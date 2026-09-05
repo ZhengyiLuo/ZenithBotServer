@@ -48177,19 +48177,6 @@ def codex_app_server_service_tier(service_tier: str) -> str:
     return CODEX_APP_SERVER_SERVICE_TIER_ALIASES.get(clean, clean)
 
 
-def discovered_codex_default_model(models: list[dict[str, Any]], preferred_slug: str = "") -> dict[str, Any] | None:
-    if preferred_slug:
-        for model in models:
-            slug = str(model.get("slug") or model.get("id") or "").strip()
-            if slug == preferred_slug:
-                return model
-    for model in models:
-        slug = str(model.get("slug") or model.get("id") or "").strip()
-        if slug:
-            return model
-    return None
-
-
 def discover_codex_catalog() -> dict[str, Any]:
     models: list[dict[str, Any]] = []
     model_options: list[dict[str, Any]] = []
@@ -48218,38 +48205,34 @@ def discover_codex_catalog() -> dict[str, Any]:
         if str(model.get("visibility") or "list") == "list" and model.get("supported_in_api", True) is not False
     ]
     visible_models.sort(key=runtime_priority)
-    # The selectable "Server default" must describe the model that
-    # codex_runtime_settings() will actually launch when a chat has no
-    # explicit model. Otherwise the picker can advertise Sol/Ultra while the
-    # turn is launched with the legacy gpt-5.5 fallback.
-    default_entry = discovered_codex_default_model(
-        visible_models,
-        configured_model or CODEX_DEFAULT_MODEL,
+    # The selectable "Server default" must describe the exact settings that
+    # codex_runtime_settings() launches for a chat with no explicit override.
+    # The CLI's discovered list can omit a configured/custom default (or a
+    # legacy fallback), so the first discovered model is not a safe proxy.
+    default_model = configured_model or CODEX_DEFAULT_MODEL
+    default_effort = clamp_codex_runtime_effort(
+        default_model,
+        configured_effort or CODEX_DEFAULT_EFFORT,
     )
-    if default_entry:
-        default_model = configured_model or str(default_entry.get("slug") or default_entry.get("id") or "").strip()
-        default_model_label = str(default_entry.get("display_name") or title_model_label(default_model)).strip()
-        default_effort = configured_effort or str(default_entry.get("default_reasoning_level") or "").strip()
-        default_effort_label = title_effort_label(default_effort) if default_effort else ""
-        default_service_tier = (
-            configured_service_tier
-            or str(default_entry.get("default_service_tier") or "").strip()
-            or codex_default_service_tier(default_model)
-        )
-    elif configured_model:
-        default_model = configured_model
-        default_model_label = title_model_label(configured_model)
-        default_effort = configured_effort
-        default_effort_label = title_effort_label(default_effort) if default_effort else ""
-        default_service_tier = configured_service_tier or codex_default_service_tier(default_model)
-    elif not visible_models:
-        default_model, default_model_label = CODEX_FALLBACK_MODELS[0]
-        default_effort = configured_effort or "medium"
-        default_effort_label = title_effort_label(default_effort)
-        default_service_tier = configured_service_tier or codex_default_service_tier(default_model)
-    if default_model == "gpt-5.5" and default_effort == "medium":
-        default_effort = "xhigh"
-        default_effort_label = "XHigh"
+    default_service_tier = (
+        configured_service_tier or codex_default_service_tier(default_model)
+    )
+    default_entry = next(
+        (
+            model
+            for model in visible_models
+            if str(model.get("slug") or model.get("id") or "").strip()
+            == default_model
+        ),
+        None,
+    )
+    default_model_label = str(
+        (default_entry or {}).get("display_name")
+        or title_model_label(default_model)
+    ).strip()
+    default_effort_label = (
+        title_effort_label(default_effort) if default_effort else ""
+    )
     for model in visible_models:
         slug = str(model.get("slug") or model.get("id") or "").strip()
         if not slug:
@@ -48286,6 +48269,15 @@ def discover_codex_catalog() -> dict[str, Any]:
         model_options.insert(0, runtime_option(configured_model, title_model_label(configured_model)))
     if configured_effort and not any(option.get("value") == configured_effort for option in effort_options):
         effort_options.append(runtime_option(configured_effort, title_effort_label(configured_effort)))
+    if default_model not in model_efforts:
+        supported_default_efforts = CODEX_FALLBACK_MODEL_EFFORTS.get(
+            default_model
+        )
+        if supported_default_efforts:
+            model_efforts[default_model] = [
+                runtime_option(effort, title_effort_label(effort))
+                for effort in supported_default_efforts
+            ]
 
     return {
         "models": unique_runtime_options(model_options, f"Server default ({default_model_label})" if default_model_label else None),
