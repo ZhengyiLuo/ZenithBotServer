@@ -26399,9 +26399,24 @@ def build_subagent_snapshot(session_id: str, limit: int = 64) -> dict[str, Any]:
     retained = list(merged.values())
     retained.sort(key=lambda state: (
         0 if normalize_subagent_status(state.get("subagent_status")) in active_statuses else 1,
-        -int(state.get("seq") or 0),
+        -(durable_event_seq(state) or 0),
     ))
-    selected = retained[:limit]
+    # The desktop persists this array as timeline events. Reconciliation can
+    # intentionally learn an old terminal child without appending a duplicate
+    # event; that in-memory state has no durable event ID or sequence and must
+    # not be advertised as an Event. Older responses that leaked those states
+    # caused SQLite binding failures in desktop clients.
+    persistable = [
+        state
+        for state in retained
+        if durable_event_seq(state) is not None
+        and isinstance(state.get("id"), str)
+        and bool(str(state.get("id") or "").strip())
+        and str(state.get("session_id") or "") == session_id
+        and str(state.get("type") or "") == "subagent_state"
+    ]
+    selected = persistable[:limit]
+    sequences = [seq for state in retained if (seq := durable_event_seq(state)) is not None]
     return {
         "session_id": session_id,
         "subagents": selected,
@@ -26410,7 +26425,7 @@ def build_subagent_snapshot(session_id: str, limit: int = 64) -> dict[str, Any]:
             normalize_subagent_status(state.get("subagent_status")) in active_statuses
             for state in retained
         ),
-        "latest_seq": max((int(state.get("seq") or 0) for state in retained), default=0),
+        "latest_seq": max(sequences, default=0),
     }
 
 
