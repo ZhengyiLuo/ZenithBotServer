@@ -905,20 +905,22 @@ represent second 60.
 
 ## Cross-chat handoffs
 
-### Current route-hint contract (API contract 25, capability v8)
+### Current route-hint contract (API contract 27, capability v10)
 
 An inline structured `@Chat` is an optional target hint. It never forwards the
 raw user prompt. On successful ordinary-turn admission, an exact local
 single-`@Chat` reference authored by a v2 client with `grant_intent: true`
 idempotently creates or refreshes a durable directional source-to-target
 grant. Subsequent turns receive only that source chat's current grants; there
-is no ambient all-chat authority. The agent decides whether to `send` a
-prepared instruction, `ask` for an asynchronous correlated reply, or make no
-contact. Every accepted configured-route Send carries one optional terminal
+is no ambient all-chat authority. An explicit user request to send, ask, tell,
+or contact a named chat requires the agent to use the matching helper; passive
+mentions remain optional. Every accepted configured-route Send carries one optional terminal
 reply path back to its immutable source; it creates no reply obligation, never
 automatically relays the target's ordinary final answer, cannot request a
 follow-up, and grants no durable reverse route. Ask explicitly requests one
-asynchronous terminal answer over the same exchange-scoped return mechanism.
+terminal answer over the same exchange-scoped return mechanism: it waits
+briefly for a direct response, then atomically falls back to durable
+asynchronous delivery without cancelling the recipient's work.
 `/chat` is a composer alias for selecting the same structured hint.
 
 Scheduled runs never inherit the source chat's grants. Each job stores its own
@@ -926,12 +928,12 @@ exact route selection, authorized by route ID in the job editor/helper flow,
 and revalidates its target, revision, and action on every firing. Its prompt
 contains the corresponding exact single `@Chat` marker for display and
 binding; no `@@` authoring syntax is required. The health surface advertises
-cross-chat version 8, `durable_route_grants`, configured-route
-`instruction_reply_once`,
+cross-chat version 10, `durable_route_grants`, configured-route
+`instruction_reply_once`, `live_wait_async_fallback`,
 `agent_ambient_local_handoffs: false`, scheduled Jobs version 5, and global
-API contract 25.
+API contract 27.
 
-Capability v8 intentionally applies this reply-once behavior to existing
+Capability v10 retains this reply-once behavior for existing
 configured `instruction` grants as well as newly created ones. The return path
 is a property of each accepted delivery, not a new durable target grant: it is
 bound to the original source, delivery run, exchange generation, two-leg
@@ -948,8 +950,9 @@ and final-result obligations retain their separate exact authorization and
 lifecycle fences.
 
 For a current ordinary turn, the provider-authority block exposes only opaque
-route IDs. The agent lists the available routes, then decides whether to Send,
-Ask, or make no contact:
+route IDs. The agent lists the available routes, then sends or asks when the
+user explicitly requests contact (and may otherwise decide no contact is
+warranted):
 
 ```bash
 "$AGENTSDOCK_CHATS_CLI" --authority-file /path/from/turn.json list
@@ -966,8 +969,10 @@ message. Send creates a correlated two-leg exchange with one optional terminal
 reply capability available only to its exact delivery run. If the target does
 not deliberately use that capability, its ordinary final stays local and the
 exchange closes without sending anything back. Ask creates the same bounded
-exchange but explicitly requests that the terminal answer or failure status
-return asynchronously to the source chat.
+exchange, initially returns the answer directly when it is ready within the
+wait window, retains that exact result briefly for safe GET replay, and
+otherwise returns an accepted/deferred receipt while the answer or failure
+status is delivered asynchronously to the source chat.
 
 ### Historical action-specific grants (v1-v2)
 

@@ -615,6 +615,190 @@ class CodexAppServerRunnerTests(unittest.IsolatedAsyncioTestCase):
             asyncio.CancelledError(),
         )
 
+    async def test_terminal_releases_slot_before_cross_chat_finalization(
+        self,
+    ) -> None:
+        turn = FakeTurn([
+            agent_message(
+                "msg-cross-chat-answer",
+                "The cross-chat answer is ready.",
+                "final_answer",
+            ),
+            completed_notification(),
+        ])
+        manager = FakeManager(turn)
+        metadata = {
+            "purpose": "cross_chat_handoff_delivery",
+            "source_session_id": "chat-source",
+            "target_session_id": "chat-native",
+            "cross_chat_exchange_id": "exchange-ordering",
+            "cross_chat_exchange_leg_id": "leg-ordering",
+        }
+        agent_server.CURRENT_TURNS["chat-native"].update(metadata)
+        agent_server.RUN_METADATA["run-original"] = dict(metadata)
+        terminal_started = asyncio.Event()
+        finish_terminal = asyncio.Event()
+        terminal_observations: list[tuple[bool, bool, bool, bool]] = []
+        schedule = Mock()
+
+        async def gated_terminal(
+            _session_id: str,
+            _payload: dict[str, object],
+        ) -> dict[str, object]:
+            terminal_observations.append((
+                "chat-native" in agent_server.ACTIVE,
+                "chat-native" in agent_server.BUSY_SESSIONS,
+                "chat-native" in agent_server.CURRENT_TURNS,
+                "run-original" in agent_server.RUN_METADATA,
+            ))
+            terminal_started.set()
+            await finish_terminal.wait()
+            return {}
+
+        real_release = agent_server.release_turn_slot
+        release_slot = AsyncMock(side_effect=real_release)
+        terminal = AsyncMock(side_effect=gated_terminal)
+        stack, _events, _finished, _exec_fallback = self.runner_patches(
+            manager
+        )
+        with stack, patch.multiple(
+            agent_server,
+            release_turn_slot=release_slot,
+            append_turn_finished_event=terminal,
+            should_schedule_queue_after_finish=Mock(return_value=True),
+            schedule_next_queued_turn=schedule,
+        ):
+            runner = asyncio.create_task(agent_server.run_codex_app_server(
+                "chat-native",
+                "run-original",
+                "Answer the incoming cross-chat exchange.",
+                dict(self.session),
+                Path(self.cwd) / ".runner-test-manifest.json",
+                allow_exec_fallback=False,
+                allow_resume_rollover=False,
+            ))
+            try:
+                await asyncio.wait_for(terminal_started.wait(), timeout=1)
+                self.assertEqual(
+                    terminal_observations,
+                    [(False, False, False, True)],
+                )
+                self.assertFalse(runner.done())
+                schedule.assert_not_called()
+            finally:
+                finish_terminal.set()
+                await asyncio.wait_for(runner, timeout=2)
+
+        release_slot.assert_awaited_once_with(
+            "chat-native",
+            expected_run_id="run-original",
+        )
+        terminal.assert_awaited_once()
+        self.assertNotIn("run-original", agent_server.RUN_METADATA)
+        schedule.assert_called_once_with("chat-native")
+
+    async def test_terminal_cross_chat_finalization_survives_repeated_cancellation(
+        self,
+    ) -> None:
+        turn = FakeTurn([
+            agent_message(
+                "msg-cross-chat-cancel",
+                "The answer remains durable during cancellation.",
+                "final_answer",
+            ),
+            completed_notification(),
+        ])
+        manager = FakeManager(turn)
+        metadata = {
+            "purpose": "cross_chat_handoff_delivery",
+            "source_session_id": "chat-source",
+            "target_session_id": "chat-native",
+            "cross_chat_exchange_id": "exchange-cancel",
+            "cross_chat_exchange_leg_id": "leg-cancel",
+        }
+        agent_server.CURRENT_TURNS["chat-native"].update(metadata)
+        agent_server.RUN_METADATA["run-original"] = dict(metadata)
+        terminal_started = asyncio.Event()
+        finish_terminal = asyncio.Event()
+        terminal_completed = asyncio.Event()
+        terminal_cancelled = False
+        join_started = asyncio.Event()
+        schedule = Mock()
+
+        async def gated_terminal(
+            _session_id: str,
+            _payload: dict[str, object],
+        ) -> dict[str, object]:
+            nonlocal terminal_cancelled
+            self.assertNotIn("chat-native", agent_server.BUSY_SESSIONS)
+            terminal_started.set()
+            try:
+                await finish_terminal.wait()
+            except asyncio.CancelledError:
+                terminal_cancelled = True
+                raise
+            finally:
+                terminal_completed.set()
+            return {}
+
+        real_release = agent_server.release_turn_slot
+        release_slot = AsyncMock(side_effect=real_release)
+        terminal = AsyncMock(side_effect=gated_terminal)
+        unpin = AsyncMock()
+        real_join = agent_server.join_task_despite_caller_cancellation
+
+        async def observed_join(task: asyncio.Task[object]) -> object:
+            join_started.set()
+            return await real_join(task)
+
+        stack, _events, _finished, _exec_fallback = self.runner_patches(
+            manager
+        )
+        with stack, patch.multiple(
+            agent_server,
+            release_turn_slot=release_slot,
+            append_turn_finished_event=terminal,
+            should_schedule_queue_after_finish=Mock(return_value=True),
+            schedule_next_queued_turn=schedule,
+            unpin_codex_app_server_thread=unpin,
+            join_task_despite_caller_cancellation=observed_join,
+        ):
+            runner = asyncio.create_task(agent_server.run_codex_app_server(
+                "chat-native",
+                "run-original",
+                "Answer the incoming cross-chat exchange.",
+                dict(self.session),
+                Path(self.cwd) / ".runner-test-manifest.json",
+                allow_exec_fallback=False,
+                allow_resume_rollover=False,
+            ))
+            try:
+                await asyncio.wait_for(terminal_started.wait(), timeout=1)
+                runner.cancel()
+                await asyncio.wait_for(join_started.wait(), timeout=1)
+                runner.cancel()
+                await asyncio.sleep(0)
+                self.assertFalse(runner.done())
+                self.assertFalse(terminal_completed.is_set())
+                self.assertFalse(terminal_cancelled)
+                self.assertIn("run-original", agent_server.RUN_METADATA)
+                schedule.assert_not_called()
+            finally:
+                finish_terminal.set()
+            with self.assertRaises(asyncio.CancelledError):
+                await asyncio.wait_for(runner, timeout=2)
+
+        self.assertTrue(terminal_completed.is_set())
+        self.assertFalse(terminal_cancelled)
+        release_slot.assert_awaited_once_with(
+            "chat-native",
+            expected_run_id="run-original",
+        )
+        terminal.assert_awaited_once()
+        unpin.assert_awaited_once_with(manager, "thread-native")
+        self.assertNotIn("run-original", agent_server.RUN_METADATA)
+        schedule.assert_called_once_with("chat-native")
+
     async def test_runner_cancellation_joins_exact_slot_release_and_unpin(self) -> None:
         turn = FakeTurn()
         manager = FakeManager(turn)

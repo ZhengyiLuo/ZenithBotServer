@@ -122,11 +122,31 @@ class CompactProviderAuthorityBlockTests(unittest.TestCase):
             exchange_response_grant=("exchange_abc", "leg_def"),
             exchange_response_followup_allowed=True,
         )
+        local_async = compact_block(
+            {"cross_chat_response"},
+            exchange_response_grant=("exchange_abc", "leg_def"),
+            exchange_response_followup_allowed=True,
+            exchange_response_followup_async=True,
+        )
 
         self.assertIn("respond: exchange=exchange_abc inbound-leg=leg_def followup=none", terminal)
         self.assertIn("respond: exchange=exchange_abc inbound-leg=leg_def followup=allowed", open_followup)
         self.assertIn("followup=allowed-async", secure)
+        self.assertIn("followup=allowed-async", local_async)
         self.assertNotIn("--request-response", terminal)
+
+    def test_verbose_async_local_followup_documents_async_response_flag(self) -> None:
+        block = agent_server.cross_chat_provider_authority_block(
+            [],
+            AUTHORITY_PATH,
+            CHAT_ID,
+            {"cross_chat_response"},
+            exchange_response_grant=("exchange_abc", "leg_def"),
+            exchange_response_followup_allowed=True,
+            exchange_response_followup_async=True,
+        )
+
+        self.assertIn("`--request-response --async-response`", block)
 
     def test_block_marks_prebound_team_mail_and_team_send_mentions(self) -> None:
         reference = agent_server.TeamReference(

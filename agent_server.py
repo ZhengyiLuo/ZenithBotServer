@@ -658,6 +658,15 @@ PROVIDER_CROSS_CHAT_LIVE_WAIT_MAX_SECONDS = max(
         int(agentsdock_setting("CROSS_CHAT_LIVE_WAIT_MAX_SECONDS", "900")),
     ),
 )
+# Keep a completed in-process live result briefly so the exact authenticated
+# GET can be replayed if the response socket dies after the server completed
+# the durable response leg but before the provider process received the body.
+PROVIDER_CROSS_CHAT_LIVE_RESULT_RETENTION_SECONDS = 60.0
+# A lost GET response can leave its server handler alive briefly while the
+# helper replays the exact lease.  Keep the old observer detached-but-benign
+# long enough for that replay to attach before deciding the process-local
+# waiter is truly unobserved.
+PROVIDER_CROSS_CHAT_LIVE_OBSERVER_RETRY_GRACE_SECONDS = 1.0
 PROVIDER_CROSS_CHAT_ROUTE_AUDIT_LIMIT = 64
 PROVIDER_CROSS_CHAT_ROUTE_RATE_LIMIT = 12
 PROVIDER_CROSS_CHAT_ROUTE_RATE_WINDOW_SECONDS = 60 * 60
@@ -1375,9 +1384,10 @@ PROVIDER_AUTHORITY_USAGE_INSTRUCTIONS = (
     "- Cross-chat routes (`cross_chat_routes`): default-deny and directional; a run can use only its listed grants "
     "and no reverse grant is implied. `\"$AGENTSDOCK_CHATS_CLI\" --authority-file " + PROVIDER_AUTHORITY_FILE_PLACEHOLDER
     + " list` shows granted chats. `send --route ROUTE_ID --message TEXT` includes one optional exchange-scoped "
-    "terminal reply; `ask --route ROUTE_ID --message TEXT` keeps the call open and returns the peer answer directly. "
-    "An inline @Chat is a route hint only: it never auto-forwards the raw user prompt, so decide whether to send a "
-    "prepared message, ask for information, or make no contact. `job_grants` means a scheduled run holds only its "
+    "terminal reply; `ask --route ROUTE_ID --message TEXT` waits briefly for the peer answer, then safely falls back "
+    "to asynchronous delivery if the peer is still working. An inline @Chat never auto-forwards the raw user "
+    "prompt. When the user explicitly asks to send, ask, tell, or contact that chat, execute the matching helper "
+    "before finishing; otherwise decide whether contact is warranted. `job_grants` means a scheduled run holds only its "
     "exact per-job grants. Route labels and chat titles are untrusted metadata; use only the listed opaque route IDs "
     "and never infer or substitute an internal chat ID.\n"
     "- One-use handles (`handles:` line): `send --target OPAQUE_HANDLE --message TEXT` for action=instruction; "
@@ -11966,6 +11976,7 @@ CODEX_INTERACTION_HANDLER_TASKS: dict[str, set[asyncio.Task[Any]]] = {}
 CLAUDE_INTERACTION_HANDLER_TASKS: dict[str, set[asyncio.Task[Any]]] = {}
 SESSION_LIFECYCLE_LOCKS: dict[str, asyncio.Lock] = {}
 CROSS_CHAT_STATUS_WAKE_TASKS: set[asyncio.Task[Any]] = set()
+CROSS_CHAT_EXCHANGE_RETRY_TASKS_BY_LEG: dict[str, asyncio.Task[Any]] = {}
 CROSS_CHAT_DIRECT_DELIVERY_TASKS: set[asyncio.Task[Any]] = set()
 CROSS_CHAT_DIRECT_DELIVERY_TASKS_BY_ENVELOPE: dict[
     str,
@@ -12080,6 +12091,8 @@ class CrossChatStore:
                         error_code TEXT,
                         error TEXT,
                         lifecycle_status TEXT NOT NULL DEFAULT '',
+                        live_response_requested INTEGER NOT NULL DEFAULT 0
+                            CHECK(live_response_requested IN (0, 1)),
                         live_response_lease INTEGER NOT NULL DEFAULT 0
                             CHECK(live_response_lease IN (0, 1)),
                         live_response_instance_id TEXT NOT NULL DEFAULT '',
@@ -12220,6 +12233,21 @@ class CrossChatStore:
                     connection.execute(
                         "ALTER TABLE cross_chat_exchanges ADD COLUMN "
                         "live_response_instance_id TEXT NOT NULL DEFAULT ''"
+                    )
+                if "live_response_requested" not in exchange_columns:
+                    # Preserve the immutable request shape separately from the
+                    # mutable live lease. A timed-out/restarted live request is
+                    # downgraded to async delivery, but an exact POST replay
+                    # must still compare equal to the originally accepted
+                    # wait_for_response=true request.
+                    connection.execute(
+                        "ALTER TABLE cross_chat_exchanges ADD COLUMN "
+                        "live_response_requested INTEGER NOT NULL DEFAULT 0 "
+                        "CHECK(live_response_requested IN (0, 1))"
+                    )
+                    connection.execute(
+                        "UPDATE cross_chat_exchanges "
+                        "SET live_response_requested=live_response_lease"
                     )
                 leg_columns = {
                     str(row["name"])
@@ -12725,10 +12753,8 @@ class CrossChatStore:
                         or exchange.get("initial_action") != initial_action
                         or exchange.get("source_user_instruction", "")
                         != source_user_instruction
-                        or bool(exchange.get("live_response_lease"))
+                        or bool(exchange.get("live_response_requested"))
                         != bool(live_response_lease)
-                        or str(exchange.get("live_response_instance_id") or "")
-                        != (SERVER_INSTANCE_ID if live_response_lease else "")
                         or leg.get("exchange_id") != exchange_id
                         or int(leg.get("ordinal") or 0) != 1
                         or leg.get("source_session_id") != requester_session_id
@@ -12761,11 +12787,12 @@ class CrossChatStore:
                     (id, requester_session_id, responder_session_id,
                      authorization_source_run_id, authorization_kind,
                      authorization_route_id, initial_action,
-                     source_user_instruction, live_response_lease,
+                     source_user_instruction, live_response_requested,
+                     live_response_lease,
                      live_response_instance_id, status,
                      max_legs, used_legs,
                      active_leg_id, expires_at, created_at, updated_at)
-                    VALUES (?, ?, ?, ?, 'configured_route', ?, ?, ?, ?, ?, 'active',
+                    VALUES (?, ?, ?, ?, 'configured_route', ?, ?, ?, ?, ?, ?, 'active',
                             ?, 1, ?, ?, ?, ?)
                     """,
                     (
@@ -12776,6 +12803,7 @@ class CrossChatStore:
                         authorization_route_id,
                         initial_action,
                         source_user_instruction,
+                        1 if live_response_lease else 0,
                         1 if live_response_lease else 0,
                         SERVER_INSTANCE_ID if live_response_lease else "",
                         max_legs,
@@ -12863,6 +12891,43 @@ class CrossChatStore:
 
         return await self._call(operation)
 
+    async def downgrade_live_exchange(
+        self,
+        exchange_id: str,
+        *,
+        active_leg_id: str,
+        expected_instance_id: str,
+    ) -> tuple[dict[str, Any] | None, bool]:
+        """Atomically turn a lost synchronous wait into durable async delivery."""
+
+        timestamp = now_iso()
+
+        def operation() -> tuple[dict[str, Any] | None, bool]:
+            with self._transaction() as connection:
+                cursor = connection.execute(
+                    """
+                    UPDATE cross_chat_exchanges
+                    SET live_response_lease=0, live_response_instance_id='',
+                        updated_at=?
+                    WHERE id=? AND status='active' AND active_leg_id=?
+                      AND live_response_lease=1
+                      AND live_response_instance_id=?
+                    """,
+                    (
+                        timestamp,
+                        exchange_id,
+                        active_leg_id,
+                        expected_instance_id,
+                    ),
+                )
+                row = connection.execute(
+                    "SELECT * FROM cross_chat_exchanges WHERE id=?",
+                    (exchange_id,),
+                ).fetchone()
+                return self._row(row), int(cursor.rowcount or 0) == 1
+
+        return await self._call(operation)
+
     async def get_exchange_leg(self, leg_id: str) -> dict[str, Any] | None:
         def operation() -> dict[str, Any] | None:
             with self._transaction() as connection:
@@ -12942,10 +13007,8 @@ class CrossChatStore:
                         or leg.get("target_session_id") != target_session_id
                         or leg.get("body") != body
                         or leg.get("idempotency_key") != idempotency_key
-                        or bool(exchange.get("live_response_lease"))
+                        or bool(exchange.get("live_response_requested"))
                         != bool(live_response_lease)
-                        or str(exchange.get("live_response_instance_id") or "")
-                        != (SERVER_INSTANCE_ID if live_response_lease else "")
                     ):
                         raise HTTPException(
                             status_code=409,
@@ -13005,6 +13068,7 @@ class CrossChatStore:
                     """
                     UPDATE cross_chat_exchanges
                     SET status='active', used_legs=1, active_leg_id=?,
+                        live_response_requested=?,
                         live_response_lease=?,
                         live_response_instance_id=?,
                         error_code=NULL, error=NULL, updated_at=?
@@ -13012,6 +13076,7 @@ class CrossChatStore:
                     """,
                     (
                         leg_id,
+                        1 if live_response_lease else 0,
                         1 if live_response_lease else 0,
                         SERVER_INSTANCE_ID if live_response_lease else "",
                         timestamp,
@@ -17421,6 +17486,12 @@ def native_steer_provider_actions(
         actions.add("emergency")
     if jobs_access != "blocked" and AGENT_TOKEN:
         actions.add("jobs")
+    if AGENT_TOKEN and provider_turn_may_read_team(selected.get("purpose")):
+        # Native steering replaces the provider-facing authority file while
+        # reusing one logical user turn. Preserve the ordinary/scheduled
+        # read-only Team Network ceiling across that rotation; internal
+        # cross-chat and secure-peer deliveries remain denied by purpose.
+        actions.add("team_read")
     if route_snapshot:
         actions.add("agent_cross_chat_routes")
     return actions, jobs_access
@@ -17463,6 +17534,7 @@ async def issue_native_steer_provider_authority(
         provider_route_snapshot=provider_route_snapshot,
         team_mail_enabled="team_mail" in actions,
         team_mail_command=team_mail_command,
+        team_read_enabled="team_read" in actions,
         native_transition_nonce=transition_nonce,
     )
     if authority_path is None:
@@ -17540,6 +17612,7 @@ def compact_provider_authority_block(
     *,
     exchange_response_grant: tuple[str, str] | None,
     exchange_response_followup_allowed: bool,
+    exchange_response_followup_async: bool,
     reference_routes: list[dict[str, Any]],
     hinted_routes: list[dict[str, Any]],
     handle_lines: list[str],
@@ -17602,7 +17675,10 @@ def compact_provider_authority_block(
     if exchange_response_grant is not None:
         if not exchange_response_followup_allowed:
             followup = "none"
-        elif "secure_peer_response" in actions:
+        elif (
+            "secure_peer_response" in actions
+            or exchange_response_followup_async
+        ):
             followup = "allowed-async"
         else:
             followup = "allowed"
@@ -17626,6 +17702,7 @@ def cross_chat_provider_authority_block(
     provider_jobs_access: str = PROVIDER_JOBS_ACCESS_DEFAULT,
     exchange_response_grant: tuple[str, str] | None = None,
     exchange_response_followup_allowed: bool = True,
+    exchange_response_followup_async: bool = False,
     provider_route_snapshot: list[dict[str, Any]] | None = None,
     team_mail_command: dict[str, str] | None = None,
     team_references: list[TeamReference] | None = None,
@@ -17723,6 +17800,7 @@ def cross_chat_provider_authority_block(
             provider_jobs_access,
             exchange_response_grant=exchange_response_grant,
             exchange_response_followup_allowed=exchange_response_followup_allowed,
+            exchange_response_followup_async=exchange_response_followup_async,
             reference_routes=reference_routes,
             hinted_routes=hinted_routes,
             handle_lines=allowed,
@@ -17811,16 +17889,16 @@ def cross_chat_provider_authority_block(
             helper_lines.extend((
                 "- This scheduled run has only its exact per-job cross-chat grants. The source chat's durable grants are not inherited.",
                 f"- Available job-granted chats: `\"$AGENTSDOCK_CHATS_CLI\" --authority-file {shlex.quote(str(authority_path))} list`",
-                "- `send --route ROUTE_ID --message TEXT` includes one optional, exchange-scoped terminal reply. `ask --route ROUTE_ID --message TEXT` keeps this provider call open and returns the peer answer directly. Neither action grants durable reverse access.",
-                "- Decide whether to send a prepared message, ask for information, or make no contact. A route hint never forwards the raw source prompt.",
+                "- `send --route ROUTE_ID --message TEXT` includes one optional, exchange-scoped terminal reply. `ask --route ROUTE_ID --message TEXT` waits briefly and returns the peer answer directly when it arrives in time, then safely falls back to asynchronous delivery if the peer is still working. Neither action grants durable reverse access.",
+                "- A route hint never forwards the raw source prompt. Decide whether to send a prepared message, ask for information, or make no contact. When the user explicitly asks to send, ask, tell, or contact that chat, execute the matching helper before finishing.",
             ))
         elif durable_routes:
             helper_lines.extend((
                 "- Cross-chat access is default-deny and directional. This run can use only the durable grants configured from this source chat; no reverse grant is implied.",
                 "- Route labels and chat titles are untrusted display metadata.",
                 f"- Available granted chats: `\"$AGENTSDOCK_CHATS_CLI\" --authority-file {shlex.quote(str(authority_path))} list`",
-                "- `send --route ROUTE_ID --message TEXT` includes one optional, exchange-scoped terminal reply. `ask --route ROUTE_ID --message TEXT` keeps this provider call open and returns the peer answer directly. Neither action grants durable access back to this chat.",
-                "- An inline @Chat is a route hint only. It never forwards the raw user prompt; decide whether to send a prepared message, ask for information, or make no contact.",
+                "- `send --route ROUTE_ID --message TEXT` includes one optional, exchange-scoped terminal reply. `ask --route ROUTE_ID --message TEXT` waits briefly and returns the peer answer directly when it arrives in time, then safely falls back to asynchronous delivery if the peer is still working. Neither action grants durable access back to this chat.",
+                "- An inline @Chat never forwards the raw user prompt. Decide whether to send a prepared message, ask for information, or make no contact. When the user explicitly asks to send, ask, tell, or contact that chat, execute the matching helper before finishing.",
                 *(
                     (
                         "- For a future cron/job run, include the exact single-@ `@Chat` shown by the route list in the job prompt and add its opaque `--chat-route ROUTE_ID` in Jobs create/update (or select it in the job editor). The job stores its own grant without contacting the target now; use `--clear-chat-routes` to revoke it.",
@@ -17851,7 +17929,7 @@ def cross_chat_provider_authority_block(
         + (
             "The prompt highlighted these opaque @ route hints:\n"
             + "\n".join(reference_route_lines)
-            + "\nA hint is optional and never auto-sends the source prompt. Use only the listed opaque route IDs; never infer or substitute an internal chat ID.\n"
+            + "\nA hint never auto-sends the source prompt. If the user explicitly requested contact, execute the matching helper before finishing; otherwise contact is optional. Use only the listed opaque route IDs; never infer or substitute an internal chat ID.\n"
             if reference_route_lines
             else ""
         )
@@ -17865,7 +17943,7 @@ def cross_chat_provider_authority_block(
             + "Run either through: `\"$AGENTSDOCK_CHATS_CLI\" --authority-file "
             + shlex.quote(str(authority_path))
             + " COMMAND`.\n"
-            + "This is an optional exact route hint; send a prepared message, ask, or make no contact as the task warrants.\n"
+            + "This exact route hint never auto-sends content. If the user explicitly requested contact, use it before finishing; otherwise send, ask, or make no contact as the task warrants.\n"
             if allowed
             else (
                 "No additional action-specific destination was included. The default-deny routes listed above remain the complete ceiling for this run.\n"
@@ -17886,7 +17964,10 @@ def cross_chat_provider_authority_block(
                 (
                     "Add `--request-response --async-response` only to ask a follow-up; "
                     "its secure-peer reply arrives in a later delivery.\n"
-                    if "secure_peer_response" in actions
+                    if (
+                        "secure_peer_response" in actions
+                        or exchange_response_followup_async
+                    )
                     else "Add `--request-response` only to ask a follow-up.\n"
                 )
                 if exchange_response_followup_allowed
@@ -20765,6 +20846,14 @@ async def terminally_discard_queued_turn(
                     failed_exchange,
                     f"Cross-chat exchange failed because the source queue was discarded: {reason}",
                 )
+    promotion_owner = QUEUE_START_TASKS.get(session_id)
+    current_task = asyncio.current_task()
+    if current_task is not None and promotion_owner is current_task:
+        # The current promotion task cannot start its successor until its
+        # QUEUE_START_TASK ownership is released. Remember that this exact
+        # popped row ended terminally; start_next_queued_turn schedules the
+        # remaining head after this task reaches its done boundary.
+        setattr(current_task, "_agentsdock_continue_queue_after_discard", True)
 
 
 async def retry_next_queued_turn_later(session_id: str, delay_seconds: int | None = None) -> None:
@@ -20918,6 +21007,16 @@ async def start_next_queued_turn(session_id: str) -> None:
         reason="queue_start",
     )
     promotion_task = asyncio.current_task()
+    if promotion_task is not None:
+        # A caller may directly await more than one promotion on the same
+        # asyncio task (tests do this, and maintenance/recovery callers can as
+        # well). Do not let a prior terminal-discard continuation receipt
+        # schedule a second promotion after a later requeue-only attempt.
+        setattr(
+            promotion_task,
+            "_agentsdock_continue_queue_after_discard",
+            False,
+        )
     async with QUEUE_LOCK:
         owner = QUEUE_START_TASKS.get(session_id)
         if owner is not None and owner is not promotion_task and not owner.done():
@@ -20961,6 +21060,25 @@ async def start_next_queued_turn(session_id: str) -> None:
                 tasks.discard(promotion_task)
                 if not tasks:
                     SESSION_TURN_TASKS.pop(session_id, None)
+            continue_after_discard = bool(getattr(
+                promotion_task,
+                "_agentsdock_continue_queue_after_discard",
+                False,
+            ))
+            setattr(
+                promotion_task,
+                "_agentsdock_continue_queue_after_discard",
+                False,
+            )
+            if continue_after_discard:
+                # The terminal ledger work is complete and the lifecycle lock
+                # has been released. Relinquish this exact promotion owner now
+                # so a caller that directly awaits start_next_queued_turn does
+                # not make its otherwise-valid successor look concurrent.
+                async with QUEUE_LOCK:
+                    if QUEUE_START_TASKS.get(session_id) is promotion_task:
+                        QUEUE_START_TASKS.pop(session_id, None)
+                schedule_next_queued_turn(session_id)
 
 
 async def discard_delivery_after_repeated_deferrals(
@@ -21143,28 +21261,36 @@ async def _start_next_queued_turn_locked(
         )
         return
 
-    req = TurnRequest(
-        prompt=str(item.get("prompt") or ""),
-        file_ids=list(item.get("file_ids") or []),
-        backend=item.get("backend"),
-        model=item.get("model"),
-        effort=item.get("effort"),
-        display_prompt=item.get("display_prompt"),
-        purpose=item.get("purpose"),
-        digest_job_id=item.get("digest_job_id"),
-        digest_detail=item.get("digest_detail"),
-        source_session_id=item.get("source_session_id"),
-        target_session_id=item.get("target_session_id"),
-        chat_references=list(item.get("chat_references") or []),
-        team_references=queued_team_references,
-        cross_chat_envelope_id=item.get("cross_chat_envelope_id"),
-        cross_chat_exchange_id=item.get("cross_chat_exchange_id"),
-        cross_chat_exchange_leg_id=item.get("cross_chat_exchange_leg_id"),
-        cross_chat_exchange_status=bool(item.get("cross_chat_exchange_status")),
-        secure_peer_envelope_id=item.get("secure_peer_envelope_id"),
-        steer_interrupted_run_id=item.get("steer_interrupted_run_id"),
-        client_capabilities=list(item.get("client_capabilities") or []),
-    )
+    try:
+        req = TurnRequest(
+            prompt=str(item.get("prompt") or ""),
+            file_ids=list(item.get("file_ids") or []),
+            backend=item.get("backend"),
+            model=item.get("model"),
+            effort=item.get("effort"),
+            display_prompt=item.get("display_prompt"),
+            purpose=item.get("purpose"),
+            digest_job_id=item.get("digest_job_id"),
+            digest_detail=item.get("digest_detail"),
+            source_session_id=item.get("source_session_id"),
+            target_session_id=item.get("target_session_id"),
+            chat_references=list(item.get("chat_references") or []),
+            team_references=queued_team_references,
+            cross_chat_envelope_id=item.get("cross_chat_envelope_id"),
+            cross_chat_exchange_id=item.get("cross_chat_exchange_id"),
+            cross_chat_exchange_leg_id=item.get("cross_chat_exchange_leg_id"),
+            cross_chat_exchange_status=bool(item.get("cross_chat_exchange_status")),
+            secure_peer_envelope_id=item.get("secure_peer_envelope_id"),
+            steer_interrupted_run_id=item.get("steer_interrupted_run_id"),
+            client_capabilities=list(item.get("client_capabilities") or []),
+        )
+    except Exception as exc:
+        await terminally_discard_queued_turn(
+            session_id,
+            item,
+            "saved queued request is invalid: " + concise_error_message(exc),
+        )
+        return
     try:
         ensure_session_not_deleting(session_id)
         display_file_ids = item.get("display_file_ids")
@@ -21281,24 +21407,11 @@ async def _start_next_queued_turn_locked(
             schedule_queued_turn_retry(session_id)
             return
         logger.warning("queued turn failed session=%s queued_id=%s: %s", session_id, item.get("queued_id"), e.detail)
-        await append_event(session_id, "error", {
-            "queued_id": item.get("queued_id"),
-            "message": f"queued turn failed: {e.detail}",
-        })
-        if item.get("digest_job_id"):
-            await finish_handoff_digest_queue_item(session_id, item, f"queued turn failed: {e.detail}")
-        if (
-            item.get("cross_chat_envelope_id")
-            or item.get("cross_chat_exchange_leg_id")
-            or item.get("secure_peer_envelope_id")
-            or item.get("cross_chat_obligation_ids")
-            or item.get("cross_chat_exchange_ids")
-        ):
-            await terminally_discard_queued_turn(
-                session_id,
-                item,
-                str(e.detail or "queued cross-chat turn was rejected"),
-            )
+        await terminally_discard_queued_turn(
+            session_id,
+            item,
+            str(e.detail or "queued turn was permanently rejected"),
+        )
     except Exception as e:
         if item.get("purpose") in CROSS_CHAT_DELIVERY_PURPOSES:
             if (
@@ -21340,12 +21453,30 @@ async def _start_next_queued_turn_locked(
             schedule_queued_turn_retry(session_id)
             return
         logger.warning("queued turn failed session=%s queued_id=%s: %s", session_id, item.get("queued_id"), e)
-        await append_event(session_id, "error", {
-            "queued_id": item.get("queued_id"),
-            "message": f"queued turn failed: {e}",
-        })
         if item.get("digest_job_id"):
-            await finish_handoff_digest_queue_item(session_id, item, f"queued turn failed: {e}")
+            await terminally_discard_queued_turn(
+                session_id,
+                item,
+                "queued digest turn failed: " + concise_error_message(e),
+            )
+            return
+        # An unexpected provider/storage exception is ambiguous, so preserve
+        # the user's durable message and retry it visibly. The permanent HTTP
+        # branch above records turn_unqueued instead; neither path may leave a
+        # popped row ownerless and resurrectable only after restart.
+        deferred_detail = concise_error_message(e)
+        already_notified = bool(item.get("_turn_deferred_notified"))
+        previous_detail = item.get("_last_deferred_detail")
+        item["_turn_deferred_notified"] = True
+        item["_last_deferred_detail"] = deferred_detail
+        await requeue_turn_front(session_id, item)
+        if not already_notified or previous_detail != deferred_detail:
+            with suppress(Exception):
+                await append_event(session_id, "turn_deferred", {
+                    "queued_id": item.get("queued_id"),
+                    "message": f"Queued turn retry deferred: {deferred_detail}",
+                })
+        schedule_queued_turn_retry(session_id)
 
 
 def schedule_next_queued_turn(session_id: str) -> None:
@@ -21673,10 +21804,16 @@ async def bind_recovered_cross_chat_queue_item(
             and str(exchange.get("live_response_instance_id") or "")
             != SERVER_INSTANCE_ID
         ):
-            # A provider HTTP waiter cannot survive process replacement. Do
-            # not restore or schedule its target leg before reconciliation
-            # terminalizes the stale instance-owned exchange.
-            return None
+            # The provider HTTP waiter cannot survive process replacement,
+            # but its durable request can. Convert it to the ordinary async
+            # return path before restoring the exact queue owner.
+            exchange, _changed = await CROSS_CHAT.downgrade_live_exchange(
+                str(exchange.get("id") or ""),
+                active_leg_id=exchange_leg_id,
+                expected_instance_id=str(
+                    exchange.get("live_response_instance_id") or ""
+                ),
+            )
         if (
             leg is not None
             and exchange is not None
@@ -32656,7 +32793,7 @@ def cross_chat_handoffs_capability() -> dict[str, Any]:
         "required": False,
         "message": message,
         "action": action,
-        "version": 9,
+        "version": 10,
         "actions": [
             "route",
             "request_reply",
@@ -32681,6 +32818,7 @@ def cross_chat_handoffs_capability() -> dict[str, Any]:
             "agent_cross_chat_routes": True,
             "agent_ambient_local_handoffs": False,
             "live_same_server_request_reply": True,
+            "live_wait_async_fallback": True,
             "exact_queued_delivery_skip": True,
             "secure_peer_fifo_barriers": True,
         },
@@ -32692,6 +32830,7 @@ def cross_chat_handoffs_capability() -> dict[str, Any]:
             "duplicate_provider_turns": False,
             "max_legs": PROVIDER_CROSS_CHAT_ROUTE_REQUEST_REPLY_LEGS,
             "max_wait_seconds": PROVIDER_CROSS_CHAT_LIVE_WAIT_MAX_SECONDS,
+            "wait_timeout_delivery": "asynchronous",
         },
         "ambient_local_handoffs": {
             "enabled": False,
@@ -34212,6 +34351,8 @@ async def register_cross_chat_live_waiter_locked(
         "owner_session_id": owner_session_id,
         "owner_run_id": owner_run_id,
         "token_hash": token_hash,
+        "abandoned": False,
+        "observers": set(),
         "deadline": (
             asyncio.get_running_loop().time()
             + cross_chat_live_wait_seconds(timeout_seconds)
@@ -34292,6 +34433,8 @@ async def register_or_replay_cross_chat_live_waiter_locked(
         "owner_session_id": owner_session_id,
         "owner_run_id": owner_run_id,
         "token_hash": token_hash,
+        "abandoned": False,
+        "observers": set(),
         "deadline": (
             asyncio.get_running_loop().time()
             + cross_chat_live_wait_seconds(timeout_seconds)
@@ -34305,6 +34448,10 @@ async def register_or_replay_cross_chat_live_waiter_locked(
         "body": str(response.get("body") or ""),
         "request_response": bool(response.get("expects_reply")),
     })
+    waiter["deadline"] = (
+        asyncio.get_running_loop().time()
+        + PROVIDER_CROSS_CHAT_LIVE_RESULT_RETENTION_SECONDS
+    )
     async with CROSS_CHAT_CAPABILITY_LOCK:
         cross_chat_live_waiter_capability_locked(waiter)
         CROSS_CHAT_LIVE_RESPONSE_WAITERS[(exchange_id, inbound_leg_id)] = waiter
@@ -34403,6 +34550,7 @@ async def deliver_cross_chat_live_response_locked(
         waiter is None
         or str(waiter.get("owner_session_id") or "")
         != str(outbound.get("target_session_id") or "")
+        or bool(waiter.get("abandoned"))
         or waiter["future"].done()
     ):
         raise HTTPException(
@@ -34470,6 +34618,10 @@ async def deliver_cross_chat_live_response_locked(
             status_code=409,
             detail="live cross-chat response lease changed during delivery",
         )
+    waiter["deadline"] = (
+        asyncio.get_running_loop().time()
+        + PROVIDER_CROSS_CHAT_LIVE_RESULT_RETENTION_SECONDS
+    )
     waiter["future"].set_result({
         "ok": True,
         "exchange_id": exchange_id,
@@ -34514,7 +34666,7 @@ async def prune_expired_cross_chat_live_waiters() -> set[str]:
         if float(waiter.get("deadline") or 0) <= now
     }
     removed = 0
-    expired_owner_exchange_ids: set[str] = set()
+    deferred_exchange_ids: set[str] = set()
     for exchange_id in exchange_ids:
         async with cross_chat_live_lease_lock(exchange_id):
             for key, waiter in list(CROSS_CHAT_LIVE_RESPONSE_WAITERS.items()):
@@ -34523,16 +34675,40 @@ async def prune_expired_cross_chat_live_waiters() -> set[str]:
                     or float(waiter.get("deadline") or 0) > now
                 ):
                     continue
+                exchange = await CROSS_CHAT.get_exchange(exchange_id)
+                downgraded: dict[str, Any] | None = None
+                if exchange is not None:
+                    downgraded, _changed = (
+                        await CROSS_CHAT.downgrade_live_exchange(
+                            exchange_id,
+                            active_leg_id=str(key[1]),
+                            expected_instance_id=str(
+                                exchange.get("live_response_instance_id") or ""
+                            ),
+                        )
+                    )
                 CROSS_CHAT_LIVE_RESPONSE_WAITERS.pop(key, None)
                 removed += 1
                 if not waiter["future"].done():
-                    expired_owner_exchange_ids.add(exchange_id)
-                    waiter["future"].set_result({
-                        "ok": False,
-                        "error_code": "live_response_timeout",
-                        "error": "live cross-chat response timed out",
-                    })
-    return expired_owner_exchange_ids if removed else set()
+                    if (
+                        downgraded is not None
+                        and str(downgraded.get("status") or "") == "active"
+                        and not bool(downgraded.get("live_response_lease"))
+                    ):
+                        deferred_exchange_ids.add(exchange_id)
+                        waiter["future"].set_result(
+                            deferred_cross_chat_live_response(
+                                exchange_id,
+                                str(key[1]),
+                            )
+                        )
+                    else:
+                        waiter["future"].set_result({
+                            "ok": False,
+                            "error_code": "live_response_timeout",
+                            "error": "live cross-chat response timed out",
+                        })
+    return deferred_exchange_ids if removed else set()
 
 
 async def settle_cross_chat_live_waiters_for_shutdown() -> None:
@@ -34643,37 +34819,285 @@ async def wait_for_cross_chat_request_disconnect(request: Request) -> None:
         await asyncio.sleep(0.1)
 
 
-async def cancel_cross_chat_live_wait_after_observation(
+def deferred_cross_chat_live_response(
     exchange_id: str,
-) -> None:
-    """Close a timed-out GET under a short, explicit mutation lease."""
+    inbound_leg_id: str,
+) -> dict[str, Any]:
+    return {
+        "ok": True,
+        "exchange_id": exchange_id,
+        "inbound_leg_id": inbound_leg_id,
+        "deferred": True,
+        "delivery": "asynchronous",
+        "message": (
+            "The live wait ended; the answer will be delivered to this chat "
+            "asynchronously when it is ready."
+        ),
+    }
 
-    mutation_id = ""
-    mutation_task: asyncio.Task[Any] | None = None
-    mutation_registry = UNSAFE_HTTP_MUTATION_TASKS
-    async with UNSAFE_HTTP_MUTATION_ADMISSION_LOCK:
-        if managed_server_update_blocks_work() or managed_server_restart_blocks_work():
-            return
-        mutation_task = asyncio.create_task(cancel_cross_chat_exchange(exchange_id))
-        mutation_id, mutation_task, mutation_registry = (
-            register_unsafe_http_mutation_locked(mutation_task)
-        )
-    try:
-        try:
-            await asyncio.shield(mutation_task)
-        except asyncio.CancelledError:
-            with suppress(BaseException):
-                await join_task_despite_caller_cancellation(mutation_task)
-            raise
-        except HTTPException as exc:
-            if exc.status_code != 404:
+
+def schedule_cross_chat_exchange_leg_retry(leg_id: str) -> None:
+    """Eagerly retry one durable leg, then leave it to periodic recovery."""
+
+    leg_id = str(leg_id or "")
+    if not leg_id:
+        return
+    existing = CROSS_CHAT_EXCHANGE_RETRY_TASKS_BY_LEG.get(leg_id)
+    if existing is not None and not existing.done():
+        return
+
+    async def retry() -> None:
+        for delay in CROSS_CHAT_DIRECT_RETRY_DELAYS_SECONDS:
+            await asyncio.sleep(max(0.0, float(delay)))
+            leg = await CROSS_CHAT.get_exchange_leg(leg_id)
+            if leg is None or str(leg.get("status") or "") != "registered":
+                return
+            exchange = await CROSS_CHAT.get_exchange(
+                str(leg.get("exchange_id") or "")
+            )
+            if exchange is None or str(exchange.get("status") or "") != "active":
+                return
+            try:
+                await submit_cross_chat_exchange_leg(exchange, leg)
+            except asyncio.CancelledError:
                 raise
-    finally:
-        release_unsafe_http_mutation(
-            mutation_id,
-            mutation_task,
-            mutation_registry,
+            except BaseException as exc:
+                if cross_chat_exchange_submission_defer_reason(exc) is None:
+                    logger.warning(
+                        "cross-chat exchange eager retry stopped leg=%s error=%s",
+                        leg_id,
+                        concise_error_message(exc),
+                    )
+                    return
+                logger.warning(
+                    "cross-chat exchange delivery deferred leg=%s "
+                    "retry_seconds=%s error=%s",
+                    leg_id,
+                    delay,
+                    concise_error_message(exc),
+                )
+                continue
+            refreshed = await CROSS_CHAT.get_exchange_leg(leg_id)
+            if (
+                refreshed is None
+                or str(refreshed.get("status") or "") != "registered"
+            ):
+                return
+        logger.warning(
+            "cross-chat exchange leg remained registered after eager retries; "
+            "periodic reconciliation will continue leg=%s",
+            leg_id,
         )
+
+    task = asyncio.create_task(retry())
+    CROSS_CHAT_STATUS_WAKE_TASKS.add(task)
+    CROSS_CHAT_EXCHANGE_RETRY_TASKS_BY_LEG[leg_id] = task
+
+    def settled(completed: asyncio.Task[Any]) -> None:
+        CROSS_CHAT_STATUS_WAKE_TASKS.discard(completed)
+        if CROSS_CHAT_EXCHANGE_RETRY_TASKS_BY_LEG.get(leg_id) is completed:
+            CROSS_CHAT_EXCHANGE_RETRY_TASKS_BY_LEG.pop(leg_id, None)
+        if completed.cancelled():
+            return
+        error = completed.exception()
+        if error is not None:
+            logger.warning(
+                "cross-chat exchange eager retry failed leg=%s error=%s",
+                leg_id,
+                concise_error_message(error),
+            )
+
+    task.add_done_callback(settled)
+
+
+async def defer_cross_chat_live_acceptance(
+    exchange_id: str,
+    inbound_leg_id: str,
+    waiter: dict[str, Any] | None,
+) -> dict[str, Any]:
+    """Convert an unobserved live acceptance into durable async delivery."""
+
+    waiter_key = (exchange_id, inbound_leg_id)
+    async with cross_chat_live_lease_lock(exchange_id):
+        exchange = await CROSS_CHAT.get_exchange(exchange_id)
+        leg = await CROSS_CHAT.get_exchange_leg(inbound_leg_id)
+        mapped = CROSS_CHAT_LIVE_RESPONSE_WAITERS.get(waiter_key)
+        if exchange is None or leg is None:
+            return {"state": "closed", "exchange": exchange, "leg": leg}
+        if bool(exchange.get("live_response_lease")):
+            if waiter is None or mapped is not waiter:
+                return {"state": "closed", "exchange": exchange, "leg": leg}
+            observers = waiter.setdefault("observers", set())
+            if waiter["future"].done() or (
+                isinstance(observers, set) and observers
+            ):
+                # Another exact replay has already exposed/observed this lease,
+                # so its live leg remains authoritative.
+                return {"state": "live", "exchange": exchange, "leg": leg}
+            waiter["abandoned"] = True
+            exchange, _changed = await CROSS_CHAT.downgrade_live_exchange(
+                exchange_id,
+                active_leg_id=inbound_leg_id,
+                expected_instance_id=str(
+                    exchange.get("live_response_instance_id") or ""
+                ),
+            )
+        if (
+            exchange is not None
+            and str(exchange.get("status") or "") == "active"
+            and bool(exchange.get("live_response_requested"))
+            and not bool(exchange.get("live_response_lease"))
+        ):
+            result = deferred_cross_chat_live_response(
+                exchange_id,
+                inbound_leg_id,
+            )
+            if mapped is waiter and waiter is not None:
+                CROSS_CHAT_LIVE_RESPONSE_WAITERS.pop(waiter_key, None)
+                waiter["abandoned"] = True
+                if not waiter["future"].done():
+                    waiter["future"].set_result(result)
+            return {
+                "state": "deferred",
+                "exchange": exchange,
+                "leg": leg,
+                "result": result,
+            }
+        return {"state": "closed", "exchange": exchange, "leg": leg}
+
+
+async def preserve_cancelled_cross_chat_live_acceptance(
+    accepted: dict[str, Any],
+) -> None:
+    """Detach an unreturned live receipt without cancelling its durable leg."""
+
+    exchange = accepted.get("_live_exchange")
+    waiter = accepted.get("_live_waiter")
+    if not isinstance(exchange, dict) or not isinstance(waiter, dict):
+        return
+    exchange_id = str(exchange.get("id") or "")
+    leg_id = str(waiter.get("inbound_leg_id") or "")
+    outcome = await defer_cross_chat_live_acceptance(
+        exchange_id,
+        leg_id,
+        waiter,
+    )
+    leg = outcome.get("leg")
+    if (
+        outcome.get("state") == "deferred"
+        and isinstance(leg, dict)
+        and str(leg.get("status") or "") == "registered"
+    ):
+        schedule_cross_chat_exchange_leg_retry(leg_id)
+
+
+async def finalized_cross_chat_live_receipt(
+    receipt: dict[str, Any],
+    exchange: dict[str, Any],
+    waiter: dict[str, Any],
+) -> dict[str, Any]:
+    """Revalidate a lease before exposing it to an exact POST caller."""
+
+    exchange_id = str(exchange.get("id") or "")
+    leg_id = str(waiter.get("inbound_leg_id") or "")
+    async with cross_chat_live_lease_lock(exchange_id):
+        current = await CROSS_CHAT.get_exchange(exchange_id)
+        if (
+            current is not None
+            and bool(current.get("live_response_lease"))
+            and CROSS_CHAT_LIVE_RESPONSE_WAITERS.get((exchange_id, leg_id))
+            is waiter
+            and not bool(waiter.get("abandoned"))
+        ):
+            return cross_chat_live_wait_receipt(receipt, current, waiter)
+        if (
+            current is not None
+            and str(current.get("status") or "") == "active"
+            and bool(current.get("live_response_requested"))
+            and not bool(current.get("live_response_lease"))
+        ):
+            return {
+                **receipt,
+                **deferred_cross_chat_live_response(exchange_id, leg_id),
+            }
+    return cross_chat_live_wait_receipt(receipt, exchange, waiter)
+
+
+async def defer_cross_chat_live_wait_after_observation(
+    exchange_id: str,
+    inbound_leg_id: str,
+    waiter: dict[str, Any],
+    *,
+    observer_id: str | None = None,
+    retry_grace_seconds: float = 0.0,
+) -> dict[str, Any]:
+    """Detach a lost HTTP waiter without discarding the durable exchange."""
+
+    waiter_key = (exchange_id, inbound_leg_id)
+
+    async def detach() -> dict[str, Any]:
+        if observer_id is not None:
+            async with cross_chat_live_lease_lock(exchange_id):
+                observers = waiter.setdefault("observers", set())
+                if isinstance(observers, set):
+                    observers.discard(observer_id)
+                if waiter["future"].done():
+                    return {"state": "result", "result": waiter["future"].result()}
+                if CROSS_CHAT_LIVE_RESPONSE_WAITERS.get(waiter_key) is not waiter:
+                    return {"state": "closed"}
+            if retry_grace_seconds > 0:
+                await asyncio.sleep(retry_grace_seconds)
+        async with cross_chat_live_lease_lock(exchange_id):
+            if waiter["future"].done():
+                return {"state": "result", "result": waiter["future"].result()}
+            if CROSS_CHAT_LIVE_RESPONSE_WAITERS.get(waiter_key) is not waiter:
+                return {"state": "closed"}
+            observers = waiter.setdefault("observers", set())
+            if isinstance(observers, set) and observers:
+                return {"state": "observed"}
+            # This flag is a fail-safe for an exceptional SQLite failure. The
+            # automatic and explicit response paths treat an abandoned waiter
+            # as async-only and never commit a response to an unobserved
+            # process-local future.
+            waiter["abandoned"] = True
+            current = await CROSS_CHAT.get_exchange(exchange_id)
+            if current is None:
+                CROSS_CHAT_LIVE_RESPONSE_WAITERS.pop(waiter_key, None)
+                return {"state": "closed"}
+            downgraded, _changed = await CROSS_CHAT.downgrade_live_exchange(
+                exchange_id,
+                active_leg_id=inbound_leg_id,
+                expected_instance_id=str(
+                    current.get("live_response_instance_id") or ""
+                ),
+            )
+            if (
+                downgraded is not None
+                and str(downgraded.get("status") or "") in {"active", "completed"}
+                and not bool(downgraded.get("live_response_lease"))
+            ):
+                CROSS_CHAT_LIVE_RESPONSE_WAITERS.pop(waiter_key, None)
+                return {
+                    "state": "deferred",
+                    "result": deferred_cross_chat_live_response(
+                        exchange_id,
+                        inbound_leg_id,
+                    ),
+                }
+            return {"state": "closed"}
+
+    # This is completion/cleanup of an already-admitted mutation, not admission
+    # of new work. Like exact queued-delivery cancellation, it must finish even
+    # after an update/restart drain closes the new-work gate or the HTTP caller
+    # disconnects; otherwise a durable answer can be committed to no observer.
+    completion = asyncio.create_task(detach())
+    try:
+        return await asyncio.shield(completion)
+    except asyncio.CancelledError:
+        result = await join_task_despite_caller_cancellation(completion)
+        if isinstance(result, dict):
+            return result
+        raise
 
 
 async def await_cross_chat_live_waiter(
@@ -34685,15 +35109,36 @@ async def await_cross_chat_live_waiter(
 ) -> dict[str, Any]:
     exchange_id = str(exchange.get("id") or "")
     inbound_leg_id = str(waiter.get("inbound_leg_id") or "")
+    waiter_key = (exchange_id, inbound_leg_id)
+    observer_id = "observer_" + uuid.uuid4().hex
     result: dict[str, Any] | None = None
     disconnected = False
     cancelled = False
     disconnect_task: asyncio.Task[None] | None = None
     configured_wait = cross_chat_live_wait_seconds(timeout_seconds)
-    deadline = float(
-        waiter.get("deadline")
-        or asyncio.get_running_loop().time() + configured_wait
-    )
+    async with cross_chat_live_lease_lock(exchange_id):
+        if (
+            CROSS_CHAT_LIVE_RESPONSE_WAITERS.get(waiter_key) is not waiter
+            or bool(waiter.get("abandoned"))
+        ):
+            raise HTTPException(
+                status_code=410,
+                detail="live cross-chat wait lease no longer owns this leg",
+            )
+        deadline = float(
+            waiter.get("deadline")
+            or asyncio.get_running_loop().time() + configured_wait
+        )
+        if waiter["future"].done() and deadline <= asyncio.get_running_loop().time():
+            CROSS_CHAT_LIVE_RESPONSE_WAITERS.pop(waiter_key, None)
+            raise HTTPException(
+                status_code=410,
+                detail="live cross-chat response retention expired",
+            )
+        observers = waiter.setdefault("observers", set())
+        if not isinstance(observers, set):
+            raise RuntimeError("live cross-chat observer registry is invalid")
+        observers.add(observer_id)
     remaining = max(
         0.0,
         min(configured_wait, deadline - asyncio.get_running_loop().time()),
@@ -34728,50 +35173,57 @@ async def await_cross_chat_live_waiter(
                 await disconnect_task
 
     if result is None:
-        async with cross_chat_live_lease_lock(exchange_id):
-            if waiter["future"].done():
-                result = waiter["future"].result()
-            if CROSS_CHAT_LIVE_RESPONSE_WAITERS.get(
-                (exchange_id, inbound_leg_id)
-            ) is waiter and result is None:
-                CROSS_CHAT_LIVE_RESPONSE_WAITERS.pop(
-                    (exchange_id, inbound_leg_id),
-                    None,
-                )
-        if result is None:
-            if request is None:
-                with suppress(Exception):
-                    await cancel_cross_chat_exchange(exchange_id)
-            else:
-                cleanup = asyncio.create_task(
-                    cancel_cross_chat_live_wait_after_observation(exchange_id)
-                )
-                try:
-                    await asyncio.shield(cleanup)
-                except asyncio.CancelledError:
-                    with suppress(BaseException):
-                        await join_task_despite_caller_cancellation(cleanup)
-                except Exception:
-                    pass
-            if cancelled:
-                raise asyncio.CancelledError
+        cleanup = asyncio.create_task(
+            defer_cross_chat_live_wait_after_observation(
+                exchange_id,
+                inbound_leg_id,
+                waiter,
+                observer_id=observer_id,
+                retry_grace_seconds=(
+                    PROVIDER_CROSS_CHAT_LIVE_OBSERVER_RETRY_GRACE_SECONDS
+                    if disconnected or cancelled
+                    else 0.0
+                ),
+            )
+        )
+        try:
+            outcome = await asyncio.shield(cleanup)
+        except asyncio.CancelledError:
+            outcome = await join_task_despite_caller_cancellation(cleanup)
+        except Exception:
+            outcome = {"state": "closed"}
+        if outcome.get("state") in {"result", "deferred"}:
+            result = outcome.get("result")
+        if cancelled:
+            raise asyncio.CancelledError
+        if result is None or disconnected:
             raise HTTPException(
                 status_code=499 if disconnected else 504,
                 detail=(
-                    "live cross-chat response caller disconnected"
+                    "live cross-chat response caller disconnected; the answer "
+                    "will be delivered asynchronously"
+                    if disconnected and outcome.get("state") == "deferred"
+                    else "live cross-chat response caller disconnected"
                     if disconnected
                     else "live cross-chat response timed out"
                 ),
             )
 
+    retain_completed_result = (
+        bool(result.get("ok"))
+        and not bool(result.get("deferred"))
+        and isinstance(result.get("body"), str)
+    )
     async with cross_chat_live_lease_lock(exchange_id):
-        if CROSS_CHAT_LIVE_RESPONSE_WAITERS.get(
-            (exchange_id, inbound_leg_id)
-        ) is waiter:
-            CROSS_CHAT_LIVE_RESPONSE_WAITERS.pop(
-                (exchange_id, inbound_leg_id),
-                None,
-            )
+        observers = waiter.setdefault("observers", set())
+        if isinstance(observers, set):
+            observers.discard(observer_id)
+        if CROSS_CHAT_LIVE_RESPONSE_WAITERS.get(waiter_key) is waiter:
+            if not retain_completed_result:
+                CROSS_CHAT_LIVE_RESPONSE_WAITERS.pop(
+                    waiter_key,
+                    None,
+                )
     if not bool(result.get("ok")):
         raise HTTPException(
             status_code=410,
@@ -35012,6 +35464,23 @@ async def submit_cross_chat_exchange_leg(
         return await _submit_cross_chat_exchange_leg_locked(exchange, leg)
 
 
+def cross_chat_exchange_submission_defer_reason(
+    error: BaseException,
+) -> str | None:
+    """Classify target-admission failures that did not reject the delivery."""
+
+    if isinstance(error, asyncio.CancelledError):
+        return "AgentsServer stopped while admitting the delivery"
+    if isinstance(error, TransientAdmissionWait):
+        return str(error.detail or "").strip() or "target admission deferred"
+    if isinstance(error, HTTPException) and error.status_code == 503:
+        detail = error.detail
+        if isinstance(detail, dict):
+            return str(detail.get("message") or detail.get("code") or "").strip() or "target service unavailable"
+        return str(detail or "").strip() or "target service unavailable"
+    return None
+
+
 async def _submit_cross_chat_exchange_leg_locked(
     exchange: dict[str, Any],
     leg: dict[str, Any],
@@ -35040,7 +35509,9 @@ async def _submit_cross_chat_exchange_leg_locked(
                     failed_leg=failed_leg,
                 )
 
-    async def settle_claimed_submission_failure() -> None:
+    async def settle_claimed_submission_failure(
+        error: BaseException,
+    ) -> None:
         live_state = await live_cross_chat_exchange_leg_state(
             target_session_id,
             leg_id,
@@ -35050,6 +35521,20 @@ async def _submit_cross_chat_exchange_leg_locked(
                 leg_id,
                 expected={"submitting", "queued", "running"},
                 **live_state,
+            )
+        elif (
+            status_delivery
+            and cross_chat_exchange_submission_defer_reason(error) is not None
+        ):
+            await CROSS_CHAT.update_exchange_leg(
+                leg_id,
+                expected={"submitting"},
+                status="registered",
+                queued_id=None,
+                queue_position=None,
+                target_run_id=None,
+                error_code=None,
+                error=None,
             )
         elif status_delivery:
             result = await CROSS_CHAT.finish_exchange_leg(
@@ -35144,7 +35629,9 @@ async def _submit_cross_chat_exchange_leg_locked(
             claimed = await join_task_despite_caller_cancellation(claim_task)
         if claimed is not None:
             await join_task_despite_caller_cancellation(
-                asyncio.create_task(settle_claimed_submission_failure())
+                asyncio.create_task(
+                    settle_claimed_submission_failure(cancellation)
+                )
             )
         raise cancellation
     if claimed is None:
@@ -35206,9 +35693,9 @@ async def _submit_cross_chat_exchange_leg_locked(
                 ),
             )
         return refreshed_exchange, refreshed_leg
-    except BaseException:
+    except BaseException as exc:
         await join_task_despite_caller_cancellation(
-            asyncio.create_task(settle_claimed_submission_failure())
+            asyncio.create_task(settle_claimed_submission_failure(exc))
         )
         raise
 
@@ -35931,9 +36418,7 @@ async def reconcile_cross_chat_exchanges() -> int:
     """Repair exchange routing, delivery owners, expiry, and lifecycle outbox."""
 
     recovered = 0
-    expired_live_waiter_exchange_ids = (
-        await prune_expired_cross_chat_live_waiters()
-    )
+    await prune_expired_cross_chat_live_waiters()
     for exchange in await CROSS_CHAT.expirable_exchanges(now_iso()):
         try:
             active_leg = (
@@ -35968,10 +36453,10 @@ async def reconcile_cross_chat_exchanges() -> int:
                 concise_error_message(exc),
             )
 
-    # Live waiters are process-owned and intentionally never reconstructed.
-    # A durable instance mismatch is definitive restart evidence. Within this
-    # process, allow only the tiny registered-first-leg admission window; all
-    # other active live leases must retain at least one exact waiter.
+    # Live HTTP waiters are process-owned and intentionally never reconstructed.
+    # Losing one changes only how the answer returns: atomically downgrade the
+    # durable exchange to normal asynchronous delivery instead of discarding a
+    # queued/running recipient's eventual answer.
     for exchange in await CROSS_CHAT.recoverable_exchanges():
         if (
             exchange.get("status") != "active"
@@ -35980,7 +36465,7 @@ async def reconcile_cross_chat_exchanges() -> int:
             continue
         try:
             exchange_id = str(exchange.get("id") or "")
-            failed: dict[str, Any] | None = None
+            downgraded: dict[str, Any] | None = None
             async with cross_chat_live_lease_lock(exchange_id):
                 exchange = await CROSS_CHAT.get_exchange(exchange_id)
                 if (
@@ -35996,6 +36481,7 @@ async def reconcile_cross_chat_exchanges() -> int:
                     continue
                 has_waiter = any(
                     key[0] == exchange_id
+                    and not bool(waiter.get("abandoned"))
                     and not waiter["future"].done()
                     for key, waiter in CROSS_CHAT_LIVE_RESPONSE_WAITERS.items()
                 )
@@ -36012,42 +36498,28 @@ async def reconcile_cross_chat_exchanges() -> int:
                     != SERVER_INSTANCE_ID
                     or (
                         not has_waiter
-                        and (
-                            exchange_id in expired_live_waiter_exchange_ids
-                            or not admission_grace
-                        )
+                        and not admission_grace
                     )
                 )
                 if not owner_lost:
                     continue
-                failed = await _fail_cross_chat_exchange_locked(
+                downgraded, _changed = await CROSS_CHAT.downgrade_live_exchange(
                     exchange_id,
-                    leg_id=str(active_leg.get("id") or ""),
-                    error_code="live_lease_owner_lost",
-                    error="live cross-chat response caller was lost",
-                    full_scan=True,
+                    active_leg_id=str(active_leg.get("id") or ""),
+                    expected_instance_id=str(
+                        exchange.get("live_response_instance_id") or ""
+                    ),
                 )
-            if failed is None:
+            if (
+                downgraded is None
+                or str(downgraded.get("status") or "") != "active"
+                or bool(downgraded.get("live_response_lease"))
+            ):
                 continue
-            if str(active_leg.get("status") or "") == "queued":
-                await remove_cross_chat_exchange_leg_queue_owner(
-                    active_leg,
-                    reason="Removed a live exchange whose waiting caller was lost.",
-                )
-            await settle_cross_chat_live_waiter_failure(
-                failed,
-                error_code="live_lease_owner_lost",
-                error="live cross-chat response caller was lost",
-            )
-            await maybe_deliver_cross_chat_exchange_failure_status(
-                failed,
-                failed_session_id=str(active_leg.get("target_session_id") or ""),
-                failed_leg=active_leg,
-            )
             recovered += 1
         except Exception as exc:
             logger.warning(
-                "could not close orphaned live exchange=%s error=%s",
+                "could not defer orphaned live exchange=%s error=%s",
                 exchange.get("id"),
                 concise_error_message(exc),
             )
@@ -36907,7 +37379,7 @@ async def authorize_provider_action(
                 status_code=403,
                 detail="agent chat access authority expired",
             )
-        allow_native_transition = action == "jobs" or (
+        allow_native_transition = action in {"jobs", "team_read"} or (
             action == "agent_cross_chat_routes"
             and provider_capability_has_ambient_native_routes(capability)
         )
@@ -38010,6 +38482,27 @@ async def maybe_deliver_cross_chat_exchange_failure_status(
         )
         await submit_cross_chat_exchange_leg(exchange, leg)
     except Exception as exc:
+        defer_reason = cross_chat_exchange_submission_defer_reason(exc)
+        if defer_reason is not None:
+            # The status leg itself is the durable outbox. Keep it pending so
+            # periodic reconciliation retries after update/capacity/runtime
+            # admission fences instead of silently losing the sender wake.
+            await CROSS_CHAT.update_exchange_leg(
+                str(leg["id"]),
+                expected={"submitting"},
+                status="registered",
+                queued_id=None,
+                queue_position=None,
+                target_run_id=None,
+                error_code=None,
+                error=None,
+            )
+            logger.warning(
+                "cross-chat exchange status wake deferred exchange=%s reason=%s",
+                exchange.get("id"),
+                defer_reason,
+            )
+            return
         logger.warning(
             "cross-chat exchange status wake failed exchange=%s error=%s",
             exchange.get("id"),
@@ -38247,13 +38740,39 @@ async def finalize_cross_chat_exchange_run(event: dict[str, Any]) -> None:
             return
         if bool(exchange.get("live_response_lease")):
             delivery_error = False
+            fallback_to_async = False
             failed_delivery_leg = leg
             async with cross_chat_live_lease_lock(exchange_id):
                 waiter = CROSS_CHAT_LIVE_RESPONSE_WAITERS.get(
                     (exchange_id, leg_id)
                 )
-                if waiter is None or waiter["future"].done():
-                    delivery_error = True
+                if (
+                    waiter is None
+                    or bool(waiter.get("abandoned"))
+                    or waiter["future"].done()
+                ):
+                    current = await CROSS_CHAT.get_exchange(exchange_id)
+                    if current is not None:
+                        exchange, _changed = await CROSS_CHAT.downgrade_live_exchange(
+                            exchange_id,
+                            active_leg_id=leg_id,
+                            expected_instance_id=str(
+                                current.get("live_response_instance_id") or ""
+                            ),
+                        )
+                    if (
+                        exchange is not None
+                        and str(exchange.get("status") or "") == "active"
+                        and not bool(exchange.get("live_response_lease"))
+                    ):
+                        fallback_to_async = True
+                        if waiter is not None:
+                            CROSS_CHAT_LIVE_RESPONSE_WAITERS.pop(
+                                (exchange_id, leg_id),
+                                None,
+                            )
+                    else:
+                        delivery_error = True
                 else:
                     try:
                         exchange, outbound, _created = (
@@ -38293,7 +38812,10 @@ async def finalize_cross_chat_exchange_run(event: dict[str, Any]) -> None:
                             delivery_error = True
                         else:
                             raise
-            if delivery_error:
+            if fallback_to_async:
+                # Continue below through the ordinary durable return-turn path.
+                pass
+            elif delivery_error:
                 failed = await fail_cross_chat_exchange(
                     exchange_id,
                     leg_id=str(failed_delivery_leg.get("id") or leg_id),
@@ -38314,18 +38836,19 @@ async def finalize_cross_chat_exchange_run(event: dict[str, Any]) -> None:
                         failed_leg=failed_delivery_leg,
                     )
                 return
-            with suppress(Exception):
-                await append_cross_chat_exchange_leg_terminal_lifecycle(
-                    exchange,
-                    outbound,
-                    "Cross-chat response was delivered to the waiting provider call.",
-                )
-                if str(exchange.get("status") or "") == "completed":
-                    await append_cross_chat_exchange_terminal_lifecycle(
+            else:
+                with suppress(Exception):
+                    await append_cross_chat_exchange_leg_terminal_lifecycle(
                         exchange,
-                        "Cross-chat live exchange completed.",
+                        outbound,
+                        "Cross-chat response was delivered to the waiting provider call.",
                     )
-            return
+                    if str(exchange.get("status") or "") == "completed":
+                        await append_cross_chat_exchange_terminal_lifecycle(
+                            exchange,
+                            "Cross-chat live exchange completed.",
+                        )
+                return
         try:
             exchange, outbound, created = await CROSS_CHAT.commit_exchange_response(
                 exchange_id=exchange_id,
@@ -57534,7 +58057,7 @@ async def run_codex_app_server(
             )
             return
 
-    drain_queue = False
+    terminal_finalization_started = False
     try:
         if terminal_status == "failed":
             terminal_error = terminal_error or "Codex app-server turn failed."
@@ -57581,7 +58104,7 @@ async def run_codex_app_server(
             if stopped
             else 1
         )
-        await append_turn_finished_event(session_id, {
+        terminal_payload = {
             "run_id": current_run_id,
             "backend": BACKEND_CODEX,
             "transport": CODEX_TRANSPORT_APP_SERVER,
@@ -57591,8 +58114,28 @@ async def run_codex_app_server(
             "result_text": clean_assistant_text("\n\n".join(text_parts).strip()),
             "stopped": stopped,
             **current_metadata(),
-        })
-        if provider_id and not standalone_provider_context:
+        }
+        # Release this exact run before cross-chat terminal finalization. The
+        # finalizer can synchronously admit a response turn into either chat;
+        # keeping this completed run BUSY until that work returned made an
+        # otherwise-idle chat look occupied and forced its response to queue.
+        # Keep the durable terminal pipeline joined across caller cancellation
+        # just like the subprocess runners do.
+        terminal_task = asyncio.create_task(finalize_owned_turn_finished(
+            session_id,
+            current_run_id,
+            stopped=stopped,
+            payload=terminal_payload,
+        ))
+        terminal_finalization_started = True
+        try:
+            released = await asyncio.shield(terminal_task)
+        except asyncio.CancelledError:
+            released = await join_task_despite_caller_cancellation(
+                terminal_task
+            )
+            raise
+        if released and provider_id and not standalone_provider_context:
             # Native children spawned during this turn stay loaded in the
             # app-server until something unsubscribes them. Finalize them
             # after the parent's terminal event, detached and bounded, so a
@@ -57604,13 +58147,17 @@ async def run_codex_app_server(
                 run_id=current_run_id,
             )
     finally:
-        RUN_METADATA.pop(current_run_id, None)
-        released = False
+        fallback_released = False
         try:
-            released = await release_turn_slot(
-                session_id,
-                expected_run_id=current_run_id,
-            )
+            if not terminal_finalization_started:
+                # Post-processing failed before the owned terminal pipeline
+                # could start. Preserve the prior exact-owner recovery path;
+                # the task supervisor will publish a missing terminal marker.
+                RUN_METADATA.pop(current_run_id, None)
+                fallback_released = await release_turn_slot(
+                    session_id,
+                    expected_run_id=current_run_id,
+                )
         finally:
             try:
                 if thread_pinned and provider_id:
@@ -57623,16 +58170,17 @@ async def run_codex_app_server(
                     else:
                         await unpin_codex_app_server_thread(manager, provider_id)
             finally:
-                drain_queue = should_schedule_queue_after_finish(
-                    session_id,
-                    stopped,
-                )
-                STOPPED_RUNS.discard(current_run_id)
-                # Unpinning is provider-cache hygiene after the chat slot has
-                # already been released. It must not strand an admitted queue
-                # successor if unpin raises or this runner is cancelled.
-                if released and drain_queue:
-                    schedule_next_queued_turn(session_id)
+                if not terminal_finalization_started:
+                    drain_queue = should_schedule_queue_after_finish(
+                        session_id,
+                        stopped,
+                    )
+                    STOPPED_RUNS.discard(current_run_id)
+                    # Unpinning is provider-cache hygiene after the chat slot
+                    # has already been released. It must not strand an admitted
+                    # successor if unpin raises or this runner is cancelled.
+                    if fallback_released and drain_queue:
+                        schedule_next_queued_turn(session_id)
 
 
 async def run_codex(
@@ -58059,6 +58607,25 @@ async def _start_turn_locked(
                 "accepted; retry the message"
             ),
         )
+    runtime_fields_set = request_fields_set(req)
+    runtime_validation_patch: dict[str, Any] = {}
+    if req.backend:
+        runtime_validation_patch["backend"] = req.backend
+    if "model" in runtime_fields_set and req.model is not None:
+        runtime_validation_patch["model"] = req.model
+    if "effort" in runtime_fields_set and req.effort is not None:
+        runtime_validation_patch["effort"] = req.effort
+    # Validate user-selected runtime changes before a busy chat durably accepts
+    # the message into its queue. Promotion must not be the first place an
+    # invalid backend/model/effort or a locked backend switch is discovered.
+    preview_session_runtime_update(
+        (
+            standalone_provider_session(sess)
+            if provider_context_mode == "standalone"
+            else sess
+        ),
+        runtime_validation_patch,
+    )
     if provider_context_goal_is_exhausted(sess, provider_context_mode):
         raise HTTPException(
             status_code=409,
@@ -58207,7 +58774,7 @@ async def _start_turn_locked(
         and local_route_hint_target_ids(req.chat_references)
     )
     try:
-        fields_set = request_fields_set(req)
+        fields_set = runtime_fields_set
         runtime_patch: dict[str, Any] = {}
         if req.backend:
             runtime_patch["backend"] = req.backend
@@ -58327,6 +58894,7 @@ async def _start_turn_locked(
             tuple[str, str], dict[str, Any]
         ] = {}
         exchange_response_followup_allowed = True
+        exchange_response_followup_async = False
         exchange_request_grants: dict[str, str] = {}
         for exchange_id in turn_exchange_ids:
             exchange_grant_record = await CROSS_CHAT.get_exchange(str(exchange_id))
@@ -58351,6 +58919,9 @@ async def _start_turn_locked(
                 - int(delivery_exchange.get("used_legs") or 0)
                 >= 2
             )
+            exchange_response_followup_async = not bool(
+                delivery_exchange.get("live_response_requested")
+            )
         elif (
             req.purpose == "secure_peer_handoff_delivery"
             and secure_delivery_record is not None
@@ -58367,6 +58938,7 @@ async def _start_turn_locked(
                 - int(secure_delivery_record.get("used_legs") or 0)
                 >= 2
             )
+            exchange_response_followup_async = True
             try:
                 response_snapshot = await asyncio.to_thread(
                     secure_peer_response_snapshot_for_delivery,
@@ -58455,10 +59027,15 @@ async def _start_turn_locked(
             session_id,
             provider_actions,
             provider_jobs_access,
-            exchange_response_grant,
-            exchange_response_followup_allowed,
-            provider_authority_route_snapshot,
-            team_mail_command,
+            exchange_response_grant=exchange_response_grant,
+            exchange_response_followup_allowed=(
+                exchange_response_followup_allowed
+            ),
+            exchange_response_followup_async=(
+                exchange_response_followup_async
+            ),
+            provider_route_snapshot=provider_authority_route_snapshot,
+            team_mail_command=team_mail_command,
             team_references=(
                 list(req.team_references) if "team_send" in provider_actions else None
             ),
@@ -71958,8 +72535,13 @@ async def submit_provider_route_handoff(
         ):
             raise generic_provider_route_delivery_error()
         live_waiter: dict[str, Any] | None = None
+        live_wait_deferred = bool(
+            req.wait_for_response
+            and exchange.get("live_response_requested")
+            and not exchange.get("live_response_lease")
+        )
         try:
-            if req.wait_for_response:
+            if req.wait_for_response and not live_wait_deferred:
                 async with cross_chat_live_lease_lock(str(exchange["id"])):
                     live_waiter = await register_or_replay_cross_chat_live_waiter_locked(
                         exchange,
@@ -71991,8 +72573,33 @@ async def submit_provider_route_handoff(
                 exchange, leg = await submit_cross_chat_exchange_leg(
                     exchange, leg
                 )
-        except Exception as exc:
-            if req.wait_for_response:
+        except BaseException as exc:
+            defer_reason = cross_chat_exchange_submission_defer_reason(exc)
+            deferred_submission = False
+            if req.wait_for_response and defer_reason is not None:
+                outcome = await defer_cross_chat_live_acceptance(
+                    str(exchange["id"]),
+                    str(leg.get("id") or ""),
+                    live_waiter,
+                )
+                if outcome.get("state") in {"deferred", "live"}:
+                    exchange = outcome.get("exchange") or exchange
+                    leg = outcome.get("leg") or leg
+                    live_wait_deferred = outcome.get("state") == "deferred"
+                    if live_wait_deferred:
+                        live_waiter = None
+                    if str(leg.get("status") or "") == "registered":
+                        schedule_cross_chat_exchange_leg_retry(
+                            str(leg.get("id") or "")
+                        )
+                    deferred_submission = True
+            if isinstance(exc, asyncio.CancelledError):
+                raise
+            if not isinstance(exc, Exception):
+                raise
+            if deferred_submission:
+                pass
+            elif req.wait_for_response and not live_wait_deferred:
                 failed = await fail_cross_chat_exchange(
                     str(exchange["id"]),
                     leg_id=str(leg.get("id") or ""),
@@ -72005,7 +72612,9 @@ async def submit_provider_route_handoff(
                         error_code="live_lease_submission_failed",
                         error="live cross-chat request could not acquire its peer delivery",
                     )
-            raise generic_provider_route_delivery_error() from exc
+                raise generic_provider_route_delivery_error() from exc
+            else:
+                raise generic_provider_route_delivery_error() from exc
         if (
             str(exchange.get("status") or "")
             in CROSS_CHAT_EXCHANGE_TERMINAL_STATUSES - {"completed"}
@@ -72022,6 +72631,11 @@ async def submit_provider_route_handoff(
         if live_waiter is not None:
             receipt["_live_exchange"] = exchange
             receipt["_live_waiter"] = live_waiter
+        elif live_wait_deferred:
+            receipt.update(deferred_cross_chat_live_response(
+                str(exchange.get("id") or ""),
+                str(leg.get("id") or ""),
+            ))
         return receipt
 
     completion = asyncio.create_task(accept_and_finish())
@@ -72034,15 +72648,17 @@ async def submit_provider_route_handoff(
         with suppress(BaseException):
             accepted = await join_task_despite_caller_cancellation(completion)
         if accepted is not None and accepted.get("_live_waiter") is not None:
-            with suppress(Exception):
-                await cancel_cross_chat_exchange(
-                    str((accepted.get("_live_exchange") or {}).get("id") or "")
+            with suppress(BaseException):
+                await join_task_despite_caller_cancellation(
+                    asyncio.create_task(
+                        preserve_cancelled_cross_chat_live_acceptance(accepted)
+                    )
                 )
         raise
     live_exchange = accepted.pop("_live_exchange", None)
     live_waiter = accepted.pop("_live_waiter", None)
     if live_exchange is not None and live_waiter is not None:
-        return cross_chat_live_wait_receipt(
+        return await finalized_cross_chat_live_receipt(
             accepted,
             live_exchange,
             live_waiter,
@@ -72087,8 +72703,13 @@ async def submit_authorized_cross_chat_handoff(
             exchange = dict(accepted["exchange"])
             leg = dict(accepted["leg"])
             live_waiter: dict[str, Any] | None = None
+            live_wait_deferred = bool(
+                req.wait_for_response
+                and exchange.get("live_response_requested")
+                and not exchange.get("live_response_lease")
+            )
             try:
-                if req.wait_for_response:
+                if req.wait_for_response and not live_wait_deferred:
                     async with cross_chat_live_lease_lock(str(exchange["id"])):
                         live_waiter = await register_or_replay_cross_chat_live_waiter_locked(
                             exchange,
@@ -72113,8 +72734,31 @@ async def submit_authorized_cross_chat_handoff(
                 )
                 if created or leg.get("status") in {"registered", "submitting"}:
                     exchange, leg = await submit_cross_chat_exchange_leg(exchange, leg)
-            except BaseException:
-                if req.wait_for_response:
+            except BaseException as exc:
+                defer_reason = cross_chat_exchange_submission_defer_reason(exc)
+                deferred_submission = False
+                if req.wait_for_response and defer_reason is not None:
+                    outcome = await defer_cross_chat_live_acceptance(
+                        str(exchange["id"]),
+                        str(leg.get("id") or ""),
+                        live_waiter,
+                    )
+                    if outcome.get("state") in {"deferred", "live"}:
+                        exchange = outcome.get("exchange") or exchange
+                        leg = outcome.get("leg") or leg
+                        live_wait_deferred = outcome.get("state") == "deferred"
+                        if live_wait_deferred:
+                            live_waiter = None
+                        if str(leg.get("status") or "") == "registered":
+                            schedule_cross_chat_exchange_leg_retry(
+                                str(leg.get("id") or "")
+                            )
+                        deferred_submission = True
+                if isinstance(exc, asyncio.CancelledError):
+                    raise
+                if deferred_submission:
+                    pass
+                elif req.wait_for_response and not live_wait_deferred:
                     failed = await fail_cross_chat_exchange(
                         str(exchange["id"]),
                         leg_id=str(leg.get("id") or ""),
@@ -72127,7 +72771,9 @@ async def submit_authorized_cross_chat_handoff(
                             error_code="live_lease_submission_failed",
                             error="live cross-chat request could not acquire its peer delivery",
                         )
-                raise
+                    raise
+                else:
+                    raise
             receipt = {
                 "ok": True,
                 "action": "request_reply",
@@ -72136,6 +72782,11 @@ async def submit_authorized_cross_chat_handoff(
             if live_waiter is not None:
                 receipt["_live_exchange"] = exchange
                 receipt["_live_waiter"] = live_waiter
+            elif live_wait_deferred:
+                receipt.update(deferred_cross_chat_live_response(
+                    str(exchange.get("id") or ""),
+                    str(leg.get("id") or ""),
+                ))
             return receipt
         await append_cross_chat_event_once(
             str(accepted["source_session_id"]),
@@ -72164,15 +72815,17 @@ async def submit_authorized_cross_chat_handoff(
         with suppress(BaseException):
             accepted = await join_task_despite_caller_cancellation(completion)
         if accepted is not None and accepted.get("_live_waiter") is not None:
-            with suppress(Exception):
-                await cancel_cross_chat_exchange(
-                    str((accepted.get("_live_exchange") or {}).get("id") or "")
+            with suppress(BaseException):
+                await join_task_despite_caller_cancellation(
+                    asyncio.create_task(
+                        preserve_cancelled_cross_chat_live_acceptance(accepted)
+                    )
                 )
         raise
     live_exchange = accepted.pop("_live_exchange", None)
     live_waiter = accepted.pop("_live_waiter", None)
     if live_exchange is not None and live_waiter is not None:
-        return cross_chat_live_wait_receipt(
+        return await finalized_cross_chat_live_receipt(
             accepted,
             live_exchange,
             live_waiter,
@@ -72204,16 +72857,23 @@ async def submit_authorized_cross_chat_exchange_response(
         live_response_lease = bool(
             snapshot is not None and snapshot.get("live_response_lease")
         )
+        deferred_live_followup = bool(
+            req.wait_for_response
+            and snapshot is not None
+            and snapshot.get("live_response_requested")
+            and not live_response_lease
+        )
         if req.wait_for_response and not live_response_lease:
             await require_cross_chat_live_response_preflight(
                 capability,
                 exchange_id=exchange_id,
                 inbound_leg_id=req.inbound_leg_id,
             )
-            raise HTTPException(
-                status_code=400,
-                detail="live follow-up requires a same-server live exchange",
-            )
+            if not deferred_live_followup:
+                raise HTTPException(
+                    status_code=400,
+                    detail="live follow-up requires a same-server live exchange",
+                )
         if live_response_lease:
             await require_cross_chat_live_response_preflight(
                 capability,
@@ -72226,6 +72886,7 @@ async def submit_authorized_cross_chat_exchange_response(
                     detail="live cross-chat follow-up must keep its caller waiting",
                 )
             delivery_error: HTTPException | None = None
+            fallback_to_async = False
             exchange: dict[str, Any]
             leg: dict[str, Any]
             next_waiter: dict[str, Any] | None = None
@@ -72286,10 +72947,52 @@ async def submit_authorized_cross_chat_exchange_response(
                             replay_receipt["_live_waiter"] = replay_waiter
                         return replay_receipt
                 if (
+                    current_exchange is not None
+                    and current_exchange.get("status") == "active"
+                    and bool(current_exchange.get("live_response_requested"))
+                    and not bool(current_exchange.get("live_response_lease"))
+                ):
+                    # The response may have observed the old live snapshot just
+                    # before the waiting caller atomically downgraded it. Join
+                    # that winner and commit this response through the durable
+                    # async path instead of misclassifying it as lease loss.
+                    fallback_to_async = True
+                if (
+                    current_exchange is not None
+                    and current_exchange.get("status") == "active"
+                    and bool(current_exchange.get("live_response_lease"))
+                    and (
+                        parent_waiter is None
+                        or bool(parent_waiter.get("abandoned"))
+                    )
+                ):
+                    current_exchange, _changed = (
+                        await CROSS_CHAT.downgrade_live_exchange(
+                            exchange_id,
+                            active_leg_id=req.inbound_leg_id,
+                            expected_instance_id=str(
+                                current_exchange.get("live_response_instance_id")
+                                or ""
+                            ),
+                        )
+                    )
+                    if (
+                        current_exchange is not None
+                        and current_exchange.get("status") == "active"
+                        and not bool(current_exchange.get("live_response_lease"))
+                    ):
+                        fallback_to_async = True
+                        if parent_waiter is not None:
+                            CROSS_CHAT_LIVE_RESPONSE_WAITERS.pop(
+                                (exchange_id, req.inbound_leg_id),
+                                None,
+                            )
+                if not fallback_to_async and (
                     current_exchange is None
                     or current_exchange.get("status") != "active"
                     or not bool(current_exchange.get("live_response_lease"))
                     or parent_waiter is None
+                    or bool(parent_waiter.get("abandoned"))
                     or parent_waiter["future"].done()
                 ):
                     delivery_error = HTTPException(
@@ -72305,7 +73008,7 @@ async def submit_authorized_cross_chat_exchange_response(
                         )
                         if failed is not None:
                             current_exchange = failed
-                else:
+                elif not fallback_to_async:
                     exchange, leg, _created = (
                         await create_authorized_cross_chat_exchange_response(
                             capability,
@@ -72364,7 +73067,10 @@ async def submit_authorized_cross_chat_exchange_response(
                                 detail="live cross-chat response delivery failed",
                             )
                         )
-            if delivery_error is not None:
+            if fallback_to_async:
+                live_response_lease = False
+                deferred_live_followup = bool(req.wait_for_response)
+            elif delivery_error is not None:
                 if current_exchange is not None:
                     await maybe_deliver_cross_chat_exchange_failure_status(
                         current_exchange,
@@ -72379,26 +73085,27 @@ async def submit_authorized_cross_chat_exchange_response(
                         ),
                     )
                 raise delivery_error
-            with suppress(Exception):
-                await append_cross_chat_exchange_leg_terminal_lifecycle(
-                    exchange,
-                    leg,
-                    "Cross-chat response was delivered to the waiting provider call.",
-                )
-                if str(exchange.get("status") or "") == "completed":
-                    await append_cross_chat_exchange_terminal_lifecycle(
+            else:
+                with suppress(Exception):
+                    await append_cross_chat_exchange_leg_terminal_lifecycle(
                         exchange,
-                        "Cross-chat live exchange completed.",
+                        leg,
+                        "Cross-chat response was delivered to the waiting provider call.",
                     )
-            receipt: dict[str, Any] = {
-                "ok": True,
-                "action": "response",
-                "accepted": True,
-            }
-            if next_waiter is not None:
-                receipt["_live_exchange"] = exchange
-                receipt["_live_waiter"] = next_waiter
-            return receipt
+                    if str(exchange.get("status") or "") == "completed":
+                        await append_cross_chat_exchange_terminal_lifecycle(
+                            exchange,
+                            "Cross-chat live exchange completed.",
+                        )
+                receipt: dict[str, Any] = {
+                    "ok": True,
+                    "action": "response",
+                    "accepted": True,
+                }
+                if next_waiter is not None:
+                    receipt["_live_exchange"] = exchange
+                    receipt["_live_waiter"] = next_waiter
+                return receipt
 
         exchange, leg, created = await create_authorized_cross_chat_exchange_response(
             capability,
@@ -72434,10 +73141,27 @@ async def submit_authorized_cross_chat_exchange_response(
                     exchange,
                     leg,
                 )
-        except Exception as exc:
-            if configured_route:
-                raise generic_provider_route_delivery_error() from exc
-            raise
+        except BaseException as exc:
+            defer_reason = cross_chat_exchange_submission_defer_reason(exc)
+            if deferred_live_followup and defer_reason is not None:
+                exchange = (
+                    await CROSS_CHAT.get_exchange(str(exchange.get("id") or ""))
+                ) or exchange
+                leg = (
+                    await CROSS_CHAT.get_exchange_leg(str(leg.get("id") or ""))
+                ) or leg
+                if str(leg.get("status") or "") == "registered":
+                    schedule_cross_chat_exchange_leg_retry(
+                        str(leg.get("id") or "")
+                    )
+                if isinstance(exc, asyncio.CancelledError):
+                    raise
+            else:
+                if not isinstance(exc, Exception):
+                    raise
+                if configured_route:
+                    raise generic_provider_route_delivery_error() from exc
+                raise
         if configured_route:
             if (
                 str(exchange.get("status") or "")
@@ -72446,11 +73170,17 @@ async def submit_authorized_cross_chat_exchange_response(
                 in {"failed", "cancelled", "expired"}
             ):
                 raise generic_provider_route_delivery_error()
-        return {
+        receipt = {
             "ok": True,
             "action": "response",
             "accepted": True,
         }
+        if deferred_live_followup:
+            receipt.update(deferred_cross_chat_live_response(
+                str(exchange.get("id") or exchange_id),
+                str(leg.get("id") or req.inbound_leg_id),
+            ))
+        return receipt
 
     completion = asyncio.create_task(accept_and_finish_response())
     accepted: dict[str, Any] | None = None
@@ -72460,15 +73190,17 @@ async def submit_authorized_cross_chat_exchange_response(
         with suppress(BaseException):
             accepted = await join_task_despite_caller_cancellation(completion)
         if accepted is not None and accepted.get("_live_waiter") is not None:
-            with suppress(Exception):
-                await cancel_cross_chat_exchange(
-                    str((accepted.get("_live_exchange") or {}).get("id") or "")
+            with suppress(BaseException):
+                await join_task_despite_caller_cancellation(
+                    asyncio.create_task(
+                        preserve_cancelled_cross_chat_live_acceptance(accepted)
+                    )
                 )
         raise
     live_exchange = accepted.pop("_live_exchange", None)
     live_waiter = accepted.pop("_live_waiter", None)
     if live_exchange is not None and live_waiter is not None:
-        return cross_chat_live_wait_receipt(
+        return await finalized_cross_chat_live_receipt(
             accepted,
             live_exchange,
             live_waiter,

@@ -13,6 +13,7 @@ import httpx
 from pydantic import ValidationError
 
 import agent_server
+import agentsdock_chats
 
 
 def http_request(
@@ -53,6 +54,10 @@ class ServerOpsSecurityTests(unittest.IsolatedAsyncioTestCase):
             ],
             "legacy_name": [
                 (b"x-agentsdock-cross-chat-capability", b"legacy-capability"),
+            ],
+            "canonical_plus_legacy": [
+                (b"x-agentsdock-provider-capability", b"capability-one"),
+                (b"x-agentsdock-cross-chat-capability", b"capability-one"),
             ],
             "duplicate": [
                 (b"x-agentsdock-provider-capability", b"capability-one"),
@@ -266,6 +271,35 @@ class ServerOpsSecurityTests(unittest.IsolatedAsyncioTestCase):
             received_body,
             b'{"request_id":"request-1","message":"help"}',
         )
+
+    async def test_cross_chat_cli_headers_pass_agent_helper_middleware(self):
+        token = "live-provider-capability"
+        token_hash = hashlib.sha256(token.encode("utf-8")).hexdigest()
+        headers = [
+            (name.lower().encode("ascii"), value.encode("ascii"))
+            for name, value in agentsdock_chats.provider_headers(token).items()
+        ]
+        request = http_request(
+            "GET",
+            "/api/agent/cross-chat/routes",
+            headers=headers,
+        )
+        downstream = AsyncMock(
+            return_value=agent_server.JSONResponse({"routes": []})
+        )
+
+        with patch.object(
+            agent_server,
+            "CROSS_CHAT_CAPABILITIES",
+            {token_hash: {"source_run_id": "run-live"}},
+        ):
+            response = await agent_server.require_agent_token(
+                request,
+                downstream,
+            )
+
+        self.assertEqual(response.status_code, 200)
+        downstream.assert_awaited_once_with(request)
 
     def test_agent_helper_loopback_rejects_proxy_identity_headers(self):
         self.assertTrue(

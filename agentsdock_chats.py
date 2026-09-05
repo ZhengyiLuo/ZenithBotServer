@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import http.client
 import ipaddress
 import json
 import os
@@ -20,6 +21,8 @@ from typing import Any
 # commonly 120 seconds). The server still enforces its own configurable cap.
 LIVE_RESPONSE_TIMEOUT_SECONDS = 75
 LIVE_RESPONSE_SOCKET_GRACE_SECONDS = 15
+IDEMPOTENT_POST_RETRY_DELAYS_SECONDS = (0.1, 0.5)
+IDEMPOTENT_GET_RETRY_DELAYS_SECONDS = (0.1, 0.5)
 
 
 class ChatsCLIError(RuntimeError):
@@ -66,6 +69,20 @@ def authority(path: str) -> str:
     return token
 
 
+def provider_headers(capability: str) -> dict[str, str]:
+    """Return the one canonical header accepted by agent-helper routes.
+
+    The retired cross-chat-specific header is intentionally omitted.  The
+    server rejects requests that mix legacy and current authority names so a
+    browser or stale helper cannot smuggle ambiguous credentials.
+    """
+
+    return {
+        "Accept": "application/json",
+        "X-AgentsDock-Provider-Capability": capability,
+    }
+
+
 def post_json(
     path: str,
     payload: dict[str, Any],
@@ -74,10 +91,8 @@ def post_json(
     server_url = environment()
     body = json.dumps(payload).encode("utf-8")
     headers = {
-        "Accept": "application/json",
+        **provider_headers(capability),
         "Content-Type": "application/json",
-        "X-AgentsDock-Cross-Chat-Capability": capability,
-        "X-AgentsDock-Provider-Capability": capability,
     }
     request = urllib.request.Request(
         f"{server_url}{path}",
@@ -90,6 +105,7 @@ def post_json(
         NoRedirectHandler(),
     )
     promotion_deadline = time.monotonic() + 10.0
+    transport_retry = 0
     while True:
         try:
             socket_timeout = (
@@ -102,7 +118,26 @@ def post_json(
                 result = json.loads(response.read().decode("utf-8"))
             break
         except urllib.error.HTTPError as exc:
-            raw = exc.read().decode("utf-8", errors="replace")
+            try:
+                raw = exc.read().decode("utf-8", errors="replace")
+            except (OSError, http.client.IncompleteRead) as read_exc:
+                retryable = bool(payload.get("idempotency_key"))
+                if (
+                    retryable
+                    and transport_retry
+                    < len(IDEMPOTENT_POST_RETRY_DELAYS_SECONDS)
+                ):
+                    delay = IDEMPOTENT_POST_RETRY_DELAYS_SECONDS[
+                        transport_retry
+                    ]
+                    transport_retry += 1
+                    time.sleep(delay)
+                    continue
+                raise ChatsCLIError(
+                    "could not confirm whether AgentsServer accepted the "
+                    "request because its error response was truncated; do "
+                    "not resend it with different wording"
+                ) from read_exc
             try:
                 detail = json.loads(raw).get("detail") or raw
             except json.JSONDecodeError:
@@ -119,9 +154,34 @@ def post_json(
             raise ChatsCLIError(
                 f"server rejected handoff ({exc.code}): {detail or exc.reason}"
             ) from exc
-        except (urllib.error.URLError, TimeoutError, OSError) as exc:
+        except (
+            urllib.error.URLError,
+            TimeoutError,
+            OSError,
+            http.client.IncompleteRead,
+            UnicodeDecodeError,
+            json.JSONDecodeError,
+        ) as exc:
+            retryable = bool(payload.get("idempotency_key"))
+            if (
+                retryable
+                and transport_retry < len(IDEMPOTENT_POST_RETRY_DELAYS_SECONDS)
+            ):
+                delay = IDEMPOTENT_POST_RETRY_DELAYS_SECONDS[transport_retry]
+                transport_retry += 1
+                # Reuse the byte-identical request and idempotency key. The
+                # prior server attempt may still commit after its socket dies.
+                time.sleep(delay)
+                continue
+            detail = getattr(exc, "reason", exc)
+            if retryable:
+                raise ChatsCLIError(
+                    "could not confirm whether AgentsServer accepted the "
+                    "request after retrying the same idempotency key; do not "
+                    f"resend it with different wording: {detail}"
+                ) from exc
             raise ChatsCLIError(
-                f"could not reach AgentsServer: {getattr(exc, 'reason', exc)}"
+                f"could not reach AgentsServer: {detail}"
             ) from exc
     if not isinstance(result, dict):
         raise ChatsCLIError("AgentsServer returned an invalid response")
@@ -137,33 +197,60 @@ def get_json(
     server_url = environment()
     request = urllib.request.Request(
         f"{server_url}{path}",
-        headers={
-            "Accept": "application/json",
-            "X-AgentsDock-Cross-Chat-Capability": capability,
-            "X-AgentsDock-Provider-Capability": capability,
-        },
+        headers=provider_headers(capability),
         method="GET",
     )
     opener = urllib.request.build_opener(
         urllib.request.ProxyHandler({}),
         NoRedirectHandler(),
     )
-    try:
-        with opener.open(request, timeout=timeout) as response:
-            result = json.loads(response.read().decode("utf-8"))
-    except urllib.error.HTTPError as exc:
-        raw = exc.read().decode("utf-8", errors="replace")
+    transport_retry = 0
+    while True:
         try:
-            detail = json.loads(raw).get("detail") or raw
-        except json.JSONDecodeError:
-            detail = raw
-        raise ChatsCLIError(
-            f"server rejected request ({exc.code}): {detail or exc.reason}"
-        ) from exc
-    except (urllib.error.URLError, TimeoutError, OSError) as exc:
-        raise ChatsCLIError(
-            f"could not reach AgentsServer: {getattr(exc, 'reason', exc)}"
-        ) from exc
+            with opener.open(request, timeout=timeout) as response:
+                result = json.loads(response.read().decode("utf-8"))
+            break
+        except urllib.error.HTTPError as exc:
+            try:
+                raw = exc.read().decode("utf-8", errors="replace")
+            except (OSError, http.client.IncompleteRead) as read_exc:
+                if transport_retry < len(IDEMPOTENT_GET_RETRY_DELAYS_SECONDS):
+                    delay = IDEMPOTENT_GET_RETRY_DELAYS_SECONDS[
+                        transport_retry
+                    ]
+                    transport_retry += 1
+                    time.sleep(delay)
+                    continue
+                raise ChatsCLIError(
+                    "AgentsServer returned a truncated error response after "
+                    "retrying the exact live-response lease"
+                ) from read_exc
+            try:
+                detail = json.loads(raw).get("detail") or raw
+            except json.JSONDecodeError:
+                detail = raw
+            raise ChatsCLIError(
+                f"server rejected request ({exc.code}): {detail or exc.reason}"
+            ) from exc
+        except (
+            urllib.error.URLError,
+            TimeoutError,
+            OSError,
+            http.client.IncompleteRead,
+            UnicodeDecodeError,
+            json.JSONDecodeError,
+        ) as exc:
+            if transport_retry < len(IDEMPOTENT_GET_RETRY_DELAYS_SECONDS):
+                delay = IDEMPOTENT_GET_RETRY_DELAYS_SECONDS[transport_retry]
+                transport_retry += 1
+                # GET is side-effect free and the live-response URL contains
+                # the same exact lease on every attempt. The server retains a
+                # completed result briefly for this replay window.
+                time.sleep(delay)
+                continue
+            raise ChatsCLIError(
+                f"could not reach AgentsServer: {getattr(exc, 'reason', exc)}"
+            ) from exc
     if not isinstance(result, dict):
         raise ChatsCLIError("AgentsServer returned an invalid response")
     return result
@@ -188,14 +275,29 @@ def await_live_response(
         capability,
         timeout=timeout_seconds + LIVE_RESPONSE_SOCKET_GRACE_SECONDS,
     )
+    answer_keys = {
+        "ok", "exchange_id", "inbound_leg_id", "body", "request_response",
+    }
+    deferred_keys = {
+        "ok", "exchange_id", "inbound_leg_id", "deferred", "delivery",
+        "message",
+    }
+    valid_answer = (
+        set(result) == answer_keys
+        and isinstance(result.get("body"), str)
+        and isinstance(result.get("request_response"), bool)
+    )
+    valid_deferred = (
+        set(result) == deferred_keys
+        and result.get("deferred") is True
+        and result.get("delivery") == "asynchronous"
+        and isinstance(result.get("message"), str)
+    )
     if (
-        set(result)
-        != {"ok", "exchange_id", "inbound_leg_id", "body", "request_response"}
+        not (valid_answer or valid_deferred)
         or result.get("ok") is not True
         or result.get("exchange_id") != exchange_id
         or not isinstance(result.get("inbound_leg_id"), str)
-        or not isinstance(result.get("body"), str)
-        or not isinstance(result.get("request_response"), bool)
     ):
         raise ChatsCLIError("AgentsServer returned an invalid live response")
     return result
@@ -257,6 +359,7 @@ def send_action(args: argparse.Namespace, action: str) -> dict[str, Any]:
     if route:
         minimal_expected.add("route_id")
     expected = set(minimal_expected)
+    deferred_expected = set(minimal_expected)
     wait_expected = set(minimal_expected)
     if live_wait:
         expected.update({
@@ -269,6 +372,13 @@ def send_action(args: argparse.Namespace, action: str) -> dict[str, Any]:
             "exchange_id",
             "inbound_leg_id",
             "live_response_lease_id",
+        })
+        deferred_expected.update({
+            "exchange_id",
+            "inbound_leg_id",
+            "deferred",
+            "delivery",
+            "message",
         })
         if frozenset(result) == frozenset(wait_expected):
             live_result = await_live_response(
@@ -285,23 +395,48 @@ def send_action(args: argparse.Namespace, action: str) -> dict[str, Any]:
                 "AgentsServer does not support a live response for this route"
             )
     has_live_response = live_wait and frozenset(result) == frozenset(expected)
+    has_deferred_response = (
+        live_wait and frozenset(result) == frozenset(deferred_expected)
+    )
     if route:
         if (
-            frozenset(result) not in {frozenset(minimal_expected), frozenset(expected)}
+            frozenset(result) not in {
+                frozenset(minimal_expected),
+                frozenset(expected),
+                frozenset(deferred_expected),
+            }
             or result.get("ok") is not True
             or result.get("route_id") != route
             or result.get("action") != action
             or result.get("accepted") is not True
             or (has_live_response and not isinstance(result.get("body"), str))
+            or (
+                has_deferred_response
+                and (
+                    result.get("deferred") is not True
+                    or result.get("delivery") != "asynchronous"
+                )
+            )
         ):
             raise ChatsCLIError("AgentsServer returned an invalid route handoff response")
     else:
         if (
-            frozenset(result) not in {frozenset(minimal_expected), frozenset(expected)}
+            frozenset(result) not in {
+                frozenset(minimal_expected),
+                frozenset(expected),
+                frozenset(deferred_expected),
+            }
             or result.get("ok") is not True
             or result.get("action") != action
             or result.get("accepted") is not True
             or (has_live_response and not isinstance(result.get("body"), str))
+            or (
+                has_deferred_response
+                and (
+                    result.get("deferred") is not True
+                    or result.get("delivery") != "asynchronous"
+                )
+            )
         ):
             raise ChatsCLIError("AgentsServer returned an invalid direct handoff response")
     return result
@@ -350,6 +485,7 @@ def respond(args: argparse.Namespace) -> dict[str, Any]:
     )
     minimal_expected = {"ok", "action", "accepted"}
     expected = set(minimal_expected)
+    deferred_expected = set(minimal_expected)
     wait_expected = set(minimal_expected)
     if live_wait:
         expected.update({
@@ -362,6 +498,13 @@ def respond(args: argparse.Namespace) -> dict[str, Any]:
             "exchange_id",
             "inbound_leg_id",
             "live_response_lease_id",
+        })
+        deferred_expected.update({
+            "exchange_id",
+            "inbound_leg_id",
+            "deferred",
+            "delivery",
+            "message",
         })
         if frozenset(result) == frozenset(wait_expected):
             live_result = await_live_response(
@@ -376,12 +519,26 @@ def respond(args: argparse.Namespace) -> dict[str, Any]:
                 "AgentsServer does not support a live follow-up response"
             )
     has_live_response = live_wait and frozenset(result) == frozenset(expected)
+    has_deferred_response = (
+        live_wait and frozenset(result) == frozenset(deferred_expected)
+    )
     if (
-        frozenset(result) not in {frozenset(minimal_expected), frozenset(expected)}
+        frozenset(result) not in {
+            frozenset(minimal_expected),
+            frozenset(expected),
+            frozenset(deferred_expected),
+        }
         or result.get("ok") is not True
         or result.get("action") != "response"
         or result.get("accepted") is not True
         or (has_live_response and not isinstance(result.get("body"), str))
+        or (
+            has_deferred_response
+            and (
+                result.get("deferred") is not True
+                or result.get("delivery") != "asynchronous"
+            )
+        )
     ):
         raise ChatsCLIError(
             "AgentsServer returned an invalid cross-chat response"

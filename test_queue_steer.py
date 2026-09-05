@@ -2649,6 +2649,125 @@ class RunQueuedTurnNowTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(agent_server.QUEUED_TURNS["chat-1"]), 1)
         start.assert_not_awaited()
 
+    async def test_busy_turn_rejects_invalid_backend_before_queueing(self) -> None:
+        agent_server.BUSY_SESSIONS = {"chat-1"}
+        enqueue = AsyncMock()
+        with patch.object(agent_server, "enqueue_turn", enqueue):
+            with self.assertRaises(HTTPException) as raised:
+                await agent_server._start_turn_locked(
+                    "chat-1",
+                    agent_server.TurnRequest(
+                        prompt="Do not queue an invalid runtime",
+                        backend="not-a-provider",
+                    ),
+                    queue_if_busy=True,
+                    admission_backend="codex",
+                )
+        self.assertEqual(raised.exception.status_code, 400)
+        enqueue.assert_not_awaited()
+
+    async def test_permanent_promotion_rejection_durably_unqueues_user_turn(self) -> None:
+        agent_server.CURRENT_TURNS.clear()
+        durable = AsyncMock(return_value={})
+        with (
+            patch.object(
+                agent_server,
+                "_start_turn_locked",
+                AsyncMock(side_effect=HTTPException(status_code=400, detail="invalid runtime")),
+            ),
+            patch.object(agent_server, "append_durable_event", durable),
+            patch.object(agent_server, "append_event", AsyncMock()),
+        ):
+            await agent_server._start_next_queued_turn_locked(
+                "chat-1",
+                admission_backend="codex",
+            )
+        self.assertNotIn("chat-1", agent_server.QUEUED_TURNS)
+        self.assertTrue(any(
+            call.args[1] == "turn_unqueued"
+            and call.args[2]["queued_id"] == "queued-steer"
+            for call in durable.await_args_list
+        ))
+
+    async def test_terminally_discarded_head_immediately_promotes_next_row(self) -> None:
+        agent_server.CURRENT_TURNS.clear()
+        invalid = {
+            "queued_id": "queued-invalid-head",
+            "prompt": "Invalid saved reference",
+            "file_ids": [],
+            "backend": "codex",
+            "chat_references": [{}],
+            "team_references": [],
+        }
+        valid = {
+            "queued_id": "queued-valid-second",
+            "prompt": "Run the valid second row",
+            "file_ids": [],
+            "backend": "codex",
+            "chat_references": [],
+            "team_references": [],
+        }
+        agent_server.QUEUED_TURNS["chat-1"] = deque([invalid, valid])
+        second_started = asyncio.Event()
+
+        async def start_second(
+            _session_id: str,
+            request: agent_server.TurnRequest,
+            **_kwargs: object,
+        ) -> dict[str, object]:
+            self.assertEqual(request.prompt, valid["prompt"])
+            second_started.set()
+            return {"queued": False}
+
+        with (
+            patch.object(
+                agent_server,
+                "wait_for_queue_recovery_admission",
+                new_callable=AsyncMock,
+            ),
+            patch.object(
+                agent_server,
+                "reconcile_idle_queue_session",
+                new_callable=AsyncMock,
+            ),
+            patch.object(agent_server, "append_durable_event", AsyncMock(return_value={})),
+            patch.object(agent_server, "append_event", AsyncMock(return_value={})),
+            patch.object(agent_server, "_start_turn_locked", side_effect=start_second) as start,
+        ):
+            await agent_server.start_next_queued_turn("chat-1")
+            await asyncio.wait_for(second_started.wait(), timeout=1)
+            for _ in range(20):
+                owner = agent_server.QUEUE_START_TASKS.get("chat-1")
+                if owner is None or owner.done():
+                    break
+                await asyncio.sleep(0)
+
+        start.assert_awaited_once()
+        self.assertNotIn("chat-1", agent_server.QUEUED_TURNS)
+
+    async def test_ambiguous_promotion_failure_requeues_user_turn(self) -> None:
+        agent_server.CURRENT_TURNS.clear()
+        schedule = patch.object(agent_server, "schedule_queued_turn_retry")
+        with (
+            patch.object(
+                agent_server,
+                "_start_turn_locked",
+                AsyncMock(side_effect=RuntimeError("temporary provider fault")),
+            ),
+            patch.object(agent_server, "append_event", AsyncMock()) as event,
+            schedule as retry,
+        ):
+            await agent_server._start_next_queued_turn_locked(
+                "chat-1",
+                admission_backend="codex",
+            )
+        self.assertEqual(
+            agent_server.QUEUED_TURNS["chat-1"][0]["queued_id"],
+            "queued-steer",
+        )
+        self.assertEqual(event.await_args.args[1], "turn_deferred")
+        retry.assert_called_once_with("chat-1")
+
     async def test_scheduler_terminally_discards_stale_team_reference(self) -> None:
         agent_server.CURRENT_TURNS.clear()
         stale = {
