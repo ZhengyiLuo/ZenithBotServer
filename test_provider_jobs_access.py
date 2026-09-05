@@ -1,5 +1,7 @@
+import asyncio
 import json
 import tempfile
+import threading
 import unittest
 from pathlib import Path
 from unittest.mock import AsyncMock, patch
@@ -230,6 +232,73 @@ class ProviderJobsAccessTests(unittest.IsolatedAsyncioTestCase):
                 )
         self.assertEqual(
             store.sessions["source"]["provider_jobs_access"],
+            "blocked",
+        )
+
+    async def test_cancelled_policy_expansion_is_rolled_back_on_disk(self) -> None:
+        store = agent_server.SessionStore()
+        store.sessions = {
+            "source": {
+                "id": "source",
+                "backend": "codex",
+                "provider_jobs_access": "blocked",
+            },
+        }
+        sessions_path = self.root / "cancelled-policy-sessions.json"
+        first_write_started = threading.Event()
+        release_first_write = threading.Event()
+        written_policies: list[str] = []
+        real_write = agent_server.write_sessions_json_text
+
+        def blocked_write(
+            path: Path,
+            text: str,
+            *,
+            durable: bool,
+        ) -> None:
+            policy = json.loads(text)["source"]["provider_jobs_access"]
+            written_policies.append(policy)
+            if len(written_policies) == 1:
+                first_write_started.set()
+                self.assertTrue(release_first_write.wait(timeout=2))
+            real_write(path, text, durable=durable)
+
+        with (
+            patch.object(agent_server, "SESSIONS_FILE", sessions_path),
+            patch.object(agent_server, "ensure_dirs"),
+            patch.object(
+                agent_server,
+                "write_sessions_json_text",
+                side_effect=blocked_write,
+            ),
+        ):
+            update_task = asyncio.create_task(store.update(
+                "source",
+                {"provider_jobs_access": "full"},
+            ))
+            try:
+                self.assertTrue(
+                    await asyncio.to_thread(first_write_started.wait, 1)
+                )
+                update_task.cancel()
+                await asyncio.sleep(0)
+                self.assertFalse(update_task.done())
+                # A second cancellation must not interrupt the rollback join.
+                update_task.cancel()
+            finally:
+                release_first_write.set()
+            with self.assertRaises(asyncio.CancelledError):
+                await update_task
+            await store.flush_pending_save()
+
+        self.assertEqual(written_policies, ["full", "blocked"])
+        self.assertEqual(
+            store.sessions["source"]["provider_jobs_access"],
+            "blocked",
+        )
+        persisted = json.loads(sessions_path.read_text(encoding="utf-8"))
+        self.assertEqual(
+            persisted["source"]["provider_jobs_access"],
             "blocked",
         )
 

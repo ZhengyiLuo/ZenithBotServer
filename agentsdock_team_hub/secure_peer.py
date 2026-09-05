@@ -51,6 +51,9 @@ PAIRING_ATTEMPT_RETENTION_SECONDS = 7 * 24 * 60 * 60
 CLIENT_CERT_TTL_SECONDS = 30 * 24 * 60 * 60
 CLIENT_CERT_RENEW_WINDOW_SECONDS = 7 * 24 * 60 * 60
 CLIENT_CERT_OVERLAP_SECONDS = 10 * 60
+RENEWAL_REQUEST_TTL_SECONDS = 24 * 60 * 60
+RETIRED_RENEWAL_MATERIAL_LIMIT = 8
+ACTIVATED_RENEWAL_HISTORY_LIMIT = 8
 MAX_RELAY_TTL_SECONDS = 72 * 60 * 60
 MAX_RELAY_LEGS = 6
 RELAY_LEASE_SECONDS = 60
@@ -872,6 +875,12 @@ class SecurePeerStore:
                 COMMIT;
                 """
             )
+            # Legacy repair is one migration, not a sequence of autocommit
+            # statements.  In particular, a crash after adding the immutable
+            # source-route revision must not leave the pre-ledger envelopes in
+            # place: on the next start the new column would otherwise suppress
+            # the fail-closed purge below.
+            connection.execute("BEGIN IMMEDIATE")
             # Development builds predating the per-route grant ledger may
             # already have created this owner-private database.  Preserve the
             # immutable source grant on those databases instead of silently
@@ -952,7 +961,6 @@ class SecurePeerStore:
                 "hub_id": self.hub_id,
                 "ca_fingerprint": self.ca_fingerprint,
             }
-            connection.execute("BEGIN IMMEDIATE")
             try:
                 for key, value in expected.items():
                     row = connection.execute("SELECT value FROM host_meta WHERE key=?", (key,)).fetchone()
@@ -977,6 +985,10 @@ class SecurePeerStore:
             except BaseException:
                 connection.execute("ROLLBACK")
                 raise
+        except BaseException:
+            if connection.in_transaction:
+                connection.execute("ROLLBACK")
+            raise
         finally:
             connection.close()
 
@@ -1435,6 +1447,26 @@ class SecurePeerStore:
             response["reason"] = row["rejection_reason"] or "Pairing request was rejected"
         return response
 
+    @staticmethod
+    def _expire_pending_pairings(
+        connection: sqlite3.Connection,
+        timestamp: int,
+        *,
+        pairing_id: str | None = None,
+    ) -> int:
+        arguments: list[Any] = [timestamp, timestamp]
+        identity_clause = ""
+        if pairing_id is not None:
+            identity_clause = " AND id=?"
+            arguments.append(pairing_id)
+        return int(
+            connection.execute(
+                "UPDATE pairing_requests SET status='expired',decided_at=? "
+                "WHERE status='pending' AND expires_at<=?" + identity_clause,
+                arguments,
+            ).rowcount
+        )
+
     def submit_pairing(
         self,
         payload: Any,
@@ -1729,11 +1761,13 @@ class SecurePeerStore:
         where = " WHERE " + " AND ".join(conditions) if conditions else ""
         connection = self._connect()
         try:
+            connection.execute("BEGIN IMMEDIATE")
+            self._expire_pending_pairings(connection, self._timestamp())
             rows = connection.execute(
                 "SELECT * FROM pairing_requests" + where + " ORDER BY created_at DESC,id DESC",
                 arguments,
             ).fetchall()
-            return [
+            result = [
                 {
                     "pairing_id": row["id"],
                     "peer_server_identity": row["peer_server_identity"],
@@ -1759,6 +1793,12 @@ class SecurePeerStore:
                 }
                 for row in rows
             ]
+            connection.execute("COMMIT")
+            return result
+        except BaseException:
+            if connection.in_transaction:
+                connection.execute("ROLLBACK")
+            raise
         finally:
             connection.close()
 
@@ -1994,7 +2034,15 @@ class SecurePeerStore:
             row = connection.execute("SELECT * FROM pairing_requests WHERE id=?", (pairing_id,)).fetchone()
             if row is None:
                 raise SecurePeerError("pairing_unavailable", "Pairing is unavailable", 404)
-            if row["status"] != "pending" or int(row["expires_at"]) <= timestamp:
+            if row["status"] == "pending" and int(row["expires_at"]) <= timestamp:
+                self._expire_pending_pairings(
+                    connection,
+                    timestamp,
+                    pairing_id=pairing_id,
+                )
+                connection.execute("COMMIT")
+                raise SecurePeerError("pairing_not_pending", "Pairing is no longer pending", 409)
+            if row["status"] != "pending":
                 raise SecurePeerError("pairing_not_pending", "Pairing is no longer pending", 409)
             if row["peer_server_identity"] != expected_identity or not hmac.compare_digest(
                 row["transcript_hash"], expected_transcript_hash
@@ -2141,7 +2189,15 @@ class SecurePeerStore:
             row = connection.execute("SELECT * FROM pairing_requests WHERE id=?", (pairing_id,)).fetchone()
             if row is None:
                 raise SecurePeerError("pairing_unavailable", "Pairing is unavailable", 404)
-            if row["status"] != "pending" or int(row["expires_at"]) <= timestamp:
+            if row["status"] == "pending" and int(row["expires_at"]) <= timestamp:
+                self._expire_pending_pairings(
+                    connection,
+                    timestamp,
+                    pairing_id=pairing_id,
+                )
+                connection.execute("COMMIT")
+                raise SecurePeerError("pairing_not_pending", "Pairing is no longer pending", 409)
+            if row["status"] != "pending":
                 raise SecurePeerError("pairing_not_pending", "Pairing is no longer pending", 409)
             if row["peer_server_identity"] != expected_identity or not hmac.compare_digest(
                 row["transcript_hash"], expected_transcript_hash
@@ -2794,7 +2850,7 @@ class SecurePeerStore:
                     digest,
                     canonical_json(response).decode("utf-8"),
                     timestamp,
-                    timestamp + 24 * 60 * 60,
+                    timestamp + RENEWAL_REQUEST_TTL_SECONDS,
                 ),
             )
             self._audit(connection, timestamp, peer.peer_id, "peer.certificate.renew.issue", fingerprint)
@@ -2863,6 +2919,21 @@ class SecurePeerStore:
             connection.execute(
                 "UPDATE renewal_requests SET status='activated',activated_at=? WHERE request_id=? AND status='issued'",
                 (timestamp, renewal_id),
+            )
+            # Retain the current activation and a small replay window without
+            # allowing successful renewals to grow this ledger forever.
+            connection.execute(
+                """DELETE FROM renewal_requests WHERE request_id IN (
+                SELECT request_id FROM renewal_requests
+                WHERE peer_id=? AND status='activated' AND request_id<>?
+                ORDER BY activated_at DESC,request_id DESC
+                LIMIT -1 OFFSET ?
+                )""",
+                (
+                    peer.peer_id,
+                    renewal_id,
+                    ACTIVATED_RENEWAL_HISTORY_LIMIT - 1,
+                ),
             )
             response = {
                 "peer_id": peer.peer_id,
@@ -4232,6 +4303,9 @@ def canonical_peer_port(value: int) -> int:
 _TEAM_ROUTE_RE = re.compile(
     rf"^/v1/teams/(?P<team>{_HUB_SEGMENT})(?:/(?P<child>members|nodes|channels|invitations))?$"
 )
+_TEAM_MEMBER_ROUTE_RE = re.compile(
+    rf"^/v1/teams/(?P<team>{_HUB_SEGMENT})/members/(?P<principal>{_HUB_SEGMENT})$"
+)
 _CHANNEL_MESSAGES_RE = re.compile(rf"^/v1/channels/(?P<channel>{_HUB_SEGMENT})/messages$")
 _NETWORK_ROUTE_RE = re.compile(
     rf"^/v1/teams/(?P<team>{_HUB_SEGMENT})/network(?P<suffix>(?:/{_HUB_SEGMENT}){{0,4}})$"
@@ -4564,14 +4638,24 @@ def sanitize_proxy_request(
         required_scope = "teamspace.read"
     else:
         team_match = _TEAM_ROUTE_RE.fullmatch(path)
+        member_match = _TEAM_MEMBER_ROUTE_RE.fullmatch(path)
         channel_match = _CHANNEL_MESSAGES_RE.fullmatch(path)
         network_match = _NETWORK_ROUTE_RE.fullmatch(path)
-        if team_match is not None:
+        if member_match is not None:
+            if member_match.group("team") != peer.team_id:
+                raise SecurePeerError("route_forbidden", "Hub route is outside the paired team", 403)
+            if normalized_method != "GET":
+                raise SecurePeerError("route_forbidden", "Hub route is not permitted", 403)
+            required_scope = "teamspace.read"
+        elif team_match is not None:
             if team_match.group("team") != peer.team_id:
                 raise SecurePeerError("route_forbidden", "Hub route is outside the paired team", 403)
             child = team_match.group("child")
             if normalized_method == "GET" and child in {None, "members", "nodes", "channels"}:
                 required_scope = "teamspace.read"
+                if child == "members":
+                    allow_query = True
+                    allowed_query_keys = {"limit", "cursor"}
             else:
                 raise SecurePeerError("route_forbidden", "Hub route is not permitted", 403)
         elif channel_match is not None:
@@ -4590,6 +4674,12 @@ def sanitize_proxy_request(
                 route_allowed = True
                 allow_query = True
                 allowed_query_keys = {"after_server_id", "limit"}
+            elif (
+                len(pieces) == 2
+                and pieces[0] == "servers"
+                and normalized_method == "GET"
+            ):
+                route_allowed = True
             elif pieces == ["agents"] and normalized_method == "POST":
                 route_allowed = True
             elif pieces == ["bulletin"] and normalized_method in {"GET", "POST"}:
@@ -4735,6 +4825,9 @@ def sanitize_proxy_request(
                 raise SecurePeerError("invalid_request", "Proxy query is invalid", 422)
         if "limit" in values and not 1 <= int(values["limit"]) <= 100:
             raise SecurePeerError("invalid_request", "Proxy query is invalid", 422)
+        if "cursor" in values:
+            if re.fullmatch(r"v1\.[A-Za-z0-9_-]{38,500}", values["cursor"]) is None:
+                raise SecurePeerError("invalid_request", "Proxy query is invalid", 422)
         if "before_sequence" in values and int(values["before_sequence"]) < 1:
             raise SecurePeerError("invalid_request", "Proxy query is invalid", 422)
         if "after_sequence" in values and not 0 <= int(
@@ -5698,7 +5791,26 @@ class SecurePeerGateway:
             )
             self._server = server
             self._thread = thread
-            thread.start()
+            try:
+                thread.start()
+            except BaseException:
+                # Binding/listening has already succeeded, but the runtime
+                # cannot retain this gateway until its serving thread starts.
+                # Release the listener here so a designated-host retry can
+                # bind the exact same endpoint.  shutdown() is safe only once
+                # Thread.start() actually admitted the thread.
+                self._server = None
+                self._thread = None
+                started = thread.ident is not None
+                if started:
+                    with suppress(Exception):
+                        server.shutdown()
+                with suppress(Exception):
+                    server.server_close()
+                if started and thread is not threading.current_thread():
+                    with suppress(Exception):
+                        thread.join(timeout=5)
+                raise
 
     def stop(self, *, timeout_seconds: float = 15.0) -> None:
         with self._guard:
@@ -5968,6 +6080,10 @@ class SecurePeerClient:
                 COMMIT;
                 """
             )
+            # Keep every compatibility ALTER and the identity binding in one
+            # transaction.  Closing the connection rolls this transaction back
+            # if validation or key inspection below fails partway through.
+            connection.execute("BEGIN IMMEDIATE")
             columns = {
                 row["name"]
                 for row in connection.execute(
@@ -6080,6 +6196,11 @@ class SecurePeerClient:
                     AND peer_public_key_fingerprint IS NULL""",
                     (key_fingerprint, row["connection_id"]),
                 )
+            connection.execute("COMMIT")
+        except BaseException:
+            if connection.in_transaction:
+                connection.execute("ROLLBACK")
+            raise
         finally:
             connection.close()
 
@@ -6499,6 +6620,11 @@ class SecurePeerClient:
                 connection = self._connect()
             except BaseException:
                 self._pairing_capacity_lock.release()
+                # The key is created immediately before capacity admission.  A
+                # database-open failure happens before the transaction/finally
+                # below, so retire this exact, not-yet-persisted key here.
+                with suppress(OSError):
+                    key_path.unlink(missing_ok=True)
                 raise
             try:
                 connection.execute("BEGIN IMMEDIATE")
@@ -6696,6 +6822,7 @@ class SecurePeerClient:
         request_id = _uuid(row["request_id"], "request_id")
         connection_id = _uuid(row["connection_id"], "connection_id")
         expected_key_path = self.keys_dir / f"{connection_id}.key.pem"
+        expected_ca_path = self.keys_dir / f"{connection_id}.ca.pem"
         if Path(row["key_path"]) != expected_key_path:
             raise PermissionError("persisted pairing key path is invalid")
         with self._pairing_capacity_lock:
@@ -6715,7 +6842,14 @@ class SecurePeerClient:
             finally:
                 connection.close()
         if cursor.rowcount == 1:
-            expected_key_path.unlink(missing_ok=True)
+            cleanup_error: OSError | None = None
+            for material_path in (expected_key_path, expected_ca_path):
+                try:
+                    material_path.unlink(missing_ok=True)
+                except OSError as exc:
+                    cleanup_error = cleanup_error or exc
+            if cleanup_error is not None:
+                raise cleanup_error
             return True
         return False
 
@@ -6956,14 +7090,20 @@ class SecurePeerClient:
         return certificate, fingerprint, expires_at
 
     def poll_pairing(self, connection_id: str) -> dict[str, Any]:
+        with self._pairing_request_guard:
+            return self._poll_pairing_locked(connection_id)
+
+    def _poll_pairing_locked(self, connection_id: str) -> dict[str, Any]:
         row = self._connection_row(connection_id)
+        if row["status"] in {"rejected", "cancelled", "expired"}:
+            # A process may have crashed after committing the terminal row but
+            # before retiring its live-directory key and pinned CA files.
+            self._retire_client_key_material(connection_id)
+            return self.get_connection(connection_id)
         if row["status"] in {
             "approved",
             "connected",
             "deactivated",
-            "rejected",
-            "cancelled",
-            "expired",
         }:
             return self.get_connection(connection_id)
         status, headers, raw, _leaf = self._request(
@@ -7027,12 +7167,13 @@ class SecurePeerClient:
                 raise PermissionError("approved certificate changed after persistence")
             certificate_path = str(cert_path)
         connection = self._connect()
+        transitioned = False
         try:
             connection.execute("BEGIN IMMEDIATE")
-            connection.execute(
+            changed = connection.execute(
                 """UPDATE client_connections SET status=?,peer_id=?,team_id=?,scopes_json=?,
                 certificate_path=?,certificate_fingerprint=?,certificate_expires_at=?,updated_at=?
-                WHERE connection_id=?""",
+                WHERE connection_id=? AND pairing_id=? AND status='pending'""",
                 (
                     remote_status,
                     response.get("peer_id"),
@@ -7043,7 +7184,209 @@ class SecurePeerClient:
                     certificate_expires,
                     timestamp,
                     connection_id,
+                    row["pairing_id"],
                 ),
+            ).rowcount
+            if changed == 1:
+                connection.execute("COMMIT")
+                transitioned = True
+            else:
+                connection.execute("ROLLBACK")
+        except BaseException:
+            if connection.in_transaction:
+                connection.execute("ROLLBACK")
+            raise
+        finally:
+            connection.close()
+        if not transitioned:
+            # Another poll/client instance or an explicit Cancel won the exact
+            # pending-state transition. Never replay this stale remote status.
+            # If cancellation won after certificate validation, retire the
+            # newly written credential material as well.
+            current = self.get_connection(connection_id)
+            if current["status"] in {"rejected", "cancelled", "expired"}:
+                self._retire_client_key_material(connection_id)
+                current = self.get_connection(connection_id)
+            return current
+        if remote_status in {"rejected", "cancelled", "expired"}:
+            # Direct terminal polls own the same cleanup obligation as a
+            # terminal state that wins the CAS in another client instance.
+            # This removes the per-connection private key and pinned CA file
+            # while retaining the non-secret database tombstone for replay.
+            self._retire_client_key_material(connection_id)
+        return self.get_connection(connection_id)
+
+    def _retire_client_key_material(
+        self,
+        connection_id: str,
+        *,
+        renewal_request_id: str | None = None,
+    ) -> None:
+        """Move exact retired client material out of the live key directory."""
+
+        canonical = _uuid(connection_id, "connection_id")
+        stem = (
+            f"{canonical}-{_uuid(renewal_request_id, 'request_id')}"
+            if renewal_request_id is not None
+            else canonical
+        )
+        retired = self.data_dir / "retired"
+        ensure_private_directory(retired)
+        if renewal_request_id is not None:
+            retired = retired / "renewals" / canonical
+            ensure_private_directory(retired.parent)
+            ensure_private_directory(retired)
+        for path in self.keys_dir.iterdir():
+            if path.is_symlink() or not path.is_file():
+                continue
+            matches = (
+                path.name.startswith(stem + ".")
+                if renewal_request_id is not None
+                else (
+                    path.name.startswith(canonical + ".")
+                    or path.name.startswith(canonical + "-")
+                )
+            )
+            if not matches:
+                continue
+            destination = retired / f"{canonical}-{uuid.uuid4().hex}-{path.name}"
+            try:
+                os.replace(path, destination)
+                os.chmod(destination, 0o600)
+            except OSError:
+                # The durable row no longer refers to this owner-only file. An
+                # orphan is safer than recreating live authority after commit.
+                pass
+        if renewal_request_id is not None:
+            candidates: list[tuple[int, str, Path]] = []
+            for path in retired.iterdir():
+                try:
+                    info = path.lstat()
+                except OSError:
+                    continue
+                if (
+                    path.is_symlink()
+                    or not stat.S_ISREG(info.st_mode)
+                    or info.st_uid != os.getuid()
+                ):
+                    continue
+                candidates.append((info.st_mtime_ns, path.name, path))
+            for _mtime, _name, path in sorted(candidates, reverse=True)[
+                RETIRED_RENEWAL_MATERIAL_LIMIT:
+            ]:
+                with suppress(OSError):
+                    path.unlink()
+
+    def _validated_live_client_material_path(
+        self,
+        connection_id: str,
+        value: Any,
+        kind: str,
+    ) -> Path:
+        """Validate one exact active key/certificate path before retirement."""
+
+        canonical = _uuid(connection_id, "connection_id")
+        if kind not in {"key", "certificate"}:
+            raise ValueError("client material kind is invalid")
+        candidate = Path(value) if isinstance(value, (str, os.PathLike)) else Path()
+        if candidate.parent != self.keys_dir:
+            raise PermissionError("persisted client material path is invalid")
+        initial_name = f"{canonical}.{kind}.pem"
+        renewal_match = re.fullmatch(
+            rf"{re.escape(canonical)}-([0-9a-f-]{{36}})\.{kind}\.pem",
+            candidate.name,
+        )
+        if candidate.name != initial_name:
+            if renewal_match is None:
+                raise PermissionError("persisted client material path is invalid")
+            _uuid(renewal_match.group(1), "renewal request_id")
+        return candidate
+
+    def _retire_exact_superseded_client_material(
+        self,
+        connection_id: str,
+        paths: Iterable[Path],
+    ) -> None:
+        """Move only transaction-captured superseded credentials, then bound them."""
+
+        canonical = _uuid(connection_id, "connection_id")
+        retired = self.data_dir / "retired" / "renewals" / canonical
+        ensure_private_directory(retired.parent)
+        ensure_private_directory(retired)
+        for path in paths:
+            destination = retired / f"{canonical}-{uuid.uuid4().hex}-{path.name}"
+            try:
+                os.replace(path, destination)
+                os.chmod(destination, 0o600)
+            except FileNotFoundError:
+                continue
+            except OSError:
+                # The committed active row no longer references this exact
+                # owner-private path; never risk moving any substitute name.
+                continue
+        candidates: list[tuple[int, str, Path]] = []
+        for path in retired.iterdir():
+            try:
+                info = path.lstat()
+            except OSError:
+                continue
+            if (
+                path.is_symlink()
+                or not stat.S_ISREG(info.st_mode)
+                or info.st_uid != os.getuid()
+            ):
+                continue
+            candidates.append((info.st_mtime_ns, path.name, path))
+        for _mtime, _name, path in sorted(candidates, reverse=True)[
+            RETIRED_RENEWAL_MATERIAL_LIMIT:
+        ]:
+            with suppress(OSError):
+                path.unlink()
+
+    def _abandon_uncredentialed_connection(
+        self,
+        row: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        """Retire authority while preserving an idempotent terminal tombstone."""
+
+        canonical = _uuid(row["connection_id"], "connection_id")
+        allowed = {"pending", "rejected", "cancelled", "expired"}
+        connection = self._connect()
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            current = connection.execute(
+                "SELECT * FROM client_connections WHERE connection_id=?",
+                (canonical,),
+            ).fetchone()
+            if (
+                current is None
+                or current["pairing_id"] != row["pairing_id"]
+                or current["host_server_identity"] != row["host_server_identity"]
+                or current["hub_id"] != row["hub_id"]
+                or current["status"] not in allowed
+                or current["certificate_path"] is not None
+                or current["certificate_fingerprint"] is not None
+            ):
+                raise SecurePeerError(
+                    "connection_changed",
+                    "Secure peer pairing changed before local retirement",
+                    409,
+                )
+            connection.execute(
+                "UPDATE client_meta SET value=NULL "
+                "WHERE key='active_connection_id' AND value=?",
+                (canonical,),
+            )
+            connection.execute(
+                "DELETE FROM client_routes WHERE connection_id=?", (canonical,)
+            )
+            connection.execute(
+                "DELETE FROM client_renewals WHERE connection_id=?", (canonical,)
+            )
+            connection.execute(
+                """UPDATE client_connections SET status='cancelled',updated_at=?
+                WHERE connection_id=?""",
+                (self._timestamp(), canonical),
             )
             connection.execute("COMMIT")
         except BaseException:
@@ -7052,37 +7395,51 @@ class SecurePeerClient:
             raise
         finally:
             connection.close()
-        return self.get_connection(connection_id)
+        self._retire_client_key_material(canonical)
+        return self.get_connection(canonical)
 
     def cancel_pairing(
         self, connection_id: str, idempotency_key: str
     ) -> dict[str, Any]:
+        with self._pairing_request_guard:
+            return self._cancel_pairing_locked(connection_id, idempotency_key)
+
+    def _cancel_pairing_locked(
+        self, connection_id: str, idempotency_key: str
+    ) -> dict[str, Any]:
         row = self._connection_row(connection_id)
-        if row["status"] == "cancelled":
-            return self.get_connection(connection_id)
+        if row["status"] in {"rejected", "cancelled", "expired"}:
+            return self._abandon_uncredentialed_connection(row)
         if row["status"] != "pending":
             raise SecurePeerError("pairing_not_pending", "Pairing is no longer pending", 409)
-        status, headers, raw, _leaf = self._request(
-            row["host_ip"],
-            int(row["port"]),
-            "POST",
-            f"/v1/pairings/{row['pairing_id']}/cancel",
-            body={"idempotency_key": _uuid(idempotency_key, "idempotency_key")},
-            headers={PAIRING_TOKEN_HEADER: row["poll_token"]},
-            context=self._pinned_context(row, mutual_tls=False),
-        )
-        response = self._decode_json_response(status, headers, raw)
-        if response != {"pairing_id": row["pairing_id"], "status": "cancelled"}:
-            raise SecurePeerError("remote_invalid", "Pairing cancellation response is invalid", 502)
-        connection = self._connect()
         try:
-            connection.execute(
-                "UPDATE client_connections SET status='cancelled',updated_at=? WHERE connection_id=? AND status='pending'",
-                (self._timestamp(), connection_id),
+            status, headers, raw, _leaf = self._request(
+                row["host_ip"],
+                int(row["port"]),
+                "POST",
+                f"/v1/pairings/{row['pairing_id']}/cancel",
+                body={"idempotency_key": _uuid(idempotency_key, "idempotency_key")},
+                headers={PAIRING_TOKEN_HEADER: row["poll_token"]},
+                context=self._pinned_context(row, mutual_tls=False),
             )
-        finally:
-            connection.close()
-        return self.get_connection(connection_id)
+            response = self._decode_json_response(status, headers, raw)
+            if response != {
+                "pairing_id": row["pairing_id"],
+                "status": "cancelled",
+            }:
+                raise SecurePeerError(
+                    "remote_invalid", "Pairing cancellation response is invalid", 502
+                )
+        except SecurePeerError:
+            # A pending pairing holds no usable client certificate.  If the
+            # pinned host is gone, already pruned the request, or approved it
+            # concurrently, retiring the local private key still makes the
+            # operator's explicit Cancel terminal on this server. This is a
+            # deliberate local-authority result, not a claim that the remote
+            # cancellation committed; the terminal tombstone makes a lost
+            # local response safely replayable with no second network request.
+            return self._abandon_uncredentialed_connection(row)
+        return self._abandon_uncredentialed_connection(row)
 
     def peer_health(self, connection_id: str) -> dict[str, Any]:
         with self._route_guard:
@@ -7221,11 +7578,16 @@ class SecurePeerClient:
                     "UPDATE client_meta SET value=NULL WHERE key='active_connection_id' AND value=?",
                     (canonical,),
                 )
-            if row["status"] not in {"forgotten", "revoked"}:
-                connection.execute(
-                    "UPDATE client_connections SET status='deactivated',updated_at=? WHERE connection_id=?",
-                    (timestamp, canonical),
+            if row["status"] not in {"approved", "connected", "deactivated"}:
+                raise SecurePeerError(
+                    "pairing_incomplete",
+                    "Secure peer connection is not approved",
+                    409,
                 )
+            connection.execute(
+                "UPDATE client_connections SET status='deactivated',updated_at=? WHERE connection_id=?",
+                (timestamp, canonical),
+            )
             connection.execute("COMMIT")
         except BaseException:
             if connection.in_transaction:
@@ -7392,22 +7754,7 @@ class SecurePeerClient:
             raise
         finally:
             connection.close()
-        retired = self.data_dir / "retired"
-        ensure_private_directory(retired)
-        for path in self.keys_dir.iterdir():
-            if (
-                not path.is_symlink()
-                and path.is_file()
-                and (path.name.startswith(canonical + ".") or path.name.startswith(canonical + "-"))
-            ):
-                destination = retired / f"{canonical}-{uuid.uuid4().hex}-{path.name}"
-                try:
-                    os.replace(path, destination)
-                    os.chmod(destination, 0o600)
-                except OSError:
-                    # The DB credential is already retired. Leaving an
-                    # owner-only orphan is safer than restoring a usable row.
-                    pass
+        self._retire_client_key_material(canonical)
         return {
             "connection_id": canonical,
             "host_server_identity": expected_host,
@@ -7416,6 +7763,84 @@ class SecurePeerClient:
             "status": "forgotten",
             "active": False,
         }
+
+    def forget_expired_connection(
+        self,
+        connection_id: str,
+        *,
+        expected_host_server_identity: str,
+        expected_hub_id: str,
+        expected_certificate_fingerprint: str,
+    ) -> dict[str, Any]:
+        """Locally retire an exact credential the pinned host can no longer accept."""
+
+        with self._route_guard:
+            canonical = _uuid(connection_id, "connection_id")
+            expected_host = _identifier(
+                expected_host_server_identity, "expected host identity"
+            )
+            expected_hub = _identifier(expected_hub_id, "expected hub id")
+            if _HEX_FP_RE.fullmatch(expected_certificate_fingerprint) is None:
+                raise SecurePeerError(
+                    "invalid_request",
+                    "expected certificate fingerprint is invalid",
+                    422,
+                )
+            connection = self._connect()
+            try:
+                connection.execute("BEGIN IMMEDIATE")
+                row = connection.execute(
+                    "SELECT * FROM client_connections WHERE connection_id=?",
+                    (canonical,),
+                ).fetchone()
+                if (
+                    row is None
+                    or row["host_server_identity"] != expected_host
+                    or row["hub_id"] != expected_hub
+                    or row["certificate_fingerprint"]
+                    != expected_certificate_fingerprint
+                ):
+                    raise SecurePeerError(
+                        "connection_changed",
+                        "Secure peer connection identity changed",
+                        409,
+                    )
+                if int(row["certificate_expires_at"] or 0) > self._timestamp():
+                    raise SecurePeerError(
+                        "certificate_not_expired",
+                        "Secure peer certificate is still valid",
+                        409,
+                    )
+                connection.execute(
+                    "UPDATE client_meta SET value=NULL "
+                    "WHERE key='active_connection_id' AND value=?",
+                    (canonical,),
+                )
+                connection.execute(
+                    "DELETE FROM client_routes WHERE connection_id=?", (canonical,)
+                )
+                connection.execute(
+                    "DELETE FROM client_renewals WHERE connection_id=?", (canonical,)
+                )
+                connection.execute(
+                    "DELETE FROM client_connections WHERE connection_id=?", (canonical,)
+                )
+                connection.execute("COMMIT")
+            except BaseException:
+                if connection.in_transaction:
+                    connection.execute("ROLLBACK")
+                raise
+            finally:
+                connection.close()
+            self._retire_client_key_material(canonical)
+            return {
+                "connection_id": canonical,
+                "host_server_identity": expected_host,
+                "hub_id": expected_hub,
+                "certificate_fingerprint": expected_certificate_fingerprint,
+                "status": "forgotten",
+                "active": False,
+            }
 
     def _mutual_json(
         self,
@@ -7782,11 +8207,20 @@ class SecurePeerClient:
         with self._route_guard:
             self._require_active_connection_locked(connection_id, relay_required=False)
             row = self._connection_row(connection_id)
+            host = str(row["host_ip"])
+            port = int(row["port"])
+            context = self._pinned_context(row, mutual_tls=True)
+
+        # Loading the exact certificate/key and validating active authority are
+        # serialized with retirement. The potentially multi-gigabyte response
+        # body is not: callers re-CAS the connection before publishing the
+        # staged file, so unrelated route/health operations stay responsive.
+        def download() -> tuple[tuple[str, str], ...]:
             connection = http.client.HTTPSConnection(
-                row["host_ip"],
-                int(row["port"]),
+                host,
+                port,
                 timeout=max(self.timeout_seconds, 30.0),
-                context=self._pinned_context(row, mutual_tls=True),
+                context=context,
             )
             try:
                 connection.request(
@@ -7874,6 +8308,8 @@ class SecurePeerClient:
                 ) from exc
             finally:
                 connection.close()
+
+        return download()
 
     def list_remote_routes(self, connection_id: str) -> list[dict[str, Any]]:
         row = self._connection_row(connection_id)
@@ -8557,11 +8993,23 @@ class SecurePeerClient:
                     route is None
                     or expected_action not in json.loads(route["actions_json"])
                 ):
-                    raise SecurePeerError(
-                        "route_changed",
-                        "Local relay target route is unavailable or changed",
-                        409,
-                    )
+                    # A publish response can be lost after the host commits the
+                    # route while the client retains only its local
+                    # ``publishing`` row.  That stale envelope must not poison
+                    # otherwise valid siblings in the shared leased batch.
+                    # Best-effort terminal receipt also prevents it from being
+                    # reclaimed forever; a transient receipt failure is safe to
+                    # retry on a later claim and still must not hide siblings.
+                    try:
+                        self._receipt_envelope_locked(
+                            canonical_connection,
+                            envelope["envelope_id"],
+                            lease_token=lease_token,
+                            outcome="failed",
+                        )
+                    except SecurePeerError:
+                        pass
+                    continue
                 resolved.append({**envelope, "target_chat_id": route["chat_id"]})
             return {**result, "envelopes": resolved}
         finally:
@@ -8649,10 +9097,65 @@ class SecurePeerClient:
         with self._route_guard:
             return self._renew_if_due_locked(connection_id)
 
-    def _renew_if_due_locked(self, connection_id: str) -> dict[str, Any]:
+    def _discard_expired_client_renewal(
+        self,
+        connection_id: str,
+        renewal: Mapping[str, Any],
+    ) -> None:
+        """CAS-retire one host-expired renewal so a fresh request can proceed."""
+
+        canonical_connection = _uuid(connection_id, "connection_id")
+        request_id = _uuid(renewal["request_id"], "request_id")
+        connection = self._connect()
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            current = connection.execute(
+                "SELECT * FROM client_renewals WHERE request_id=? AND connection_id=?",
+                (request_id, canonical_connection),
+            ).fetchone()
+            if (
+                current is None
+                or current["status"] != renewal["status"]
+                or current["old_certificate_fingerprint"]
+                != renewal["old_certificate_fingerprint"]
+                or current["key_path"] != renewal["key_path"]
+                or current["certificate_path"] != renewal["certificate_path"]
+                or current["certificate_fingerprint"]
+                != renewal["certificate_fingerprint"]
+            ):
+                raise SecurePeerError(
+                    "renewal_conflict", "Local renewal state changed", 409
+                )
+            if connection.execute(
+                "DELETE FROM client_renewals WHERE request_id=? AND connection_id=?",
+                (request_id, canonical_connection),
+            ).rowcount != 1:
+                raise SecurePeerError(
+                    "renewal_conflict", "Local renewal state changed", 409
+                )
+            connection.execute("COMMIT")
+        except BaseException:
+            if connection.in_transaction:
+                connection.execute("ROLLBACK")
+            raise
+        finally:
+            connection.close()
+        self._retire_client_key_material(
+            canonical_connection,
+            renewal_request_id=request_id,
+        )
+
+    def _renew_if_due_locked(
+        self,
+        connection_id: str,
+        *,
+        retry_expired: bool = True,
+    ) -> dict[str, Any]:
         row = self._connection_row(connection_id)
         timestamp = self._timestamp()
         connection = self._connect()
+        created_renewal_key: Path | None = None
+        remove_unpersisted_key = False
         try:
             connection.execute("BEGIN IMMEDIATE")
             pending = connection.execute(
@@ -8693,6 +9196,7 @@ class SecurePeerClient:
                 }
                 key_path = self.keys_dir / f"{connection_id}-{request_id}.key.pem"
                 create_secret_file(key_path, _private_key_pem(new_key))
+                created_renewal_key = key_path
                 connection.execute(
                     """INSERT INTO client_renewals(
                     request_id,connection_id,old_certificate_fingerprint,request_json,key_path,
@@ -8716,16 +9220,59 @@ class SecurePeerClient:
         except BaseException:
             if connection.in_transaction:
                 connection.execute("ROLLBACK")
+            if created_renewal_key is not None:
+                # COMMIT can fail ambiguously. Keep the key only when this
+                # exact renewal row is now durably visible; otherwise the key
+                # has no replay owner and must not accumulate in live keys.
+                try:
+                    persisted = connection.execute(
+                        """SELECT key_path FROM client_renewals
+                        WHERE request_id=? AND connection_id=?""",
+                        (request_id, connection_id),
+                    ).fetchone()
+                except Exception:
+                    persisted = {"key_path": str(created_renewal_key)}
+                remove_unpersisted_key = (
+                    persisted is None
+                    or persisted["key_path"] != str(created_renewal_key)
+                )
             raise
         finally:
-            connection.close()
+            try:
+                connection.close()
+            finally:
+                if remove_unpersisted_key and created_renewal_key is not None:
+                    with suppress(OSError):
+                        created_renewal_key.unlink(missing_ok=True)
 
         payload = json.loads(pending["request_json"])
-        new_key = _load_private_key(Path(pending["key_path"]))
+        expected_renewal_key = (
+            self.keys_dir
+            / f"{_uuid(connection_id, 'connection_id')}-{_uuid(pending['request_id'], 'request_id')}.key.pem"
+        )
+        if Path(pending["key_path"]) != expected_renewal_key:
+            raise PermissionError("persisted renewal key path is invalid")
+        new_key = _load_private_key(expected_renewal_key)
         certificate_path = pending["certificate_path"]
         certificate_fingerprint = pending["certificate_fingerprint"]
         if pending["status"] == "pending":
-            response = self._mutual_json(connection_id, "POST", "/v1/renew", payload)
+            try:
+                response = self._mutual_json(
+                    connection_id, "POST", "/v1/renew", payload
+                )
+            except SecurePeerError as exc:
+                if (
+                    exc.code != "renewal_expired"
+                    or not retry_expired
+                    or int(pending["created_at"])
+                    > self._timestamp() - RENEWAL_REQUEST_TTL_SECONDS
+                ):
+                    raise
+                self._discard_expired_client_renewal(connection_id, pending)
+                return self._renew_if_due_locked(
+                    connection_id,
+                    retry_expired=False,
+                )
             pem = response.get("client_certificate_pem")
             if (
                 set(response)
@@ -8796,20 +9343,40 @@ class SecurePeerClient:
         certificate = x509.load_pem_x509_certificate(
             read_secret_file(Path(certificate_path))
         )
-        status, response_headers, raw, _leaf = self._request(
-            row["host_ip"],
-            int(row["port"]),
-            "POST",
-            f"/v1/renewals/{pending['request_id']}/activate",
-            body={"request_id": pending["request_id"]},
-            context=self._pinned_context(
-                row,
-                mutual_tls=True,
-                certificate_path=certificate_path,
-                key_path=pending["key_path"],
-            ),
-        )
-        activation = self._decode_json_response(status, response_headers, raw)
+        try:
+            status, response_headers, raw, _leaf = self._request(
+                row["host_ip"],
+                int(row["port"]),
+                "POST",
+                f"/v1/renewals/{pending['request_id']}/activate",
+                body={"request_id": pending["request_id"]},
+                context=self._pinned_context(
+                    row,
+                    mutual_tls=True,
+                    certificate_path=certificate_path,
+                    key_path=pending["key_path"],
+                ),
+            )
+            activation = self._decode_json_response(status, response_headers, raw)
+        except SecurePeerError as exc:
+            if (
+                exc.code not in {"renewal_expired", "renewal_unavailable"}
+                or not retry_expired
+                or (
+                    exc.code == "renewal_expired"
+                    and int(pending["created_at"])
+                    > self._timestamp() - RENEWAL_REQUEST_TTL_SECONDS
+                )
+            ):
+                raise
+            # Always attempted activation first: an earlier response may have
+            # been lost after the host committed, in which case activation is
+            # idempotently successful even beyond the request TTL.
+            self._discard_expired_client_renewal(connection_id, pending)
+            return self._renew_if_due_locked(
+                connection_id,
+                retry_expired=False,
+            )
         if (
             activation.get("activated") is not True
             or activation.get("request_id") != pending["request_id"]
@@ -8817,8 +9384,28 @@ class SecurePeerClient:
         ):
             raise SecurePeerError("remote_invalid", "Renewal activation response is invalid", 502)
         connection = self._connect()
+        superseded_material: tuple[Path, Path] | None = None
         try:
             connection.execute("BEGIN IMMEDIATE")
+            current = connection.execute(
+                """SELECT key_path,certificate_path,certificate_fingerprint
+                FROM client_connections WHERE connection_id=?""",
+                (connection_id,),
+            ).fetchone()
+            if current is None:
+                raise SecurePeerError(
+                    "renewal_conflict", "Local certificate state changed", 409
+                )
+            if current["certificate_fingerprint"] == pending[
+                "old_certificate_fingerprint"
+            ]:
+                old_key_path = self._validated_live_client_material_path(
+                    connection_id, current["key_path"], "key"
+                )
+                old_certificate_path = self._validated_live_client_material_path(
+                    connection_id, current["certificate_path"], "certificate"
+                )
+                superseded_material = (old_key_path, old_certificate_path)
             changed = connection.execute(
                 """UPDATE client_connections SET key_path=?,certificate_path=?,
                 certificate_fingerprint=?,certificate_expires_at=?,updated_at=?
@@ -8834,15 +9421,30 @@ class SecurePeerClient:
                 ),
             ).rowcount
             if changed != 1:
-                current = connection.execute(
-                    "SELECT certificate_fingerprint FROM client_connections WHERE connection_id=?",
-                    (connection_id,),
-                ).fetchone()
                 if current is None or current["certificate_fingerprint"] != certificate_fingerprint:
                     raise SecurePeerError("renewal_conflict", "Local certificate state changed", 409)
+                superseded_material = None
+            if connection.execute(
+                """UPDATE client_renewals SET status='activated',updated_at=?
+                WHERE request_id=? AND connection_id=?
+                AND status='certificate_saved'""",
+                (self._timestamp(), pending["request_id"], connection_id),
+            ).rowcount != 1:
+                raise SecurePeerError(
+                    "renewal_conflict", "Local renewal state changed", 409
+                )
             connection.execute(
-                "UPDATE client_renewals SET status='activated',updated_at=? WHERE request_id=?",
-                (self._timestamp(), pending["request_id"]),
+                """DELETE FROM client_renewals WHERE request_id IN (
+                SELECT request_id FROM client_renewals
+                WHERE connection_id=? AND status='activated' AND request_id<>?
+                ORDER BY updated_at DESC,request_id DESC
+                LIMIT -1 OFFSET ?
+                )""",
+                (
+                    connection_id,
+                    pending["request_id"],
+                    ACTIVATED_RENEWAL_HISTORY_LIMIT - 1,
+                ),
             )
             connection.execute("COMMIT")
         except BaseException:
@@ -8851,4 +9453,8 @@ class SecurePeerClient:
             raise
         finally:
             connection.close()
+        if superseded_material is not None:
+            self._retire_exact_superseded_client_material(
+                connection_id, superseded_material
+            )
         return {"renewed": True, "connection": self.get_connection(connection_id)}

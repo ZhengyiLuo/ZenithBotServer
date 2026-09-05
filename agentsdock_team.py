@@ -276,6 +276,8 @@ def send(args: argparse.Namespace) -> dict[str, Any]:
     kind = str(args.kind or "message")
     if kind not in {"message", "skill"}:
         raise TeamCLIError("--kind must be message or skill")
+    if kind == "message" and args.title:
+        raise TeamCLIError("--title requires --kind skill")
     body = _read_body()
     attachments = _attachment_paths(list(args.attach or []))
     payload: dict[str, Any] = {

@@ -509,6 +509,9 @@ class SecurePeerHubAdapter:
                 raise HubError("invalid_request", "Query is invalid", 422)
         if "limit" in values and not 1 <= int(values["limit"]) <= 100:
             raise HubError("invalid_request", "Query is invalid", 422)
+        if "cursor" in values:
+            if re.fullmatch(r"v1\.[A-Za-z0-9_-]{38,500}", values["cursor"]) is None:
+                raise HubError("invalid_request", "Query is invalid", 422)
         for key in ("address_id", "from_id"):
             if key in values:
                 values[key] = SecurePeerHubAdapter._resource_id(values[key])
@@ -777,7 +780,16 @@ class SecurePeerHubAdapter:
                 if len(pieces) == 1:
                     result = self.store.get_team(claims, team_id)
                 elif len(pieces) == 2 and pieces[1] == "members":
-                    result = self.store.list_members(claims, team_id)
+                    values = self._query(request, allowed={"limit", "cursor"})
+                    result = self.store.list_members(
+                        claims,
+                        team_id,
+                        limit=int(values.get("limit", "50")),
+                        cursor=values.get("cursor"),
+                    )
+                elif len(pieces) == 3 and pieces[1] == "members":
+                    self._query(request, allowed=set())
+                    result = self.store.get_member(claims, team_id, pieces[2])
                 elif len(pieces) == 2 and pieces[1] == "nodes":
                     result = self.store.list_nodes(claims, team_id)
                 elif len(pieces) == 2 and pieces[1] == "channels":
@@ -791,6 +803,16 @@ class SecurePeerHubAdapter:
                         team_id,
                         after_server_id=values.get("after_server_id"),
                         limit=int(values.get("limit", "50")),
+                    )
+                elif (
+                    len(pieces) == 4
+                    and pieces[1:3] == [_NETWORK_CHILD, "servers"]
+                ):
+                    self._query(request, allowed=set())
+                    result = self.store.get_network_server(
+                        claims,
+                        team_id,
+                        self._resource_id(pieces[3]),
                     )
                 elif len(pieces) == 3 and pieces[1:] == [_NETWORK_CHILD, "bulletin"]:
                     values = self._query(

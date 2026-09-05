@@ -85,10 +85,12 @@ class TerminalShellInitializationTests(unittest.TestCase):
             patch.object(agent_server, "set_pty_dimensions"),
             patch.object(agent_server.subprocess, "Popen", side_effect=popen),
             patch.object(agent_server.os, "close"),
+            patch.object(agent_server.os, "set_blocking") as set_blocking,
             patch.object(agent_server, "tmux_bin", return_value="tmux"),
         ):
             agent_server.spawn_terminal_client("chat", "/tmp", 80, 24)
 
+        set_blocking.assert_called_once_with(10, False)
         for name in agent_server.PROVIDER_SECRET_ENV_NAMES:
             self.assertNotIn(name, captured)
 

@@ -1594,6 +1594,301 @@ class CodexAppServerClientTests(unittest.IsolatedAsyncioTestCase):
             await client.request("turn/start", {"threadId": "thr", "input": []})
         self.assertTrue(raised.exception.request_sent)
         self.assertFalse(raised.exception.safe_to_retry)
+        self.assertTrue(client.ready)
+        self.assertIs(client.process, factory.process)
+
+    async def test_cancelled_turn_start_transfers_provisional_for_cleanup(self) -> None:
+        factory = FakeProcessFactory()
+        process = factory.process
+        client = self.make_client(factory)
+        self.addAsyncCleanup(client.close)
+        # Exercise lazy start: the transport generation is still zero when the
+        # caller begins, then initialize advances it before turn/start is
+        # written. Cleanup must use the generation captured at that write.
+        self.assertEqual(client.generation, 0)
+
+        start = asyncio.create_task(
+            client.start_turn(
+                "thr_cancelled_start",
+                [{"type": "text", "text": "hello"}],
+            )
+        )
+        await wait_until(
+            lambda: any(
+                message.get("method") == "turn/start"
+                for message in process.messages
+            )
+        )
+        start.cancel()
+        try:
+            await start
+        except asyncio.CancelledError as exc:
+            provisional = getattr(exc, "pending_turn", None)
+        else:
+            self.fail("turn/start cancellation did not propagate")
+
+        self.assertIsNotNone(provisional)
+        self.assertIs(
+            client.active_turn("thr_cancelled_start"),
+            provisional,
+        )
+        self.assertEqual(provisional.transport_generation, client.generation)
+        self.assertEqual(provisional.transport_generation, 1)
+        accepted_event = {
+            "method": "turn/started",
+            "params": {
+                "threadId": "thr_cancelled_start",
+                "turn": {"id": "turn_late_after_cancel"},
+            },
+        }
+        process.feed(accepted_event)
+        self.assertEqual(
+            await provisional.next_notification(timeout=1),
+            accepted_event,
+        )
+        self.assertEqual(provisional.turn_id, "turn_late_after_cancel")
+        await provisional.close()
+        self.assertIsNone(client.active_turn("thr_cancelled_start"))
+
+    async def test_retire_generation_cannot_stop_a_replacement_transport(self) -> None:
+        factory = FakeProcessFactory()
+        client = self.make_client(factory)
+        self.addAsyncCleanup(client.close)
+        await client.start()
+
+        generation = client.generation
+        self.assertFalse(await client.retire_generation(generation + 1))
+        self.assertTrue(client.ready)
+        self.assertTrue(await client.retire_generation(generation))
+        self.assertFalse(client.ready)
+
+    async def test_request_timeout_waiting_for_write_lock_is_retry_safe(self) -> None:
+        factory = FakeProcessFactory()
+        process = factory.process
+        process.responders["test/recovered"] = lambda _: {"ok": True}
+        client = self.make_client(factory)
+        client.request_timeout = 0.01
+        self.addAsyncCleanup(client.close)
+        await client.start()
+
+        await client._write_lock.acquire()
+        try:
+            with self.assertRaises(CodexAppServerTimeout) as raised:
+                await client.request("test/blocked-before-write", {})
+        finally:
+            client._write_lock.release()
+
+        self.assertFalse(raised.exception.request_sent)
+        self.assertTrue(raised.exception.safe_to_retry)
+        self.assertFalse(any(
+            message.get("method") == "test/blocked-before-write"
+            for message in process.messages
+        ))
+        self.assertTrue(client.ready)
+        self.assertIs(client.process, process)
+        self.assertEqual(
+            await client.request("test/recovered", {}),
+            {"ok": True},
+        )
+
+    async def test_blocked_drain_retires_process_and_next_request_recovers(
+        self,
+    ) -> None:
+        first_process = FakeProcess()
+        second_process = FakeProcess()
+        second_process.responders["test/recovered"] = lambda _: {"ok": True}
+        factory = FakeProcessFactory(first_process, second_process)
+        client = self.make_client(factory)
+        client.request_timeout = 0.01
+        self.addAsyncCleanup(client.close)
+        await client.start()
+
+        drain_started = asyncio.Event()
+        never_drain = asyncio.Event()
+
+        async def blocked_drain() -> None:
+            drain_started.set()
+            await never_drain.wait()
+
+        first_process.stdin.drain = blocked_drain
+        wedged_request = asyncio.create_task(
+            client.request("test/wedged-write", {})
+        )
+        await asyncio.wait_for(drain_started.wait(), timeout=1)
+        queued_request = asyncio.create_task(
+            client.request("test/queued-behind-wedge", {})
+        )
+        with self.assertRaises(CodexAppServerTimeout) as raised:
+            await wedged_request
+        with self.assertRaises(
+            (CodexAppServerTimeout, CodexAppServerDisconnected)
+        ):
+            await asyncio.wait_for(queued_request, timeout=1)
+
+        self.assertTrue(drain_started.is_set())
+        self.assertTrue(raised.exception.request_sent)
+        self.assertFalse(raised.exception.safe_to_retry)
+        self.assertFalse(client._write_lock.locked())
+        self.assertIsNone(client.process)
+        self.assertFalse(client.ready)
+        self.assertEqual(first_process.returncode, -signal.SIGTERM)
+
+        self.assertEqual(
+            await client.request("test/recovered", {}),
+            {"ok": True},
+        )
+        self.assertIs(client.process, second_process)
+        self.assertEqual(client.generation, 2)
+
+        await client.close()
+        self.assertIsNone(client.process)
+        self.assertEqual(second_process.returncode, -signal.SIGTERM)
+
+    async def test_repeated_cancellation_cannot_abandon_write_timeout_cleanup(
+        self,
+    ) -> None:
+        process = FakeProcess()
+        exit_hooks: list[tuple[int, int | None]] = []
+        client = self.make_client(
+            FakeProcessFactory(process),
+            on_process_exited=lambda pid, group_id: exit_hooks.append(
+                (pid, group_id)
+            ),
+        )
+        client._proc = process
+        client._initialized = True
+
+        wait_started = asyncio.Event()
+        release_first_wait = asyncio.Event()
+        original_wait = process.wait
+        original_kill = process.kill
+        wait_calls = 0
+        terminate_calls = 0
+        kill_calls = 0
+
+        async def stalled_wait() -> int:
+            nonlocal wait_calls
+            wait_calls += 1
+            if wait_calls == 1:
+                wait_started.set()
+                await release_first_wait.wait()
+                return -signal.SIGTERM
+            return await original_wait()
+
+        def stalled_terminate() -> None:
+            nonlocal terminate_calls
+            terminate_calls += 1
+
+        def recording_kill() -> None:
+            nonlocal kill_calls
+            kill_calls += 1
+            original_kill()
+
+        process.wait = stalled_wait
+        process.terminate = stalled_terminate
+        process.kill = recording_kill
+
+        owner = asyncio.create_task(
+            client._discard_process_after_write_timeout(process)
+        )
+        await asyncio.wait_for(wait_started.wait(), timeout=1)
+        owner.cancel("first cancellation")
+        await asyncio.sleep(0)
+        self.assertFalse(owner.done())
+        owner.cancel("second cancellation")
+        await asyncio.sleep(0)
+        self.assertFalse(owner.done())
+
+        release_first_wait.set()
+        with self.assertRaises(asyncio.CancelledError):
+            await asyncio.wait_for(owner, timeout=1)
+
+        self.assertIsNone(client.process)
+        self.assertEqual(process.returncode, -signal.SIGKILL)
+        self.assertEqual(terminate_calls, 1)
+        self.assertEqual(kill_calls, 1)
+        self.assertEqual(exit_hooks, [(process.pid, None)])
+
+    async def test_response_wait_uses_remaining_end_to_end_deadline(self) -> None:
+        factory = FakeProcessFactory()
+        process = factory.process
+        client = self.make_client(factory)
+        self.addAsyncCleanup(client.close)
+        await client.start()
+
+        original_drain = process.stdin.drain
+
+        async def slow_drain() -> None:
+            await asyncio.sleep(0.03)
+            await original_drain()
+
+        process.stdin.drain = slow_drain
+        recorded_timeouts: list[float | None] = []
+        real_wait_for = asyncio.wait_for
+
+        async def recording_wait_for(
+            awaitable: Any,
+            timeout: float | None,
+        ) -> Any:
+            recorded_timeouts.append(timeout)
+            return await real_wait_for(awaitable, timeout=timeout)
+
+        with patch("codex_app_server.asyncio.wait_for", recording_wait_for):
+            with self.assertRaises(CodexAppServerTimeout):
+                await client.request("test/no-response", {}, timeout=0.1)
+
+        self.assertGreaterEqual(len(recorded_timeouts), 3)
+        first_timeout = recorded_timeouts[0]
+        response_timeout = recorded_timeouts[-1]
+        self.assertIsNotNone(first_timeout)
+        self.assertIsNotNone(response_timeout)
+        assert first_timeout is not None
+        assert response_timeout is not None
+        self.assertLess(response_timeout, first_timeout - 0.015)
+        self.assertTrue(client.ready)
+        self.assertIs(client.process, process)
+
+    async def test_blocked_server_response_drain_cleans_up_without_self_wait(
+        self,
+    ) -> None:
+        first_process = FakeProcess()
+        second_process = FakeProcess()
+        second_process.responders["test/recovered"] = lambda _: {"ok": True}
+        factory = FakeProcessFactory(first_process, second_process)
+
+        async def handler(
+            _request_id: Any,
+            _method: str,
+            _params: dict[str, Any],
+        ) -> dict[str, Any]:
+            return {"ok": True}
+
+        client = self.make_client(factory, server_request_handler=handler)
+        client.request_timeout = 0.01
+        self.addAsyncCleanup(client.close)
+        await client.start()
+
+        never_drain = asyncio.Event()
+
+        async def blocked_drain() -> None:
+            await never_drain.wait()
+
+        first_process.stdin.drain = blocked_drain
+        first_process.feed({
+            "id": "server-request",
+            "method": "test/server-request",
+            "params": {},
+        })
+        await wait_until(lambda: client.process is None)
+        await wait_until(lambda: not client._server_request_tasks)
+
+        self.assertEqual(first_process.returncode, -signal.SIGTERM)
+        self.assertFalse(client._server_request_tasks)
+        self.assertEqual(
+            await client.request("test/recovered", {}),
+            {"ok": True},
+        )
+        self.assertIs(client.process, second_process)
 
     async def test_ambiguous_turn_start_keeps_a_routed_provisional_handle(self) -> None:
         factory = FakeProcessFactory()

@@ -14,7 +14,7 @@ import socket
 import stat
 import threading
 import time
-from typing import Any, Mapping
+from typing import Any, Callable, Mapping
 from urllib.parse import quote, urlencode
 import uuid
 
@@ -54,6 +54,12 @@ _TEAM_CACHE_SEGMENT_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,239}$")
 _TEAM_CACHE_SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 _TEAM_CACHE_META_NAME = ".metadata.json"
 _TEAM_CACHE_META_MAX_BYTES = 4096
+_TEAM_CACHE_DIRECTORY_SCAN_LIMIT = 4096
+_TEAM_CACHE_OVERFLOW_RECOVERY_PASSES = 8
+_TEAM_EXPORT_TTL_SECONDS = 60 * 60
+_TEAM_EXPORT_MAX_BATCHES = 128
+_TEAM_EXPORT_BATCH_RE = re.compile(r"^export-([0-9]{10})-([0-9a-f]{32})$")
+_TEAM_EXPORT_TEMP_RE = re.compile(r"^\.export-([0-9a-f]{32})\.tmp$")
 _PAIRING_ACTIONABLE_STATUSES = frozenset(
     {"requesting", "pending_approval", "approved", "connected"}
 )
@@ -167,8 +173,19 @@ class SecurePeerRuntime:
             else DEFAULT_TEAM_CACHE_MAX_BYTES
         )
         self.team_cache_dir = self.data_dir.parent / "team-cache"
+        self.team_export_dir = self.data_dir.parent / "team-exports"
         self._team_cache_guard = threading.RLock()
         self._team_cache_pins: dict[Path, int] = {}
+        self._team_cache_entry_locks: dict[
+            Path, tuple[threading.Lock, int]
+        ] = {}
+        # Active staging bytes are counted at their full declared size and are
+        # excluded from the filesystem scan. This preserves the cache bound
+        # without holding the global cache lock during network or disk I/O.
+        self._team_cache_reservations: dict[Path, int] = {}
+        # Export reservations bound durable, caller-visible copies while their
+        # bytes are written outside the global cache lock.
+        self._team_export_reservations: dict[Path, int] = {}
         self.config_path = self.data_dir / "host-config.json"
         self._guard = threading.RLock()
         # Linearizes durable outbound intent creation with every local
@@ -367,17 +384,25 @@ class SecurePeerRuntime:
             return
         if hub_store is None:
             raise RuntimeError("secure peer host attachment requires the live Hub store")
-        hub_store.provision_local_agent_mail()
         attachment = (str(hub_id), Path(hub_data_dir), hub_store)
         with self._guard:
             if self._hub_store is not None and self._hub_store is not hub_store:
                 raise RuntimeError("secure peer host is already attached")
+            # Record the exact live Hub object before the first fallible
+            # projection step. Startup recovery can then retry even when local
+            # Agent Mail provisioning itself was the interrupted boundary.
             self._pending_host_attachment = attachment
+            hub_store.provision_local_agent_mail()
+            # An enabled attachment is complete only after its listener is
+            # live. A prior gateway-start failure leaves the durable stores
+            # installed specifically so this same pending attachment can
+            # retry without restarting the service.
             if (
                 self._hub_store is hub_store
                 and self._host_store is not None
                 and self._adapter is not None
                 and self._host_error_code is None
+                and (not self._config["enabled"] or self._gateway is not None)
             ):
                 self._pending_host_attachment = None
                 return
@@ -796,6 +821,22 @@ class SecurePeerRuntime:
                     "Secure peer connection identity changed",
                     409,
                 )
+            if int(connection.get("certificate_expires_at") or 0) <= int(
+                time.time()
+            ):
+                # An expired certificate cannot authenticate the remote revoke
+                # endpoint. Exact identity/fingerprint CAS plus local key
+                # retirement is therefore the only safe terminal transition.
+                self.client.forget_expired_connection(
+                    connection_id,
+                    expected_host_server_identity=expected_host_server_identity,
+                    expected_hub_id=expected_hub_id,
+                    expected_certificate_fingerprint=(
+                        expected_certificate_fingerprint
+                    ),
+                )
+                self._client_failure_counts.pop(connection_id, None)
+                return self.status()
             self.client.revoke_remote_connection(
                 connection_id,
                 idempotency_key=_stable_uuid4(
@@ -1996,15 +2037,10 @@ class SecurePeerRuntime:
                 ]
                 self._remote_routes_refreshed_at[connection_id] = int(time.time())
 
-        self._client_error = (
-            _safe_status_error(
-                ancillary_error.message
-                if isinstance(ancillary_error, SecurePeerError)
-                else ancillary_error
-            )
-            if ancillary_error is not None
-            else None
-        )
+        # A verified heartbeat proves the secure transport remains usable.
+        # Renewal/catalog cleanup failures are surfaced in this maintenance
+        # result but must not suppress Team Hub or relay capability.
+        self._client_error = None
         result = {
             "active": True,
             "renewed": bool(renewal.get("renewed")),
@@ -2519,11 +2555,14 @@ class SecurePeerRuntime:
             return []
         claims: list[tuple[str, str, str, dict[str, Any]]] = []
         lease_owner = f"agentsserver-{self.server_instance_id}"
+        delivery_claim_attempted = False
+        delivery_claim_error: str | None = None
         active = next(
             (item for item in self.client.list_connections() if item.get("active")),
             None,
         )
         if active is not None:
+            delivery_claim_attempted = True
             connection_id = str(active.get("connection_id") or "")
             try:
                 response = self.client.claim_inbox(
@@ -2535,7 +2574,12 @@ class SecurePeerRuntime:
                 for envelope in response.get("envelopes") or []:
                     claims.append(("client", connection_id, token, dict(envelope)))
             except Exception as exc:
-                self._client_error = _safe_status_error(
+                # Relay inbox availability is an ancillary delivery signal. A
+                # fresh authenticated heartbeat still proves that ordinary
+                # Teamspace proxy traffic is usable, so never poison the
+                # transport-health field (and its Team Hub capability gate)
+                # with a relay-only failure.
+                delivery_claim_error = _safe_status_error(
                     exc.message if isinstance(exc, SecurePeerError) else exc
                 )
         with self._guard:
@@ -2543,12 +2587,12 @@ class SecurePeerRuntime:
         if store is not None:
             remaining = max(0, limit - len(claims))
             if remaining:
+                delivery_claim_attempted = True
                 try:
                     response = store.claim_local_inbox(
                         lease_owner,
                         limit=remaining,
                     )
-                    self._delivery_error = None
                     token = str(response.get("lease_token") or "")
                     for envelope in response.get("envelopes") or []:
                         claims.append((
@@ -2558,9 +2602,11 @@ class SecurePeerRuntime:
                             dict(envelope),
                         ))
                 except Exception as exc:
-                    self._delivery_error = _safe_status_error(
+                    delivery_claim_error = delivery_claim_error or _safe_status_error(
                         exc.message if isinstance(exc, SecurePeerError) else exc
                     )
+        if delivery_claim_attempted:
+            self._delivery_error = delivery_claim_error
         ready: list[dict[str, Any]] = []
         for role, connection_id, lease_token, envelope in claims:
             if not lease_token:
@@ -2692,6 +2738,16 @@ class SecurePeerRuntime:
             return self.delivery_ledger.finish(
                 envelope_id,
                 succeeded=False,
+                error=error,
+            )
+        if record.get("state") == "authorized":
+            # The remote delivered receipt has already committed. There is no
+            # lease to reject now, but an ownerless authorization whose local
+            # target disappeared must become terminal instead of retrying and
+            # fencing chat/connection retirement forever. The ledger CAS
+            # refuses this transition if queue/run ownership raced with it.
+            return self.delivery_ledger.fail_ownerless_authorized(
+                envelope_id,
                 error=error,
             )
         return record
@@ -3265,7 +3321,17 @@ class SecurePeerRuntime:
         return destinations
 
     @staticmethod
-    def _decoded_proxy_json(response: Any) -> dict[str, Any]:
+    def _decoded_proxy_json(
+        response: Any,
+        *,
+        preserve_not_found: bool = False,
+    ) -> dict[str, Any]:
+        if preserve_not_found and int(response.status) == 404:
+            # Exact recipient lookups intentionally collapse missing,
+            # cross-team, and retired identities to the same local 404. Do
+            # not reinterpret that bounded absence as a transient transport
+            # outage; no remote response detail crosses this boundary.
+            raise SecurePeerError("not_found", "Resource not found", 404)
         if int(response.status) != 200:
             raise SecurePeerError(
                 "team_mail_unavailable",
@@ -3753,6 +3819,18 @@ class SecurePeerRuntime:
         attachment_id: str,
         file_name: str,
     ) -> tuple[Path, Path]:
+        with self._team_cache_guard:
+            return self._team_cache_paths_locked(
+                active, team_id, attachment_id, file_name
+            )
+
+    def _team_cache_paths_locked(
+        self,
+        active: Mapping[str, Any],
+        team_id: str,
+        attachment_id: str,
+        file_name: str,
+    ) -> tuple[Path, Path]:
         hub_id = str(active.get("hub_id") or "")
         for value in (hub_id, team_id, attachment_id):
             if _TEAM_CACHE_SEGMENT_RE.fullmatch(value) is None:
@@ -3803,16 +3881,22 @@ class SecurePeerRuntime:
         return value if isinstance(value, dict) else None
 
     @staticmethod
-    def _team_cache_write_sidecar(path: Path, value: Mapping[str, Any]) -> None:
+    def _team_cache_write_sidecar_at(
+        parent_descriptor: int,
+        name: str,
+        value: Mapping[str, Any],
+    ) -> None:
         encoded = canonical_json(dict(value))
         if not 2 <= len(encoded) <= _TEAM_CACHE_META_MAX_BYTES:
             raise SecurePeerError(
                 "cache_unavailable", "Team attachment cache metadata is invalid", 503
             )
-        temporary = path.parent / f".metadata.{uuid.uuid4().hex}.tmp"
+        temporary = f".metadata.{uuid.uuid4().hex}.tmp"
         flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
         flags |= getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
-        descriptor = os.open(temporary, flags, 0o600)
+        descriptor = os.open(
+            temporary, flags, 0o600, dir_fd=parent_descriptor
+        )
         try:
             try:
                 view = memoryview(encoded)
@@ -3824,52 +3908,467 @@ class SecurePeerRuntime:
                 os.fsync(descriptor)
             finally:
                 os.close(descriptor)
-            os.replace(temporary, path)
-            os.chmod(path, 0o600)
+            os.replace(
+                temporary,
+                name,
+                src_dir_fd=parent_descriptor,
+                dst_dir_fd=parent_descriptor,
+            )
+            os.fsync(parent_descriptor)
         except BaseException:
             with suppress(OSError):
-                temporary.unlink()
+                os.unlink(temporary, dir_fd=parent_descriptor)
             raise
 
-    def _team_cache_file_valid(
-        self, target: Path, sidecar: Path, attachment: Mapping[str, Any]
-    ) -> bool:
-        metadata = self._team_cache_read_sidecar(sidecar)
-        try:
-            info = target.lstat()
-        except (FileNotFoundError, OSError):
-            return False
-        if (
-            metadata is None
-            or not stat.S_ISREG(info.st_mode)
-            or info.st_uid != os.getuid()
-            or info.st_size != int(attachment["byte_size"])
-            or metadata.get("sha256") != attachment["sha256"]
-            or metadata.get("byte_size") != attachment["byte_size"]
-            or metadata.get("file_name") != attachment["file_name"]
-        ):
-            return False
-        unchanged = (
-            metadata.get("inode") == info.st_ino
-            and metadata.get("mtime_ns") == info.st_mtime_ns
+    @staticmethod
+    def _team_cache_stat_identity(info: os.stat_result) -> tuple[int, ...]:
+        return (
+            info.st_dev,
+            info.st_ino,
+            info.st_mode,
+            info.st_nlink,
+            info.st_uid,
+            info.st_size,
+            info.st_mtime_ns,
+            info.st_ctime_ns,
         )
-        if not unchanged and self._team_file_sha256(target) != attachment["sha256"]:
-            return False
-        if not unchanged:
-            self._team_cache_write_sidecar(
-                sidecar,
-                {
-                    **metadata,
-                    "inode": info.st_ino,
-                    "mtime_ns": info.st_mtime_ns,
-                },
-            )
+
+    @staticmethod
+    def _team_directory_identity(info: os.stat_result) -> tuple[int, int]:
+        """Directory identity fields that remain stable while children change."""
+
+        return info.st_dev, info.st_ino
+
+    @staticmethod
+    def _team_descriptor_sha256(descriptor: int, size: int) -> str:
+        digest = hashlib.sha256()
+        offset = 0
+        while offset < size:
+            block = os.pread(descriptor, min(1024 * 1024, size - offset), offset)
+            if not block:
+                raise OSError("Team attachment cache file is truncated")
+            digest.update(block)
+            offset += len(block)
+        if os.pread(descriptor, 1, size):
+            raise OSError("Team attachment cache file exceeded metadata")
+        return digest.hexdigest()
+
+    def _release_team_cache_descriptor_locked(
+        self, target: Path, descriptor: int
+    ) -> None:
         with suppress(OSError):
-            os.utime(sidecar, None, follow_symlinks=False)
-        return True
+            os.close(descriptor)
+        remaining = self._team_cache_pins.get(target, 0) - 1
+        if remaining > 0:
+            self._team_cache_pins[target] = remaining
+        else:
+            self._team_cache_pins.pop(target, None)
+
+    def _verified_team_cache_descriptor(
+        self, target: Path, sidecar: Path, attachment: Mapping[str, Any]
+    ) -> int | None:
+        """Hash a pinned inode outside the global lock, then re-CAS its path."""
+
+        descriptor = -1
+        with self._team_cache_guard:
+            metadata = self._team_cache_read_sidecar(sidecar)
+            flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
+            flags |= getattr(os, "O_NOFOLLOW", 0)
+            try:
+                descriptor = os.open(target, flags)
+                before = os.fstat(descriptor)
+                path_before = target.lstat()
+                sidecar_before = sidecar.lstat()
+            except OSError:
+                if descriptor >= 0:
+                    with suppress(OSError):
+                        os.close(descriptor)
+                return None
+            if (
+                metadata is None
+                or metadata.get("version") != 1
+                or not stat.S_ISREG(before.st_mode)
+                or before.st_nlink != 1
+                or before.st_uid != os.getuid()
+                or before.st_size != int(attachment["byte_size"])
+                or self._team_cache_stat_identity(path_before)
+                != self._team_cache_stat_identity(before)
+                or not stat.S_ISREG(sidecar_before.st_mode)
+                or sidecar_before.st_nlink != 1
+                or sidecar_before.st_uid != os.getuid()
+                or metadata.get("sha256") != attachment["sha256"]
+                or metadata.get("byte_size") != attachment["byte_size"]
+                or metadata.get("file_name") != attachment["file_name"]
+                or metadata.get("inode") != before.st_ino
+                or metadata.get("mtime_ns") != before.st_mtime_ns
+            ):
+                os.close(descriptor)
+                return None
+            self._team_cache_pins[target] = self._team_cache_pins.get(target, 0) + 1
+
+        try:
+            digest = self._team_descriptor_sha256(descriptor, before.st_size)
+        except OSError:
+            with self._team_cache_guard:
+                self._release_team_cache_descriptor_locked(target, descriptor)
+            return None
+
+        with self._team_cache_guard:
+            try:
+                after = os.fstat(descriptor)
+                path_after = target.lstat()
+                sidecar_after = sidecar.lstat()
+            except OSError:
+                self._release_team_cache_descriptor_locked(target, descriptor)
+                return None
+            current_metadata = self._team_cache_read_sidecar(sidecar)
+            if (
+                digest != attachment["sha256"]
+                or self._team_cache_stat_identity(after)
+                != self._team_cache_stat_identity(before)
+                or self._team_cache_stat_identity(path_after)
+                != self._team_cache_stat_identity(after)
+                or self._team_cache_stat_identity(sidecar_after)
+                != self._team_cache_stat_identity(sidecar_before)
+                or current_metadata != metadata
+            ):
+                self._release_team_cache_descriptor_locked(target, descriptor)
+                return None
+            with suppress(OSError):
+                os.utime(sidecar, None, follow_symlinks=False)
+            # The caller owns both this descriptor and the matching cache pin.
+            return descriptor
+
+    def _prune_empty_team_cache_directories_locked(self) -> int:
+        """Boundedly prune through verified directory descriptors only."""
+
+        root = self.team_cache_dir
+        protected_directories: set[Path] = set()
+        protected_paths = (
+            set(self._team_cache_entry_locks)
+            | set(self._team_cache_pins)
+            | set(self._team_cache_reservations)
+        )
+        for protected in protected_paths:
+            current = protected.parent
+            while current != root and root in current.parents:
+                protected_directories.add(current)
+                current = current.parent
+
+        flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
+        flags |= getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+        try:
+            root_descriptor = os.open(root, flags)
+            root_info = os.fstat(root_descriptor)
+        except OSError:
+            return 0
+        if (
+            not stat.S_ISDIR(root_info.st_mode)
+            or root_info.st_uid != os.getuid()
+        ):
+            os.close(root_descriptor)
+            return 0
+
+        # Cache layout depth is root/hub/team/attachment/payload. Every child
+        # is opened relative to its already-verified parent, never by a path
+        # that can be redirected through a swapped symlink. rmdir(2) does not
+        # follow a final symlink and is attempted only after the name still
+        # matches the open child descriptor.
+        examined = 0
+        removed = 0
+
+        def prune(
+            directory_descriptor: int,
+            logical_directory: Path,
+            depth: int,
+        ) -> None:
+            nonlocal examined, removed
+            try:
+                entries = os.scandir(directory_descriptor)
+            except OSError:
+                return
+            with entries:
+                for entry in entries:
+                    if examined >= _TEAM_CACHE_DIRECTORY_SCAN_LIMIT:
+                        return
+                    examined += 1
+                    try:
+                        info = entry.stat(follow_symlinks=False)
+                    except OSError:
+                        continue
+                    if (
+                        depth >= 4
+                        or not stat.S_ISDIR(info.st_mode)
+                        or info.st_uid != os.getuid()
+                        or info.st_dev != root_info.st_dev
+                    ):
+                        continue
+                    try:
+                        child_descriptor = os.open(
+                            entry.name, flags, dir_fd=directory_descriptor
+                        )
+                        opened = os.fstat(child_descriptor)
+                    except OSError:
+                        continue
+                    try:
+                        if (
+                            self._team_directory_identity(opened)
+                            != self._team_directory_identity(info)
+                            or opened.st_dev != root_info.st_dev
+                            or opened.st_uid != os.getuid()
+                        ):
+                            continue
+                        child = logical_directory / entry.name
+                        prune(child_descriptor, child, depth + 1)
+                        if child in protected_directories:
+                            continue
+                        try:
+                            opened_after = os.fstat(child_descriptor)
+                            named_after = os.stat(
+                                entry.name,
+                                dir_fd=directory_descriptor,
+                                follow_symlinks=False,
+                            )
+                        except OSError:
+                            continue
+                        if (
+                            self._team_directory_identity(opened_after)
+                            != self._team_directory_identity(named_after)
+                            or not stat.S_ISDIR(named_after.st_mode)
+                            or named_after.st_uid != os.getuid()
+                            or named_after.st_dev != root_info.st_dev
+                        ):
+                            continue
+                        try:
+                            os.rmdir(entry.name, dir_fd=directory_descriptor)
+                        except OSError:
+                            pass
+                        else:
+                            removed += 1
+                    finally:
+                        os.close(child_descriptor)
+
+        try:
+            prune(root_descriptor, root, 0)
+        finally:
+            os.close(root_descriptor)
+        return removed
+
+    def _bounded_team_cache_regular_files_locked(
+        self,
+    ) -> tuple[dict[Path, os.stat_result], str]:
+        """Scan the fixed cache shape without symlink following or fanout."""
+
+        root = self.team_cache_dir
+        flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
+        flags |= getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+        try:
+            root_descriptor = os.open(root, flags)
+            root_info = os.fstat(root_descriptor)
+        except FileNotFoundError:
+            return {}, "complete"
+        except OSError:
+            return {}, "unsafe"
+        if (
+            not stat.S_ISDIR(root_info.st_mode)
+            or root_info.st_uid != os.getuid()
+        ):
+            os.close(root_descriptor)
+            return {}, "unsafe"
+
+        regular: dict[Path, os.stat_result] = {}
+        examined = 0
+        overflow = False
+        unsafe = False
+
+        def scan(
+            directory_descriptor: int,
+            logical_directory: Path,
+            depth: int,
+        ) -> None:
+            nonlocal examined, overflow, unsafe
+            try:
+                entries = os.scandir(directory_descriptor)
+            except OSError:
+                unsafe = True
+                return
+            with entries:
+                for entry in entries:
+                    if examined >= _TEAM_CACHE_DIRECTORY_SCAN_LIMIT:
+                        overflow = True
+                        return
+                    examined += 1
+                    try:
+                        info = entry.stat(follow_symlinks=False)
+                    except OSError:
+                        unsafe = True
+                        continue
+                    candidate = logical_directory / entry.name
+                    if stat.S_ISREG(info.st_mode) and info.st_uid == os.getuid():
+                        if info.st_nlink != 1:
+                            unsafe = True
+                        else:
+                            regular[candidate] = info
+                        continue
+                    if not stat.S_ISDIR(info.st_mode):
+                        continue
+                    if (
+                        depth >= 4
+                        or info.st_uid != os.getuid()
+                        or info.st_dev != root_info.st_dev
+                    ):
+                        unsafe = True
+                        continue
+                    try:
+                        child_descriptor = os.open(
+                            entry.name, flags, dir_fd=directory_descriptor
+                        )
+                        opened = os.fstat(child_descriptor)
+                    except OSError:
+                        unsafe = True
+                        continue
+                    try:
+                        if (
+                            self._team_directory_identity(opened)
+                            != self._team_directory_identity(info)
+                            or opened.st_dev != root_info.st_dev
+                            or opened.st_uid != os.getuid()
+                        ):
+                            unsafe = True
+                            continue
+                        scan(child_descriptor, candidate, depth + 1)
+                    finally:
+                        os.close(child_descriptor)
+
+        try:
+            scan(root_descriptor, root, 0)
+        finally:
+            os.close(root_descriptor)
+        return regular, (
+            "unsafe" if unsafe else "overflow" if overflow else "complete"
+        )
+
+    def _open_team_cache_parent_descriptor_locked(
+        self, candidate: Path
+    ) -> tuple[int, str]:
+        """Open a scanned cache file's parent through pinned no-follow fds."""
+
+        try:
+            parts = candidate.relative_to(self.team_cache_dir).parts
+        except ValueError as exc:
+            raise OSError("cache path escaped root") from exc
+        if not parts or len(parts) > 5 or any(
+            not part or part in {".", ".."} for part in parts
+        ):
+            raise OSError("cache path shape is invalid")
+        flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
+        flags |= getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+        descriptor = os.open(self.team_cache_dir, flags)
+        root_info = os.fstat(descriptor)
+        if (
+            not stat.S_ISDIR(root_info.st_mode)
+            or root_info.st_uid != os.getuid()
+        ):
+            os.close(descriptor)
+            raise OSError("cache root is unsafe")
+        try:
+            for component in parts[:-1]:
+                child = os.open(component, flags, dir_fd=descriptor)
+                child_info = os.fstat(child)
+                if (
+                    not stat.S_ISDIR(child_info.st_mode)
+                    or child_info.st_uid != os.getuid()
+                    or child_info.st_dev != root_info.st_dev
+                ):
+                    os.close(child)
+                    raise OSError("cache ancestor is unsafe")
+                os.close(descriptor)
+                descriptor = child
+            return descriptor, parts[-1]
+        except BaseException:
+            os.close(descriptor)
+            raise
+
+    def _team_cache_read_scanned_sidecar_locked(
+        self, candidate: Path, expected: os.stat_result
+    ) -> dict[str, Any] | None:
+        try:
+            parent_descriptor, name = (
+                self._open_team_cache_parent_descriptor_locked(candidate)
+            )
+        except OSError:
+            return None
+        descriptor = -1
+        try:
+            flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
+            flags |= getattr(os, "O_NOFOLLOW", 0)
+            descriptor = os.open(name, flags, dir_fd=parent_descriptor)
+            info = os.fstat(descriptor)
+            if (
+                self._team_cache_stat_identity(info)
+                != self._team_cache_stat_identity(expected)
+                or not stat.S_ISREG(info.st_mode)
+                or info.st_uid != os.getuid()
+                or info.st_nlink != 1
+                or not 2 <= info.st_size <= _TEAM_CACHE_META_MAX_BYTES
+            ):
+                return None
+            raw = bytearray()
+            while len(raw) < info.st_size:
+                block = os.read(descriptor, info.st_size - len(raw))
+                if not block:
+                    return None
+                raw.extend(block)
+            if os.read(descriptor, 1):
+                return None
+            try:
+                value = json.loads(bytes(raw))
+            except (UnicodeDecodeError, json.JSONDecodeError):
+                return None
+            return value if isinstance(value, dict) else None
+        except OSError:
+            return None
+        finally:
+            if descriptor >= 0:
+                with suppress(OSError):
+                    os.close(descriptor)
+            os.close(parent_descriptor)
+
+    def _unlink_scanned_team_cache_file_locked(
+        self, candidate: Path, expected: os.stat_result
+    ) -> bool:
+        try:
+            parent_descriptor, name = (
+                self._open_team_cache_parent_descriptor_locked(candidate)
+            )
+        except OSError:
+            return False
+        try:
+            current = os.stat(
+                name,
+                dir_fd=parent_descriptor,
+                follow_symlinks=False,
+            )
+            if (
+                self._team_cache_stat_identity(current)
+                != self._team_cache_stat_identity(expected)
+                or not stat.S_ISREG(current.st_mode)
+                or current.st_uid != os.getuid()
+            ):
+                return False
+            os.unlink(name, dir_fd=parent_descriptor)
+            return True
+        except OSError:
+            return False
+        finally:
+            os.close(parent_descriptor)
 
     def _evict_team_cache(
-        self, *, protected: Path | None = None, reserve_bytes: int = 0
+        self,
+        *,
+        protected: Path | None = None,
+        reserve_bytes: int = 0,
+        prune_empty: bool = True,
     ) -> None:
         if (
             type(reserve_bytes) is not int
@@ -3879,42 +4378,105 @@ class SecurePeerRuntime:
             raise SecurePeerError(
                 "attachment_limit", "Attachment exceeds the local cache limit", 413
             )
-        entries: list[tuple[int, int, tuple[Path, ...]]] = []
-        total = 0
-        if not self.team_cache_dir.is_dir():
-            return
-        regular: dict[Path, os.stat_result] = {}
-        for candidate in self.team_cache_dir.rglob("*"):
-            try:
-                info = candidate.lstat()
-            except OSError:
-                continue
-            if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid():
-                continue
-            # No cache operation remains live while this global lock is held;
-            # these names can only be crash leftovers. Remove them eagerly so
-            # repeated failed downloads cannot accumulate outside the LRU.
-            if (
-                (candidate.parent / "payload").is_dir()
-                and (
+        active_staging = set(self._team_cache_reservations)
+        reserved_bytes = sum(self._team_cache_reservations.values()) + reserve_bytes
+        if reserved_bytes > self.team_cache_max_bytes:
+            raise SecurePeerError(
+                "cache_unavailable", "Team attachment cache cannot free enough space", 507
+            )
+        live_targets = set(self._team_cache_entry_locks) | {
+            path for path, count in self._team_cache_pins.items() if count > 0
+        }
+        if protected is not None:
+            live_targets.add(protected)
+        protected_entry_directories = {
+            path.parent.parent for path in live_targets
+        } | {path.parent for path in self._team_cache_reservations}
+        recovery_passes = 0
+        while True:
+            regular, scan_status = (
+                self._bounded_team_cache_regular_files_locked()
+            )
+            progress = 0
+            for candidate, info in tuple(regular.items()):
+                if candidate in active_staging:
+                    regular.pop(candidate, None)
+                    continue
+                # No cache operation remains live while this global lock is
+                # held; these names can only be crash leftovers. Remove them
+                # eagerly so failed downloads cannot accumulate outside LRU.
+                try:
+                    relative_parts = candidate.relative_to(
+                        self.team_cache_dir
+                    ).parts
+                except ValueError:
+                    relative_parts = ()
+                if len(relative_parts) == 4 and (
                     candidate.name.startswith(".download.")
                     or (
                         candidate.name.startswith(".metadata.")
                         and candidate.name.endswith(".tmp")
                     )
+                ) and self._unlink_scanned_team_cache_file_locked(
+                    candidate, info
+                ):
+                    regular.pop(candidate, None)
+                    progress += 1
+            if scan_status == "unsafe":
+                if prune_empty:
+                    self._prune_empty_team_cache_directories_locked()
+                raise SecurePeerError(
+                    "cache_unavailable",
+                    "Team attachment cache contains unsafe entries",
+                    507,
                 )
-            ):
-                with suppress(OSError):
-                    candidate.unlink()
-                if not candidate.exists():
+            if scan_status == "complete":
+                break
+            if recovery_passes >= _TEAM_CACHE_OVERFLOW_RECOVERY_PASSES:
+                raise SecurePeerError(
+                    "cache_unavailable",
+                    "Team attachment cache recovery requires another bounded pass",
+                    507,
+                )
+            # A pre-hardening cache can legitimately exceed today's bounded
+            # scanner. Evict the verified, inactive portion of this one scan,
+            # prune what became empty, and rescan. Work remains capped per
+            # request; if more remains, the next request continues recovery.
+            for candidate, info in tuple(regular.items()):
+                try:
+                    parts = candidate.relative_to(self.team_cache_dir).parts
+                except ValueError:
                     continue
-            regular[candidate] = info
+                entry_directory: Path | None
+                if len(parts) == 4:
+                    entry_directory = candidate.parent
+                elif len(parts) == 5 and parts[-2] == "payload":
+                    entry_directory = candidate.parent.parent
+                else:
+                    entry_directory = None
+                if entry_directory in protected_entry_directories:
+                    continue
+                if self._unlink_scanned_team_cache_file_locked(candidate, info):
+                    progress += 1
+            progress += self._prune_empty_team_cache_directories_locked()
+            if progress == 0:
+                raise SecurePeerError(
+                    "cache_unavailable",
+                    "Team attachment cache overflow could not be recovered safely",
+                    507,
+                )
+            recovery_passes += 1
+
+        entries: list[tuple[int, int, tuple[Path, ...]]] = []
+        total = 0
 
         grouped: set[Path] = set()
         for sidecar, side_info in tuple(regular.items()):
             target: Path | None = None
             if sidecar.name == _TEAM_CACHE_META_NAME:
-                metadata = self._team_cache_read_sidecar(sidecar)
+                metadata = self._team_cache_read_scanned_sidecar_locked(
+                    sidecar, side_info
+                )
                 file_name = metadata.get("file_name") if metadata else None
                 if (
                     isinstance(file_name, str)
@@ -3934,9 +4496,9 @@ class SecurePeerRuntime:
                 if sidecar.name == _TEAM_CACHE_META_NAME or sidecar.name.endswith(
                     ".agentsdock-meta"
                 ):
-                    with suppress(OSError):
-                        sidecar.unlink()
-                    if not sidecar.exists():
+                    if self._unlink_scanned_team_cache_file_locked(
+                        sidecar, side_info
+                    ):
                         grouped.add(sidecar)
                 continue
             target_info = regular[target]
@@ -3960,7 +4522,7 @@ class SecurePeerRuntime:
             entries.append((info.st_mtime_ns, info.st_size, (candidate,)))
 
         for _used, size, paths in sorted(entries, key=lambda item: item[0]):
-            if total + reserve_bytes <= self.team_cache_max_bytes:
+            if total + reserved_bytes <= self.team_cache_max_bytes:
                 break
             if (
                 protected is not None
@@ -3971,16 +4533,400 @@ class SecurePeerRuntime:
             freed = 0
             for candidate in paths:
                 info = regular.get(candidate)
-                before = candidate.exists()
-                with suppress(OSError):
-                    candidate.unlink()
-                if before and not candidate.exists() and info is not None:
+                if (
+                    info is not None
+                    and self._unlink_scanned_team_cache_file_locked(
+                        candidate, info
+                    )
+                ):
                     freed += info.st_size
             total -= freed
-        if total + reserve_bytes > self.team_cache_max_bytes:
+        if prune_empty:
+            self._prune_empty_team_cache_directories_locked()
+        if total + reserved_bytes > self.team_cache_max_bytes:
             raise SecurePeerError(
                 "cache_unavailable", "Team attachment cache cannot free enough space", 507
             )
+
+    def _reference_team_cache_entry_lock_locked(
+        self, target: Path
+    ) -> threading.Lock:
+        entry = self._team_cache_entry_locks.get(target)
+        if entry is None:
+            lock = threading.Lock()
+            references = 0
+        else:
+            lock, references = entry
+        self._team_cache_entry_locks[target] = (lock, references + 1)
+        return lock
+
+    def _release_team_cache_entry_lock(
+        self, target: Path, lock: threading.Lock
+    ) -> None:
+        lock.release()
+        with self._team_cache_guard:
+            current = self._team_cache_entry_locks.get(target)
+            if current is None or current[0] is not lock:
+                raise RuntimeError("Team attachment cache lock identity changed")
+            remaining = current[1] - 1
+            if remaining:
+                self._team_cache_entry_locks[target] = (lock, remaining)
+            else:
+                self._team_cache_entry_locks.pop(target, None)
+                self._prune_empty_team_cache_directories_locked()
+
+    def _pin_team_cache_entry_locked(
+        self,
+        target: Path,
+        sidecar: Path,
+        attachment: Mapping[str, Any],
+    ) -> AttachmentFileLease:
+        flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
+        flags |= getattr(os, "O_NOFOLLOW", 0)
+        descriptor = -1
+        try:
+            descriptor = os.open(target, flags)
+            info = os.fstat(descriptor)
+            metadata = self._team_cache_read_sidecar(sidecar)
+            if (
+                not stat.S_ISREG(info.st_mode)
+                or info.st_uid != os.getuid()
+                or info.st_size != int(attachment["byte_size"])
+                or metadata is None
+                or metadata.get("inode") != info.st_ino
+                or metadata.get("mtime_ns") != info.st_mtime_ns
+                or metadata.get("sha256") != attachment["sha256"]
+            ):
+                raise OSError("Team attachment cache inode changed")
+        except (OSError, ValueError) as exc:
+            if descriptor >= 0:
+                with suppress(OSError):
+                    os.close(descriptor)
+            raise SecurePeerError(
+                "cache_unavailable", "Team attachment cache is unavailable", 503
+            ) from exc
+        self._team_cache_pins[target] = self._team_cache_pins.get(target, 0) + 1
+        return self._team_cache_lease_for_pinned_descriptor_locked(
+            target, descriptor
+        )
+
+    def _team_cache_lease_for_pinned_descriptor_locked(
+        self, target: Path, descriptor: int
+    ) -> AttachmentFileLease:
+        """Transfer one already-counted cache pin into a closeable lease."""
+
+        finalizer_lock = threading.Lock()
+        finalized = False
+
+        def finalize() -> None:
+            nonlocal finalized
+            with finalizer_lock:
+                if finalized:
+                    return
+                finalized = True
+            with self._team_cache_guard:
+                self._release_team_cache_descriptor_locked(target, descriptor)
+
+        return AttachmentFileLease(descriptor, finalize)
+
+    def _materialize_team_cache_entry(
+        self,
+        *,
+        active: Mapping[str, Any],
+        attachment: Mapping[str, Any],
+        team_id: str,
+        attachment_id: str,
+        download: Callable[[Path], tuple[tuple[str, str], ...]],
+        connection_id: str | None,
+        pin: bool,
+    ) -> Path | AttachmentFileLease:
+        """Materialize one entry without global locks across transfer or hash."""
+
+        required_cache_bytes = (
+            int(attachment["byte_size"]) + _TEAM_CACHE_META_MAX_BYTES
+        )
+        if required_cache_bytes > self.team_cache_max_bytes:
+            raise SecurePeerError(
+                "attachment_limit", "Attachment exceeds the local cache limit", 413
+            )
+        # Directory creation and active-entry registration are one global-lock
+        # operation, so bounded empty-directory pruning cannot remove a newly
+        # created payload directory before its download reservation exists.
+        with self._team_cache_guard:
+            target, sidecar = self._team_cache_paths_locked(
+                active,
+                team_id,
+                attachment_id,
+                str(attachment["file_name"]),
+            )
+            entry_lock = self._reference_team_cache_entry_lock_locked(target)
+        entry_lock.acquire()
+        temporary: Path | None = None
+        staging_parent_descriptor = -1
+        target_parent_descriptor = -1
+        staging_name = ""
+        target_name = target.name
+        staging_descriptor = -1
+        staging_before: os.stat_result | None = None
+        staging_digest: str | None = None
+        replaced = False
+        try:
+            verified_descriptor = self._verified_team_cache_descriptor(
+                target, sidecar, attachment
+            )
+            if verified_descriptor is not None:
+                with self._team_cache_guard:
+                    try:
+                        self._evict_team_cache(protected=target)
+                    except BaseException:
+                        self._release_team_cache_descriptor_locked(
+                            target, verified_descriptor
+                        )
+                        raise
+                    if pin:
+                        return self._team_cache_lease_for_pinned_descriptor_locked(
+                            target, verified_descriptor
+                        )
+                    self._release_team_cache_descriptor_locked(
+                        target, verified_descriptor
+                    )
+                    return target
+            with self._team_cache_guard:
+                if self._team_cache_pins.get(target, 0) > 0:
+                    raise SecurePeerError(
+                        "cache_unavailable",
+                        "Team attachment cache entry is currently in use",
+                        503,
+                    )
+                temporary = sidecar.parent / f".download.{uuid.uuid4().hex}"
+                self._evict_team_cache(
+                    reserve_bytes=required_cache_bytes,
+                    prune_empty=False,
+                )
+                self._team_cache_reservations[temporary] = required_cache_bytes
+                staging_parent_descriptor, staging_name = (
+                    self._open_team_cache_parent_descriptor_locked(temporary)
+                )
+                directory_flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
+                directory_flags |= getattr(os, "O_DIRECTORY", 0) | getattr(
+                    os, "O_NOFOLLOW", 0
+                )
+                target_parent_descriptor = os.open(
+                    "payload",
+                    directory_flags,
+                    dir_fd=staging_parent_descriptor,
+                )
+                target_parent_info = os.fstat(target_parent_descriptor)
+                staging_parent_info = os.fstat(staging_parent_descriptor)
+                if (
+                    not stat.S_ISDIR(target_parent_info.st_mode)
+                    or target_parent_info.st_uid != os.getuid()
+                    or target_parent_info.st_dev != staging_parent_info.st_dev
+                ):
+                    raise SecurePeerError(
+                        "cache_unavailable",
+                        "Team attachment cache hierarchy is unsafe",
+                        503,
+                    )
+
+            response_headers = download(temporary)
+            header_map = dict(response_headers)
+            if (
+                header_map.get("etag") != f'"{attachment["sha256"]}"'
+                or header_map.get("content-type") != attachment["media_type"]
+                or header_map.get("accept-ranges") != "bytes"
+            ):
+                raise SecurePeerError(
+                    "attachment_hash_mismatch",
+                    "Downloaded attachment failed integrity verification",
+                    502,
+                )
+            try:
+                flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
+                flags |= getattr(os, "O_NOFOLLOW", 0)
+                staging_descriptor = os.open(
+                    staging_name,
+                    flags,
+                    dir_fd=staging_parent_descriptor,
+                )
+                os.fchmod(staging_descriptor, 0o600)
+                staging_before = os.fstat(staging_descriptor)
+                staging_path_before = os.stat(
+                    staging_name,
+                    dir_fd=staging_parent_descriptor,
+                    follow_symlinks=False,
+                )
+                if (
+                    not stat.S_ISREG(staging_before.st_mode)
+                    or staging_before.st_nlink != 1
+                    or staging_before.st_uid != os.getuid()
+                    or staging_before.st_size != int(attachment["byte_size"])
+                    or self._team_cache_stat_identity(staging_path_before)
+                    != self._team_cache_stat_identity(staging_before)
+                ):
+                    raise OSError("Team attachment staging inode is invalid")
+                # Hash the pinned staging inode without holding the cache-wide
+                # lock. Publication below CASes both the descriptor and name.
+                staging_digest = self._team_descriptor_sha256(
+                    staging_descriptor, staging_before.st_size
+                )
+            except OSError as exc:
+                raise SecurePeerError(
+                    "attachment_hash_mismatch",
+                    "Downloaded attachment failed integrity verification",
+                    502,
+                ) from exc
+
+            def publish_locked() -> Path | AttachmentFileLease:
+                nonlocal replaced, staging_descriptor
+                assert temporary is not None
+                assert staging_before is not None
+                assert staging_digest is not None
+                staging_after = os.fstat(staging_descriptor)
+                staging_path_after = os.stat(
+                    staging_name,
+                    dir_fd=staging_parent_descriptor,
+                    follow_symlinks=False,
+                )
+                if (
+                    staging_digest != attachment["sha256"]
+                    or self._team_cache_stat_identity(staging_after)
+                    != self._team_cache_stat_identity(staging_before)
+                    or self._team_cache_stat_identity(staging_path_after)
+                    != self._team_cache_stat_identity(staging_after)
+                ):
+                    raise SecurePeerError(
+                        "attachment_hash_mismatch",
+                        "Downloaded attachment changed before cache publication",
+                        502,
+                    )
+                os.replace(
+                    staging_name,
+                    target_name,
+                    src_dir_fd=staging_parent_descriptor,
+                    dst_dir_fd=target_parent_descriptor,
+                )
+                replaced = True
+                info = os.stat(
+                    target_name,
+                    dir_fd=target_parent_descriptor,
+                    follow_symlinks=False,
+                )
+                descriptor_info = os.fstat(staging_descriptor)
+                if (
+                    self._team_cache_stat_identity(info)
+                    != self._team_cache_stat_identity(descriptor_info)
+                ):
+                    raise SecurePeerError(
+                        "attachment_hash_mismatch",
+                        "Downloaded attachment changed during cache publication",
+                        502,
+                    )
+                self._team_cache_write_sidecar_at(
+                    staging_parent_descriptor,
+                    sidecar.name,
+                    {
+                        "version": 1,
+                        "hub_id": active["hub_id"],
+                        "team_id": team_id,
+                        "attachment_id": attachment_id,
+                        "file_name": attachment["file_name"],
+                        "media_type": attachment["media_type"],
+                        "byte_size": attachment["byte_size"],
+                        "sha256": attachment["sha256"],
+                        "inode": info.st_ino,
+                        "mtime_ns": info.st_mtime_ns,
+                    },
+                )
+                os.fsync(target_parent_descriptor)
+                self._team_cache_reservations.pop(temporary, None)
+                self._evict_team_cache(protected=target)
+                logical_parent, logical_name = (
+                    self._open_team_cache_parent_descriptor_locked(target)
+                )
+                try:
+                    if (
+                        logical_name != target_name
+                        or os.fstat(logical_parent).st_dev
+                        != os.fstat(target_parent_descriptor).st_dev
+                        or os.fstat(logical_parent).st_ino
+                        != os.fstat(target_parent_descriptor).st_ino
+                        or self._team_cache_stat_identity(
+                            os.stat(
+                                logical_name,
+                                dir_fd=logical_parent,
+                                follow_symlinks=False,
+                            )
+                        )
+                        != self._team_cache_stat_identity(descriptor_info)
+                    ):
+                        raise SecurePeerError(
+                            "cache_unavailable",
+                            "Team attachment cache hierarchy changed",
+                            503,
+                        )
+                finally:
+                    os.close(logical_parent)
+                if not pin:
+                    return target
+                self._team_cache_pins[target] = (
+                    self._team_cache_pins.get(target, 0) + 1
+                )
+                lease_descriptor = staging_descriptor
+                staging_descriptor = -1
+                return self._team_cache_lease_for_pinned_descriptor_locked(
+                    target, lease_descriptor
+                )
+
+            if connection_id is None:
+                with self._team_cache_guard:
+                    return publish_locked()
+            # Retirement may proceed while bytes stream, but cannot cross this
+            # exact active/hub CAS and atomic cache publication boundary.
+            with self._outbound_guard:
+                current = self._active_team_connection(connection_id, team_id)
+                if current.get("hub_id") != active.get("hub_id"):
+                    raise SecurePeerError(
+                        "connection_changed", "Secure peer connection changed", 409
+                    )
+                with self._team_cache_guard:
+                    return publish_locked()
+        except BaseException:
+            with self._team_cache_guard:
+                if temporary is not None:
+                    self._team_cache_reservations.pop(temporary, None)
+                    if staging_parent_descriptor >= 0 and staging_name:
+                        with suppress(OSError):
+                            os.unlink(
+                                staging_name,
+                                dir_fd=staging_parent_descriptor,
+                            )
+                if replaced:
+                    if target_parent_descriptor >= 0:
+                        with suppress(OSError):
+                            os.unlink(
+                                target_name,
+                                dir_fd=target_parent_descriptor,
+                            )
+                    if staging_parent_descriptor >= 0:
+                        with suppress(OSError):
+                            os.unlink(
+                                sidecar.name,
+                                dir_fd=staging_parent_descriptor,
+                            )
+                self._prune_empty_team_cache_directories_locked()
+            raise
+        finally:
+            if staging_descriptor >= 0:
+                with suppress(OSError):
+                    os.close(staging_descriptor)
+            if target_parent_descriptor >= 0:
+                with suppress(OSError):
+                    os.close(target_parent_descriptor)
+            if staging_parent_descriptor >= 0:
+                with suppress(OSError):
+                    os.close(staging_parent_descriptor)
+            self._release_team_cache_entry_lock(target, entry_lock)
 
     def cache_team_attachment(
         self, connection_id: str, team_id: str, attachment_id: str
@@ -3990,157 +4936,439 @@ class SecurePeerRuntime:
         active, attachment = self._team_attachment_metadata(
             connection_id, team_id, attachment_id
         )
-        required_cache_bytes = (
-            int(attachment["byte_size"]) + _TEAM_CACHE_META_MAX_BYTES
-        )
-        if required_cache_bytes > self.team_cache_max_bytes:
-            raise SecurePeerError(
-                "attachment_limit", "Attachment exceeds the local cache limit", 413
-            )
-        target, sidecar = self._team_cache_paths(
-            active,
-            team_id,
-            attachment_id,
-            str(attachment["file_name"]),
-        )
-        with self._team_cache_guard:
-            if self._team_cache_file_valid(target, sidecar, attachment):
-                self._evict_team_cache(protected=target)
-                return attachment, target
-            if self._team_cache_pins.get(target, 0) > 0:
-                raise SecurePeerError(
-                    "cache_unavailable",
-                    "Team attachment cache entry is currently in use",
-                    503,
-                )
-            with suppress(OSError):
-                target.unlink()
-            with suppress(OSError):
-                sidecar.unlink()
-            # Reserve the entire incoming payload before creating its staging
-            # file so the configured bound remains true during download, not
-            # only after the atomic replace.
-            self._evict_team_cache(reserve_bytes=required_cache_bytes)
-            temporary = sidecar.parent / f".download.{uuid.uuid4().hex}"
+
+        def download(temporary: Path) -> tuple[tuple[str, str], ...]:
             try:
-                with self._outbound_guard:
-                    current = self._active_team_connection(connection_id, team_id)
-                    if current.get("hub_id") != active.get("hub_id"):
-                        raise SecurePeerError(
-                            "connection_changed", "Secure peer connection changed", 409
-                        )
-                    try:
-                        response_headers = self.client.download_attachment_to(
-                            connection_id,
-                            self._team_attachment_path(team_id, attachment_id),
-                            temporary,
-                            expected_size=int(attachment["byte_size"]),
-                        )
-                    except SecurePeerError as exc:
-                        if (
-                            self._is_unconfirmed_peer_revocation(exc)
-                            and self._remote_revocation_confirmed(connection_id) is True
-                        ):
-                            with suppress(Exception):
-                                self._retire_remote_revoked_active_connection(current, {})
-                        raise
-                header_map = dict(response_headers)
+                return self.client.download_attachment_to(
+                    connection_id,
+                    self._team_attachment_path(team_id, attachment_id),
+                    temporary,
+                    expected_size=int(attachment["byte_size"]),
+                )
+            except SecurePeerError as exc:
                 if (
-                    header_map.get("etag") != f'"{attachment["sha256"]}"'
-                    or header_map.get("content-type") != attachment["media_type"]
-                    or header_map.get("accept-ranges") != "bytes"
-                    or temporary.stat().st_size != int(attachment["byte_size"])
-                    or self._team_file_sha256(temporary) != attachment["sha256"]
+                    self._is_unconfirmed_peer_revocation(exc)
+                    and self._remote_revocation_confirmed(connection_id) is True
                 ):
-                    raise SecurePeerError(
-                        "attachment_hash_mismatch",
-                        "Downloaded attachment failed integrity verification",
-                        502,
-                    )
-                os.chmod(temporary, 0o600)
-                os.replace(temporary, target)
-            except BaseException:
-                with suppress(OSError):
-                    temporary.unlink()
+                    with suppress(Exception):
+                        self._retire_remote_revoked_active_connection(active, {})
                 raise
-            info = target.lstat()
-            self._team_cache_write_sidecar(
-                sidecar,
-                {
-                    "version": 1,
-                    "hub_id": active["hub_id"],
-                    "team_id": team_id,
-                    "attachment_id": attachment_id,
-                    "file_name": attachment["file_name"],
-                    "media_type": attachment["media_type"],
-                    "byte_size": attachment["byte_size"],
-                    "sha256": attachment["sha256"],
-                    "inode": info.st_ino,
-                    "mtime_ns": info.st_mtime_ns,
-                },
-            )
-            self._evict_team_cache(protected=target)
-            return attachment, target
+
+        target = self._materialize_team_cache_entry(
+            active=active,
+            attachment=attachment,
+            team_id=team_id,
+            attachment_id=attachment_id,
+            download=download,
+            connection_id=connection_id,
+            pin=False,
+        )
+        assert isinstance(target, Path)
+        return dict(attachment), target
 
     def open_cached_team_attachment(
         self, connection_id: str, team_id: str, attachment_id: str
     ) -> tuple[dict[str, Any], AttachmentFileLease]:
         """Pin a verified cache inode for a complete local HTTP response."""
 
-        with self._team_cache_guard:
-            attachment, target = self.cache_team_attachment(
-                connection_id, team_id, attachment_id
-            )
-            flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
-            flags |= getattr(os, "O_NOFOLLOW", 0)
-            descriptor = -1
+        active, attachment = self._team_attachment_metadata(
+            connection_id, team_id, attachment_id
+        )
+
+        def download(temporary: Path) -> tuple[tuple[str, str], ...]:
             try:
-                descriptor = os.open(target, flags)
-                info = os.fstat(descriptor)
-                _target, sidecar = self._team_cache_paths(
-                    self._active_team_connection(connection_id, team_id),
-                    team_id,
-                    attachment_id,
-                    str(attachment["file_name"]),
+                return self.client.download_attachment_to(
+                    connection_id,
+                    self._team_attachment_path(team_id, attachment_id),
+                    temporary,
+                    expected_size=int(attachment["byte_size"]),
                 )
-                metadata = self._team_cache_read_sidecar(sidecar)
+            except SecurePeerError as exc:
+                if (
+                    self._is_unconfirmed_peer_revocation(exc)
+                    and self._remote_revocation_confirmed(connection_id) is True
+                ):
+                    with suppress(Exception):
+                        self._retire_remote_revoked_active_connection(active, {})
+                raise
+
+        lease = self._materialize_team_cache_entry(
+            active=active,
+            attachment=attachment,
+            team_id=team_id,
+            attachment_id=attachment_id,
+            download=download,
+            connection_id=connection_id,
+            pin=True,
+        )
+        assert isinstance(lease, AttachmentFileLease)
+        return dict(attachment), lease
+
+    @staticmethod
+    def _remove_team_export_directory_fd(
+        root_descriptor: int,
+        directory_name: str,
+        directory_descriptor: int,
+    ) -> bool:
+        """Remove one verified flat export directory without path traversal."""
+
+        try:
+            entries = os.scandir(directory_descriptor)
+        except OSError:
+            return False
+        removable = True
+        with entries:
+            for entry in entries:
+                try:
+                    info = entry.stat(follow_symlinks=False)
+                except OSError:
+                    removable = False
+                    continue
                 if (
                     not stat.S_ISREG(info.st_mode)
                     or info.st_uid != os.getuid()
-                    or info.st_size != int(attachment["byte_size"])
-                    or metadata is None
-                    or metadata.get("inode") != info.st_ino
-                    or metadata.get("mtime_ns") != info.st_mtime_ns
-                    or metadata.get("sha256") != attachment["sha256"]
+                    or info.st_nlink != 1
                 ):
-                    raise OSError("Team attachment cache inode changed")
-            except (OSError, ValueError) as exc:
-                if descriptor >= 0:
-                    with suppress(OSError):
-                        os.close(descriptor)
-                raise SecurePeerError(
-                    "cache_unavailable", "Team attachment cache is unavailable", 503
-                ) from exc
-            self._team_cache_pins[target] = self._team_cache_pins.get(target, 0) + 1
-            finalizer_lock = threading.Lock()
-            finalized = False
-
-            def finalize() -> None:
-                nonlocal finalized
-                with finalizer_lock:
-                    if finalized:
-                        return
-                    finalized = True
+                    removable = False
+                    continue
                 with suppress(OSError):
-                    os.close(descriptor)
-                with self._team_cache_guard:
-                    remaining = self._team_cache_pins.get(target, 0) - 1
-                    if remaining > 0:
-                        self._team_cache_pins[target] = remaining
-                    else:
-                        self._team_cache_pins.pop(target, None)
+                    os.unlink(entry.name, dir_fd=directory_descriptor)
+                try:
+                    os.stat(
+                        entry.name,
+                        dir_fd=directory_descriptor,
+                        follow_symlinks=False,
+                    )
+                except FileNotFoundError:
+                    pass
+                except OSError:
+                    removable = False
+                else:
+                    removable = False
+        if not removable:
+            return False
+        try:
+            opened = os.fstat(directory_descriptor)
+            named = os.stat(
+                directory_name,
+                dir_fd=root_descriptor,
+                follow_symlinks=False,
+            )
+        except OSError:
+            return False
+        if (
+            opened.st_dev != named.st_dev
+            or opened.st_ino != named.st_ino
+            or not stat.S_ISDIR(named.st_mode)
+            or named.st_uid != os.getuid()
+        ):
+            return False
+        try:
+            os.rmdir(directory_name, dir_fd=root_descriptor)
+        except OSError:
+            return False
+        return True
 
-            return attachment, AttachmentFileLease(descriptor, finalize)
+    def _reserve_team_export_locked(self, required_bytes: int) -> tuple[int, int, str, Path]:
+        """Clean expired exports and reserve one bounded owner-only batch."""
+
+        if required_bytes > self.team_cache_max_bytes:
+            raise SecurePeerError(
+                "attachment_limit", "Attachment batch exceeds the export limit", 413
+            )
+        ensure_private_directory(self.team_export_dir)
+        flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
+        flags |= getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+        try:
+            root_descriptor = os.open(self.team_export_dir, flags)
+            root_info = os.fstat(root_descriptor)
+        except OSError as exc:
+            raise SecurePeerError(
+                "cache_unavailable", "Team attachment export is unavailable", 503
+            ) from exc
+        if (
+            not stat.S_ISDIR(root_info.st_mode)
+            or root_info.st_uid != os.getuid()
+        ):
+            os.close(root_descriptor)
+            raise SecurePeerError(
+                "cache_unavailable", "Team attachment export is unsafe", 503
+            )
+
+        timestamp = int(time.time())
+        retained_batches = 0
+        retained_bytes = 0
+        examined = 0
+        unsafe = False
+        try:
+            entries = os.scandir(root_descriptor)
+            with entries:
+                for entry in entries:
+                    examined += 1
+                    if examined > _TEAM_CACHE_DIRECTORY_SCAN_LIMIT:
+                        unsafe = True
+                        break
+                    final_match = _TEAM_EXPORT_BATCH_RE.fullmatch(entry.name)
+                    temporary_match = _TEAM_EXPORT_TEMP_RE.fullmatch(entry.name)
+                    if final_match is None and temporary_match is None:
+                        unsafe = True
+                        continue
+                    try:
+                        listed = entry.stat(follow_symlinks=False)
+                    except OSError:
+                        unsafe = True
+                        continue
+                    if (
+                        not stat.S_ISDIR(listed.st_mode)
+                        or listed.st_uid != os.getuid()
+                        or listed.st_dev != root_info.st_dev
+                    ):
+                        unsafe = True
+                        continue
+                    try:
+                        directory_descriptor = os.open(
+                            entry.name, flags, dir_fd=root_descriptor
+                        )
+                        opened = os.fstat(directory_descriptor)
+                    except OSError:
+                        unsafe = True
+                        continue
+                    try:
+                        if (
+                            self._team_directory_identity(opened)
+                            != self._team_directory_identity(listed)
+                            or opened.st_uid != os.getuid()
+                            or opened.st_dev != root_info.st_dev
+                        ):
+                            unsafe = True
+                            continue
+                        logical = self.team_export_dir / entry.name
+                        is_active = logical in self._team_export_reservations
+                        # The reservation already accounts for this batch's
+                        # declared bytes and count. Its writer may be adding
+                        # children right now, so do not enumerate a live temp
+                        # directory or mistake benign directory mutations for
+                        # corruption.
+                        if temporary_match is not None and is_active:
+                            continue
+                        batch_bytes = 0
+                        batch_safe = True
+                        children = os.scandir(directory_descriptor)
+                        with children:
+                            for child in children:
+                                examined += 1
+                                if examined > _TEAM_CACHE_DIRECTORY_SCAN_LIMIT:
+                                    batch_safe = False
+                                    unsafe = True
+                                    break
+                                try:
+                                    child_info = child.stat(follow_symlinks=False)
+                                except OSError:
+                                    batch_safe = False
+                                    continue
+                                if (
+                                    not stat.S_ISREG(child_info.st_mode)
+                                    or child_info.st_uid != os.getuid()
+                                    or child_info.st_nlink != 1
+                                    or child_info.st_dev != root_info.st_dev
+                                ):
+                                    batch_safe = False
+                                    continue
+                                batch_bytes += child_info.st_size
+                        expired = bool(
+                            final_match is not None
+                            and int(final_match.group(1))
+                            <= timestamp - _TEAM_EXPORT_TTL_SECONDS
+                        )
+                        if batch_safe and not is_active and (
+                            temporary_match is not None or expired
+                        ):
+                            if not self._remove_team_export_directory_fd(
+                                root_descriptor,
+                                entry.name,
+                                directory_descriptor,
+                            ):
+                                unsafe = True
+                            continue
+                        if temporary_match is not None:
+                            if not is_active:
+                                unsafe = True
+                            continue
+                        retained_batches += 1
+                        retained_bytes += batch_bytes
+                        if not batch_safe:
+                            unsafe = True
+                    finally:
+                        os.close(directory_descriptor)
+
+            reserved_bytes = sum(self._team_export_reservations.values())
+            reserved_batches = len(self._team_export_reservations)
+            if (
+                unsafe
+                or retained_batches + reserved_batches + 1
+                > _TEAM_EXPORT_MAX_BATCHES
+                or retained_bytes + reserved_bytes + required_bytes
+                > self.team_cache_max_bytes
+            ):
+                raise SecurePeerError(
+                    "cache_unavailable",
+                    "Team attachment export capacity is unavailable",
+                    507,
+                )
+            token = uuid.uuid4().hex
+            temporary_name = f".export-{token}.tmp"
+            temporary_path = self.team_export_dir / temporary_name
+            os.mkdir(temporary_name, 0o700, dir_fd=root_descriptor)
+            directory_descriptor = os.open(
+                temporary_name, flags, dir_fd=root_descriptor
+            )
+            self._team_export_reservations[temporary_path] = required_bytes
+            return root_descriptor, directory_descriptor, temporary_name, temporary_path
+        except BaseException:
+            os.close(root_descriptor)
+            raise
+
+    def _export_team_attachment_batch(
+        self,
+        attachments: list[dict[str, Any]],
+        leases: list[AttachmentFileLease],
+    ) -> list[dict[str, Any]]:
+        """Copy verified cache inodes into bounded, one-hour durable exports."""
+
+        if not attachments:
+            return []
+        if len(attachments) != len(leases):
+            raise RuntimeError("Team attachment export lease count changed")
+        required_bytes = sum(int(item["byte_size"]) for item in attachments)
+        with self._team_cache_guard:
+            (
+                root_descriptor,
+                directory_descriptor,
+                temporary_name,
+                temporary_path,
+            ) = self._reserve_team_export_locked(required_bytes)
+        published_name: str | None = None
+        output_names: list[str] = []
+        try:
+            for index, (attachment, lease) in enumerate(zip(attachments, leases)):
+                suffix = Path(str(attachment["file_name"])).suffix
+                if (
+                    len(suffix.encode("utf-8")) > 24
+                    or re.fullmatch(r"\.[A-Za-z0-9._+-]{1,23}", suffix) is None
+                ):
+                    suffix = ""
+                name_digest = hashlib.sha256(
+                    (
+                        str(attachment["id"])
+                        + "\0"
+                        + str(attachment["file_name"])
+                    ).encode("utf-8")
+                ).hexdigest()[:24]
+                output_name = f"attachment-{index:03d}-{name_digest}{suffix}"
+                output_names.append(output_name)
+                flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+                flags |= getattr(os, "O_CLOEXEC", 0) | getattr(
+                    os, "O_NOFOLLOW", 0
+                )
+                output = os.open(
+                    output_name,
+                    flags,
+                    0o600,
+                    dir_fd=directory_descriptor,
+                )
+                source_before = os.fstat(lease.descriptor)
+                digest = hashlib.sha256()
+                offset = 0
+                try:
+                    expected_size = int(attachment["byte_size"])
+                    while offset < expected_size:
+                        block = os.pread(
+                            lease.descriptor,
+                            min(1024 * 1024, expected_size - offset),
+                            offset,
+                        )
+                        if not block:
+                            raise OSError("Team attachment cache export was truncated")
+                        digest.update(block)
+                        view = memoryview(block)
+                        while view:
+                            written = os.write(output, view)
+                            if written <= 0:
+                                raise OSError("Team attachment export write stalled")
+                            view = view[written:]
+                        offset += len(block)
+                    if os.pread(lease.descriptor, 1, expected_size):
+                        raise OSError("Team attachment cache export exceeded metadata")
+                    os.fsync(output)
+                finally:
+                    os.close(output)
+                source_after = os.fstat(lease.descriptor)
+                if (
+                    self._team_cache_stat_identity(source_before)
+                    != self._team_cache_stat_identity(source_after)
+                    or source_after.st_size != int(attachment["byte_size"])
+                    or digest.hexdigest() != attachment["sha256"]
+                ):
+                    raise SecurePeerError(
+                        "attachment_hash_mismatch",
+                        "Team attachment changed during durable export",
+                        502,
+                    )
+            os.fsync(directory_descriptor)
+            timestamp = int(time.time())
+            final_name = f"export-{timestamp:010d}-{uuid.uuid4().hex}"
+            with self._team_cache_guard:
+                root_opened = os.fstat(root_descriptor)
+                root_named = self.team_export_dir.lstat()
+                opened = os.fstat(directory_descriptor)
+                named = os.stat(
+                    temporary_name,
+                    dir_fd=root_descriptor,
+                    follow_symlinks=False,
+                )
+                if (
+                    self._team_directory_identity(root_opened)
+                    != self._team_directory_identity(root_named)
+                    or not stat.S_ISDIR(root_named.st_mode)
+                    or root_named.st_uid != os.getuid()
+                    or self._team_directory_identity(opened)
+                    != self._team_directory_identity(named)
+                    or not stat.S_ISDIR(named.st_mode)
+                    or named.st_uid != os.getuid()
+                ):
+                    raise SecurePeerError(
+                        "cache_unavailable", "Team attachment export changed", 503
+                    )
+                os.rename(
+                    temporary_name,
+                    final_name,
+                    src_dir_fd=root_descriptor,
+                    dst_dir_fd=root_descriptor,
+                )
+                published_name = final_name
+                self._team_export_reservations.pop(temporary_path, None)
+                os.fsync(root_descriptor)
+            return [
+                {
+                    **attachment,
+                    "local_path": str(
+                        self.team_export_dir / final_name / output_name
+                    ),
+                }
+                for attachment, output_name in zip(attachments, output_names)
+            ]
+        except BaseException:
+            with self._team_cache_guard:
+                self._team_export_reservations.pop(temporary_path, None)
+                self._remove_team_export_directory_fd(
+                    root_descriptor,
+                    published_name or temporary_name,
+                    directory_descriptor,
+                )
+            raise
+        finally:
+            os.close(directory_descriptor)
+            os.close(root_descriptor)
 
     def team_realms(self) -> list[dict[str, Any]]:
         """Every team this server can act in, in deterministic order."""
@@ -4224,8 +5452,8 @@ class SecurePeerRuntime:
                 409,
             )
         realms: dict[str, dict[str, Any]] = {}
-        servers: dict[str, dict[str, dict[str, Any]]] = {}
-        members: dict[str, dict[str, dict[str, Any]]] = {}
+        server_targets: dict[tuple[str, str], dict[str, Any] | None] = {}
+        member_targets: dict[tuple[str, str], dict[str, Any] | None] = {}
         skills: dict[str, dict[str, dict[str, Any]]] = {}
 
         def realm_for(team_id: str) -> dict[str, Any]:
@@ -4241,14 +5469,12 @@ class SecurePeerRuntime:
                 realms[team_id] = realm
             return realms[team_id]
 
-        def network_servers(team_id: str) -> dict[str, dict[str, Any]]:
-            if team_id in servers:
-                return servers[team_id]
+        def network_server(team_id: str, server_id: str) -> dict[str, Any] | None:
+            cache_key = (team_id, server_id)
+            if cache_key in server_targets:
+                return server_targets[cache_key]
             realm = realm_for(team_id)
-            collected: dict[str, dict[str, Any]] = {}
-            cursor: str | None = None
-            seen_cursors: set[str] = set()
-            for _page in range(100):
+            try:
                 if realm["realm"] == "host":
                     with self._guard:
                         store = self._hub_store
@@ -4256,71 +5482,82 @@ class SecurePeerRuntime:
                         raise SecurePeerError(
                             "team_unavailable", "Team Hub is unavailable", 409
                         )
-                    projection = store.get_network(
+                    projection = store.get_network_server(
                         store.local_agent_mail_claims(team_id),
                         team_id,
-                        after_server_id=cursor,
-                        limit=100,
+                        server_id,
                     )
                 else:
                     projection = self._team_hub_get(
                         realm,
-                        f"/v1/teams/{quote(team_id, safe='')}/network",
-                        {"after_server_id": cursor, "limit": 100},
+                        f"/v1/teams/{quote(team_id, safe='')}/network/servers/"
+                        f"{quote(server_id, safe='')}",
+                        {},
+                        preserve_not_found=True,
                     )
-                for item in projection.get("servers") or []:
-                    if isinstance(item, Mapping) and item.get("id"):
-                        collected[str(item["id"])] = dict(item)
-                if projection.get("has_more") is not True:
-                    break
-                next_cursor = str(projection.get("next_after_server_id") or "")
-                if not next_cursor or next_cursor in seen_cursors:
-                    raise SecurePeerError(
-                        "team_reference_invalid",
-                        "Team Network recipient projection changed",
-                        409,
-                    )
-                seen_cursors.add(next_cursor)
-                cursor = next_cursor
-            else:
+            except (HubError, SecurePeerError) as exc:
+                if getattr(exc, "status_code", None) == 404:
+                    server_targets[cache_key] = None
+                    return None
+                raise
+            item = projection.get("server") if isinstance(projection, Mapping) else None
+            if (
+                not isinstance(item, Mapping)
+                or str(item.get("id") or "") != server_id
+            ):
                 raise SecurePeerError(
                     "team_reference_invalid",
-                    "Team Network recipient projection exceeded its page limit",
+                    "Team Network server projection is invalid",
                     409,
                 )
-            servers[team_id] = collected
-            return collected
+            server_targets[cache_key] = dict(item)
+            return server_targets[cache_key]
 
-        def team_members(team_id: str) -> dict[str, dict[str, Any]]:
-            if team_id in members:
-                return members[team_id]
+        def team_member(team_id: str, principal_id: str) -> dict[str, Any] | None:
+            cache_key = (team_id, principal_id)
+            if cache_key in member_targets:
+                return member_targets[cache_key]
             realm = realm_for(team_id)
-            if realm["realm"] == "host":
-                with self._guard:
-                    store = self._hub_store
-                if store is None or store.hub_id != realm.get("hub_id"):
-                    raise SecurePeerError(
-                        "team_unavailable", "Team Hub is unavailable", 409
+            try:
+                if realm["realm"] == "host":
+                    with self._guard:
+                        store = self._hub_store
+                    if store is None or store.hub_id != realm.get("hub_id"):
+                        raise SecurePeerError(
+                            "team_unavailable", "Team Hub is unavailable", 409
+                        )
+                    projection = store.get_member(
+                        store.local_agent_mail_claims(team_id),
+                        team_id,
+                        principal_id,
                     )
-                projection = store.list_members(
-                    store.local_agent_mail_claims(team_id), team_id
+                else:
+                    projection = self._team_hub_get(
+                        realm,
+                        f"/v1/teams/{quote(team_id, safe='')}/members/"
+                        f"{quote(principal_id, safe='')}",
+                        {},
+                        preserve_not_found=True,
+                    )
+            except (HubError, SecurePeerError) as exc:
+                if getattr(exc, "status_code", None) == 404:
+                    member_targets[cache_key] = None
+                    return None
+                raise
+            item = projection.get("member") if isinstance(projection, Mapping) else None
+            if (
+                not isinstance(item, Mapping)
+                or str(item.get("principal_id") or "") != principal_id
+                or item.get("status") != "active"
+                or item.get("role") == "automation"
+            ):
+                raise SecurePeerError(
+                    "team_reference_invalid",
+                    "Team member projection is invalid",
+                    409,
                 )
-            else:
-                projection = self._team_hub_get(
-                    realm,
-                    f"/v1/teams/{quote(team_id, safe='')}/members",
-                    {},
-                )
-            collected = {
-                str(item["principal_id"]): dict(item)
-                for item in (projection.get("members") or [])
-                if isinstance(item, Mapping)
-                and item.get("principal_id")
-                and item.get("status") == "active"
-                and item.get("role") != "automation"
-            }
-            members[team_id] = collected
-            return collected
+            member_targets[cache_key] = dict(item)
+            return member_targets[cache_key]
 
         def team_skills(team_id: str) -> dict[str, dict[str, Any]]:
             if team_id in skills:
@@ -4369,7 +5606,7 @@ class SecurePeerRuntime:
                         409,
                     )
             elif reference.get("recipient_kind") == "server":
-                target = network_servers(team_id).get(target_id)
+                target = network_server(team_id, target_id)
                 if (
                     target is None
                     or str(target.get("display_name") or "") != display_name
@@ -4380,7 +5617,7 @@ class SecurePeerRuntime:
                         409,
                     )
             elif reference.get("recipient_kind") == "human":
-                target = team_members(team_id).get(target_id)
+                target = team_member(team_id, target_id)
                 if (
                     target is None
                     or str(target.get("display_name") or "") != display_name
@@ -4398,7 +5635,14 @@ class SecurePeerRuntime:
 
         return resolved
 
-    def _team_hub_get(self, realm: dict[str, Any], path: str, query: dict[str, Any]) -> dict[str, Any]:
+    def _team_hub_get(
+        self,
+        realm: dict[str, Any],
+        path: str,
+        query: dict[str, Any],
+        *,
+        preserve_not_found: bool = False,
+    ) -> dict[str, Any]:
         clean = {
             key: ("1" if value is True else str(value))
             for key, value in query.items()
@@ -4414,7 +5658,10 @@ class SecurePeerRuntime:
             headers={"accept": "application/json"},
             body=None,
         )
-        return self._decoded_proxy_json(response)
+        return self._decoded_proxy_json(
+            response,
+            preserve_not_found=preserve_not_found,
+        )
 
     def _team_hub_post(self, realm: dict[str, Any], path: str, body: dict[str, Any]) -> dict[str, Any]:
         if realm["realm"] == "host":
@@ -4894,30 +6141,172 @@ class SecurePeerRuntime:
         *,
         team_id: str | None = None,
     ) -> list[dict[str, Any]]:
-        """Resolve ready attachments to local files; host realm serves storage paths."""
+        """Resolve into bounded durable exports that outlive cache eviction."""
 
         realm = self.team_realm(team_id)
         resolved: list[dict[str, Any]] = []
-        if realm["realm"] != "host":
-            for attachment in attachments:
-                public, path = self.cache_team_attachment(
-                    str(realm["connection_id"]),
-                    str(realm["team_id"]),
-                    str(attachment.get("id") or ""),
-                )
-                resolved.append({**public, "local_path": str(path)})
-            return resolved
-        with self._guard:
-            store = self._hub_store
-        if store is None:
-            raise SecurePeerError("team_unavailable", "Team Hub is unavailable", 409)
-        claims = store.local_agent_mail_claims(str(realm["team_id"]))
-        for attachment in attachments:
-            public, path = store.bound_team_attachment_local_path(
-                claims, str(realm["team_id"]), str(attachment.get("id") or "")
+        batch_leases: list[tuple[Path, AttachmentFileLease]] = []
+        try:
+            if realm["realm"] != "host":
+                for attachment in attachments:
+                    attachment_id = str(attachment.get("id") or "")
+                    public, lease = self.open_cached_team_attachment(
+                        str(realm["connection_id"]),
+                        str(realm["team_id"]),
+                        attachment_id,
+                    )
+                    try:
+                        path, _sidecar = self._team_cache_paths(
+                            realm,
+                            str(realm["team_id"]),
+                            attachment_id,
+                            str(public["file_name"]),
+                        )
+                    except BaseException:
+                        lease.close()
+                        raise
+                    batch_leases.append((path, lease))
+                    resolved.append({**public, "local_path": str(path)})
+            else:
+                with self._guard:
+                    store = self._hub_store
+                if store is None:
+                    raise SecurePeerError(
+                        "team_unavailable", "Team Hub is unavailable", 409
+                    )
+                claims = store.local_agent_mail_claims(str(realm["team_id"]))
+                for attachment in attachments:
+                    canonical_team = str(realm["team_id"])
+                    attachment_id = str(attachment.get("id") or "")
+                    public, source = store.open_team_attachment(
+                        claims,
+                        canonical_team,
+                        attachment_id,
+                    )
+                    try:
+                        if public.get("message_id") is None:
+                            raise HubError("not_found", "Resource not found", 404)
+                        verified = self._validate_team_attachment_metadata(
+                            {"attachment": public},
+                            team_id=canonical_team,
+                            attachment_id=attachment_id,
+                        )
+
+                        def copy_to_cache(
+                            temporary: Path,
+                            *,
+                            descriptor: int = source.descriptor,
+                            expected_size: int = int(verified["byte_size"]),
+                            expected_sha256: str = str(verified["sha256"]),
+                            media_type: str = str(verified["media_type"]),
+                        ) -> tuple[tuple[str, str], ...]:
+                            flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+                            flags |= getattr(os, "O_CLOEXEC", 0) | getattr(
+                                os, "O_NOFOLLOW", 0
+                            )
+                            output = os.open(temporary, flags, 0o600)
+                            try:
+                                os.lseek(descriptor, 0, os.SEEK_SET)
+                                remaining = expected_size
+                                while remaining:
+                                    block = os.read(
+                                        descriptor, min(1024 * 1024, remaining)
+                                    )
+                                    if not block:
+                                        raise SecurePeerError(
+                                            "attachment_unavailable",
+                                            "Team attachment bytes are truncated",
+                                            404,
+                                        )
+                                    view = memoryview(block)
+                                    while view:
+                                        written = os.write(output, view)
+                                        if written <= 0:
+                                            raise OSError(
+                                                "Team attachment cache write stalled"
+                                            )
+                                        view = view[written:]
+                                    remaining -= len(block)
+                                if os.read(descriptor, 1):
+                                    raise SecurePeerError(
+                                        "attachment_unavailable",
+                                        "Team attachment bytes exceeded metadata",
+                                        409,
+                                    )
+                                os.fsync(output)
+                            except BaseException:
+                                with suppress(OSError):
+                                    os.close(output)
+                                with suppress(OSError):
+                                    temporary.unlink()
+                                raise
+                            else:
+                                os.close(output)
+                            return (
+                                ("etag", f'"{expected_sha256}"'),
+                                ("content-type", media_type),
+                                ("accept-ranges", "bytes"),
+                            )
+
+                        lease = self._materialize_team_cache_entry(
+                            active={"hub_id": store.hub_id},
+                            attachment=verified,
+                            team_id=canonical_team,
+                            attachment_id=attachment_id,
+                            download=copy_to_cache,
+                            connection_id=None,
+                            pin=True,
+                        )
+                        assert isinstance(lease, AttachmentFileLease)
+                    finally:
+                        source.close()
+                    try:
+                        path, _sidecar = self._team_cache_paths(
+                            {"hub_id": store.hub_id},
+                            canonical_team,
+                            attachment_id,
+                            str(verified["file_name"]),
+                        )
+                    except BaseException:
+                        lease.close()
+                        raise
+                    batch_leases.append((path, lease))
+                    resolved.append({**verified, "local_path": str(path)})
+
+            # Keep every earlier entry pinned while materializing later ones,
+            # then prove the complete returned name set still resolves to the
+            # exact verified inodes. A too-small cache therefore fails the
+            # entire request instead of returning already-evicted paths.
+            with self._team_cache_guard:
+                for path, lease in batch_leases:
+                    try:
+                        path_info = path.lstat()
+                        descriptor_info = os.fstat(lease.descriptor)
+                    except OSError as exc:
+                        raise SecurePeerError(
+                            "cache_unavailable",
+                            "Team attachment cache changed during batch resolution",
+                            503,
+                        ) from exc
+                    if (
+                        not stat.S_ISREG(path_info.st_mode)
+                        or path_info.st_nlink != 1
+                        or path_info.st_uid != os.getuid()
+                        or self._team_cache_stat_identity(path_info)
+                        != self._team_cache_stat_identity(descriptor_info)
+                    ):
+                        raise SecurePeerError(
+                            "cache_unavailable",
+                            "Team attachment cache changed during batch resolution",
+                            503,
+                        )
+            return self._export_team_attachment_batch(
+                resolved,
+                [lease for _path, lease in batch_leases],
             )
-            resolved.append({**public, "local_path": str(path)})
-        return resolved
+        finally:
+            for _path, lease in reversed(batch_leases):
+                lease.close()
 
     def shutdown(self) -> None:
         self.close_host_admission()

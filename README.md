@@ -69,8 +69,15 @@ machine paths.
 
 ## Requirements
 
-- Linux or macOS host with Python 3.10+.
-- `uv` recommended for the runtime environment.
+- Linux or Apple silicon (arm64) macOS host. The trusted `uv` runtime below
+  provisions the release's isolated Python 3.10+ environment. Intel macOS is
+  unsupported because the patched cryptography runtime no longer publishes or
+  supports x86_64 macOS wheels; `install.sh` rejects that architecture before
+  changing state, releases, configuration, or services.
+- A trusted, preinstalled `uv` on `PATH` is required for the isolated runtime.
+  On macOS, install it with `brew install uv`; on Linux, use your trusted OS or
+  package-management environment. The installer never downloads and executes
+  a mutable bootstrap script.
 - Claude CLI and/or Codex CLI installed and authenticated on the agent host.
 - Optional: `tmux`, for the persistent chat terminal, tmux-pane inspection,
   and in-app managed updates. Everything else (chats, turns, jobs, files)
@@ -127,7 +134,7 @@ cd AgentsServer
 ```
 
 Before changing state, releases, configuration, or services, the installer
-checks for either `curl` or `wget` and the platform service command
+checks for a working, preinstalled `uv` and the platform service command
 (`launchctl` on macOS or `systemctl` on Linux), and verifies that the current
 user's service domain responds. Missing tools or an unavailable user service
 session produce platform-specific guidance and stop the install. The preflight
@@ -139,7 +146,7 @@ a host without Homebrew all just print the manual `tmux` install command and
 continue — tmux is optional, so its absence never blocks setup. See
 [Optional: tmux](#optional-tmux) below for what it enables.
 
-After that preflight, the installer uses `uv`, installs a user-level service,
+After that preflight, the installer uses the trusted `uv`, installs a user-level service,
 creates a private access token, verifies authenticated health, and preserves
 existing `~/.agentsdock` chat state on every update. Network downloads retry
 with bounded timeouts, and the longer runtime/dependency stages print output
@@ -230,9 +237,10 @@ messages are plaintext in transit. Literal IP shape is not proof of Tailscale
 or identity. The route must be canonical
 `http://<literal-ip>:<AgentsServer-port>/api/team-hub`; it cannot use a
 hostname, loopback, another port/path, credentials, query or fragment. The
-desktop labels AgentsServer control and Teamspace separately and requires an
-explicit Direct-IP choice plus an additional Start confirmation. Automatic
-selection continues to use the advertised Serve primary.
+AgentsServer retains this legacy transport for manual host configuration and
+rollback continuity. The current desktop filters and refuses Direct-IP routes
+instead of offering them for selection; use secure pairing or private Tailscale
+Serve. Automatic selection continues to use the advertised Serve primary.
 
 If the host install fails or you abandon this setup, remove only that listener:
 
@@ -243,11 +251,22 @@ tailscale serve --https=8444 off
 The host choice and exact primary/Direct-IP routes are preserved by managed
 updates and rollback. A fresh server with no Hub database may be designated
 directly.
-Direct adoption or reactivation of existing Hub state is refused unless the
-operation has the snapshot-bound rollback contract. `--no-team-hub-host`
-stops serving an existing Hub but preserves its data; use it only when you
-intend to keep the Hub offline pending a signed managed recovery or
-support-assisted restoration.
+`--no-team-hub-host` stops serving an existing Hub but preserves its data and
+managed host binding. It is never silently reactivated. To bring that exact
+preserved host back on the same AgentsServer, request the guarded transition:
+
+```bash
+./install.sh --non-interactive --reactivate-team-hub-host
+```
+
+The installer requires disabled mode, verifies the stored Hub binding against
+this server's durable identity without migrating the source database, and
+writes and re-verifies a complete pre-reactivation snapshot before changing
+configuration or service state. A candidate failure restores that snapshot.
+Foreign, unbound, fenced, missing, or concurrently changed state is refused.
+The Tailscale Serve or Direct-IP options may be supplied with the explicit
+reactivation flag when retaining the corresponding supported origin; ordinary
+`--team-hub-host` remains the fresh-state path.
 
 Adding or changing Direct IP on an existing live Hub is intentionally rejected
 by the ordinary installer, including a same-version reinstall. That change
@@ -298,6 +317,17 @@ PYTHONPATH=~/.local/share/agents-server/current \
 Issuing a device-recovery proof immediately revokes every existing device
 session and live refresh token for that person. Deliver and redeem the printed
 proof path on the replacement device within ten minutes.
+
+Authenticated human owners can list and revoke pending invitations and can
+change, suspend, reactivate, or permanently revoke non-owner human memberships;
+owner, automation, and self rows are not mutable through this API. Human users
+can list and revoke only their own device sessions. Device revocation takes
+effect on the next authenticated request and revokes every still-live refresh
+token for that device. These controls keep invitation, membership, session, and
+audit ledger rows rather than deleting security history. The member,
+pending-invitation, and device-session inventory endpoints use opaque,
+authenticated keyset cursors with a default page size of 50 and a maximum of
+100; callers follow `next_cursor` only while `has_more` is true.
 
 If you override the install or state directory, use the exact operator commands
 printed by `install.sh` at the end of a host-mode install.
@@ -608,7 +638,9 @@ making changes unless `--yes` is passed. Chat history, jobs, files, and
 terminals under the state directory (`~/.agentsdock` by default) are kept by
 default, so a later `./install.sh` picks the same ordinary AgentsServer history
 back up. Preserved Team Hub state is intentionally not auto-reactivated in this
-beta; it requires a signed managed recovery or support-assisted restoration.
+beta; re-enable an exact same-server preserved host explicitly with
+`./install.sh --reactivate-team-hub-host`, which verifies its durable binding
+and takes a rollback snapshot first.
 Passing `--purge-state` permanently deletes that too, but always requires an
 interactive exact-path confirmation that `--yes` cannot bypass. Before any
 change, the uninstaller rejects root, home, broad system/user directories,

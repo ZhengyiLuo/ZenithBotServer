@@ -932,15 +932,28 @@ class PortTunnelTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(capability["destination_host"], "127.0.0.1")
         self.assertEqual(capability["minimum_port"], 1024)
         self.assertEqual(capability["maximum_port"], 65535)
+        self.assertEqual(
+            capability["max_active_connections"],
+            agent_server.PORT_TUNNEL_MAX_ACTIVE_GLOBAL,
+        )
+        self.assertEqual(
+            capability["max_active_connections_per_session"],
+            agent_server.PORT_TUNNEL_MAX_ACTIVE_PER_SESSION,
+        )
         self.assertEqual(capability["max_client_frame_bytes"], 1024 * 1024)
         self.assertEqual(capability["active_connections"], 0)
 
     async def test_uvicorn_does_not_apply_tunnel_frame_limit_globally(self) -> None:
         with patch("sys.argv", ["agent_server.py"]), \
+             patch.object(
+                 agent_server,
+                 "configure_server_logging",
+             ) as configure_logging, \
              patch.object(agent_server.uvicorn, "run") as run:
             result = agent_server.main()
 
         self.assertEqual(result, 0)
+        configure_logging.assert_called_once_with(agent_server.STATE_DIR)
         self.assertNotIn("ws_max_size", run.call_args.kwargs)
 
 

@@ -528,6 +528,29 @@ class SecurePeerDeliveryLedger:
             state="authorized",
         )
 
+    def fail_ownerless_authorized(
+        self,
+        envelope_id: str,
+        *,
+        error: str,
+    ) -> dict[str, Any] | None:
+        """Fail only a receipt-accepted delivery that has no queued/run owner."""
+
+        timestamp = int(time.time())
+        with self._transaction() as connection:
+            connection.execute(
+                """UPDATE secure_peer_deliveries SET
+                state='failed',error=?,admission_retry_at=NULL,
+                admission_last_error=NULL,updated_at=?
+                WHERE envelope_id=? AND state='authorized'
+                AND queued_id IS NULL AND run_id IS NULL""",
+                (str(error)[:400], timestamp, envelope_id),
+            )
+            return self._public(connection.execute(
+                "SELECT * FROM secure_peer_deliveries WHERE envelope_id=?",
+                (envelope_id,),
+            ).fetchone())
+
     def bind_owner(
         self,
         envelope_id: str,

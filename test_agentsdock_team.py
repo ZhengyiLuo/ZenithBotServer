@@ -10,6 +10,7 @@ import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import AsyncMock, patch
+from urllib.parse import quote
 
 from fastapi import HTTPException
 from pydantic import ValidationError
@@ -331,15 +332,32 @@ class TeamReferenceResolutionTests(unittest.TestCase):
         member_map = members or {}
         skill_map = skills or {}
 
-        def get(realm, path, _query):
+        def get(realm, path, _query, *, preserve_not_found=False):
             team_id = realm["team_id"]
-            if path.endswith("/network"):
-                return {
-                    "servers": list(server_map.get(team_id, [])),
-                    "has_more": False,
-                }
-            if path.endswith("/members"):
-                return {"members": list(member_map.get(team_id, []))}
+            team_path = quote(team_id, safe="")
+            server_prefix = f"/v1/teams/{team_path}/network/servers/"
+            member_prefix = f"/v1/teams/{team_path}/members/"
+            if path.startswith(server_prefix):
+                self.assertTrue(preserve_not_found)
+                for server in server_map.get(team_id, []):
+                    server_id = str(server.get("id") or "")
+                    if (
+                        path == server_prefix + quote(server_id, safe="")
+                        and server.get("status") != "revoked"
+                    ):
+                        return {"server": dict(server)}
+                raise SecurePeerError("not_found", "Resource not found", 404)
+            if path.startswith(member_prefix):
+                self.assertTrue(preserve_not_found)
+                for member in member_map.get(team_id, []):
+                    principal_id = str(member.get("principal_id") or "")
+                    if (
+                        path == member_prefix + quote(principal_id, safe="")
+                        and member.get("status") == "active"
+                        and member.get("role") != "automation"
+                    ):
+                        return {"member": dict(member)}
+                raise SecurePeerError("not_found", "Resource not found", 404)
             raise AssertionError(path)
 
         runtime.team_realms = lambda: list(realms)
@@ -597,6 +615,21 @@ class AgentsDockTeamCLITests(unittest.TestCase):
                 2,
             )
 
+    def test_send_rejects_title_for_plain_message(self) -> None:
+        with (
+            patch.dict(agentsdock_team.os.environ, {"AGENTSDOCK_SERVER_URL": "http://127.0.0.1:7850"}),
+            patch.object(agentsdock_team.sys, "stdin", io.StringIO("body")),
+            patch.object(agentsdock_team.urllib.request, "build_opener") as opener,
+        ):
+            self.assertEqual(
+                agentsdock_team.main([
+                    "--authority-file", self.authority(), "send",
+                    "--route", "team_" + "b" * 32, "--title", "Unexpected",
+                ]),
+                2,
+            )
+        opener.assert_not_called()
+
 
 class ProviderTeamEndpointTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self) -> None:
@@ -783,6 +816,7 @@ class ProviderTeamEndpointTests(unittest.IsolatedAsyncioTestCase):
             )
             self.assertEqual(receipt["ok"], True)
             self.assertEqual(receipt["message_id"], "tmsg_node_sonic_0001")
+
             self.assertEqual(receipt["attachments"], 1)
             self.assertFalse(receipt["duplicate"])
             self.assertEqual(send.call_args.kwargs["attachment_paths"], [str(attachment.resolve())])
@@ -830,6 +864,37 @@ class ProviderTeamEndpointTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(skill_receipt["skill_slug"], "deploy-sonic")
             self.assertEqual(skill_receipt["skill_version"], 1)
             self.assertEqual(send.call_count, 2)
+
+    async def test_send_from_legacy_session_uses_default_backend_provenance(self) -> None:
+        agent_server.STORE.sessions["source"].pop("backend")
+        routes = await self.routes()
+        message = {
+            "id": "tmsg_node_sonic_0001",
+            "title": None,
+            "attachments": [],
+            "recipients": [{"kind": "server", "display_name": "SONIC"}],
+            "skill": None,
+        }
+        with (
+            patch.object(
+                agent_server.SECURE_PEER_RUNTIME,
+                "team_send_message",
+                return_value={"message": message},
+            ) as send,
+            patch.object(agent_server, "record_team_message_sent_event", AsyncMock()),
+        ):
+            await agent_server.send_provider_team_message(
+                routes["SONIC"]["route_id"],
+                agent_server.AgentTeamSendRequest(
+                    body="Legacy session send.",
+                    idempotency_key="legacy-session-send-key",
+                ),
+                self.request("POST"),
+            )
+        self.assertEqual(
+            send.call_args.kwargs["provenance"]["backend"],
+            agent_server.DEFAULT_BACKEND,
+        )
 
     async def test_skill_sends_need_the_publish_action_and_an_all_route(self) -> None:
         agent_server.CROSS_CHAT_CAPABILITIES = {}
@@ -989,9 +1054,17 @@ class ProviderTeamEndpointTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("$AGENTSDOCK_TEAM_CLI", block)
         self.assertIn("inbox", block)
         self.assertIn("routes`", block)
-        self.assertIn("--kind skill", block)
+        self.assertIn("--kind message [--attach", block)
+        self.assertIn("--kind skill --skill-slug SLUG --title T", block)
+        self.assertNotIn("--kind message|skill", block)
+        self.assertNotIn("--kind message [--title", block)
         self.assertIn("a server, the whole team", block)
         self.assertNotIn("node_sonic_0001", block)
+        durable = agent_server.PROVIDER_AUTHORITY_USAGE_INSTRUCTIONS
+        self.assertIn("--kind message [--attach", durable)
+        self.assertIn("--kind skill --skill-slug SLUG --title T", durable)
+        self.assertNotIn("--kind message|skill", durable)
+        self.assertNotIn("--kind message [--title", durable)
         read_only = agent_server.cross_chat_provider_authority_block(
             [], self.authority_path, "source", {"team_read"}
         )

@@ -454,11 +454,13 @@ class SecurePeerConnectorTests(unittest.IsolatedAsyncioTestCase):
     def prepare_running(
         self,
         *,
+        kind: str = "request_reply",
         used_legs: int = 1,
         expires_at: int | None = None,
         run_id: str = "run_target",
     ) -> dict[str, Any]:
         envelope = self.envelope(
+            kind=kind,
             used_legs=used_legs,
             expires_at=expires_at,
         )
@@ -845,6 +847,110 @@ class SecurePeerConnectorTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(closed["state"], "completed")
         self.assertEqual(closed["response_committed"], 1)
 
+    async def test_incoming_terminal_response_does_not_create_a_response_to_response(
+        self,
+    ) -> None:
+        record = self.prepare_running(kind="response", used_legs=2)
+        await agent_server.finalize_secure_peer_delivery_run({
+            "type": "turn_finished",
+            "run_id": "run_target",
+            "secure_peer_envelope_id": record["envelope_id"],
+            "result_text": "Response received successfully",
+            "exit_code": 0,
+        })
+
+        closed = self.runtime.delivery(str(record["envelope_id"]))
+        self.assertEqual(closed["state"], "completed")
+        self.assertEqual(self.runtime.submissions, [])
+
+    async def test_exact_secure_send_retry_freezes_expiry_in_idempotency_digest(
+        self,
+    ) -> None:
+        snapshot = self.snapshot(action="instruction")
+        token = await self.issue_secure_send("run_expiry_retry", snapshot)
+        request = agent_server.CrossChatHandoffRequest(
+            target_session_id=self.target_route_id,
+            action="instruction",
+            body="Deliver exactly once",
+            idempotency_key="expiry-retry-key",
+        )
+
+        with patch.object(agent_server.time, "time", return_value=1_000_000):
+            first, first_created = (
+                await agent_server.create_authorized_cross_chat_instruction(
+                    token,
+                    request,
+                )
+            )
+        with patch.object(agent_server.time, "time", return_value=1_000_001):
+            replay, replay_created = (
+                await agent_server.create_authorized_cross_chat_instruction(
+                    token,
+                    request,
+                )
+            )
+
+        self.assertTrue(first_created)
+        self.assertFalse(replay_created)
+        self.assertEqual(first["envelope_id"], replay["envelope_id"])
+        self.assertEqual(first["expires_at"], replay["expires_at"])
+
+    async def test_corrected_send_after_definite_rejection_gets_fresh_expiry(
+        self,
+    ) -> None:
+        snapshot = self.snapshot(action="instruction")
+        token = await self.issue_secure_send("run_expiry_reopen", snapshot)
+        original_prepare = self.runtime.prepare_outbound_handoff
+        attempts = 0
+
+        def reject_once(**kwargs: Any):
+            nonlocal attempts
+            attempts += 1
+            if attempts == 1:
+                raise SecurePeerError(
+                    "route_changed",
+                    "Correct the stale route",
+                    409,
+                )
+            return original_prepare(**kwargs)
+
+        first_request = agent_server.CrossChatHandoffRequest(
+            target_session_id=self.target_route_id,
+            action="instruction",
+            body="First shape",
+            idempotency_key="expiry-rejected-key",
+        )
+        with patch.object(
+            self.runtime,
+            "prepare_outbound_handoff",
+            side_effect=reject_once,
+        ), patch.object(agent_server.time, "time", return_value=1_000_000):
+            with self.assertRaises(HTTPException) as rejected:
+                await agent_server.create_authorized_cross_chat_instruction(
+                    token,
+                    first_request,
+                )
+        self.assertEqual(rejected.exception.status_code, 409)
+
+        corrected = first_request.model_copy(update={
+            "body": "Corrected shape",
+            "idempotency_key": "expiry-corrected-key",
+        })
+        with patch.object(
+            self.runtime,
+            "prepare_outbound_handoff",
+            side_effect=reject_once,
+        ), patch.object(agent_server.time, "time", return_value=1_000_100):
+            accepted, created = (
+                await agent_server.create_authorized_cross_chat_instruction(
+                    token,
+                    corrected,
+                )
+            )
+
+        self.assertTrue(created)
+        self.assertEqual(accepted["expires_at"], 1_000_100 + (72 * 60 * 60))
+
     async def test_live_response_intent_does_not_block_newer_same_peer_work(self) -> None:
         base = int(time.time())
         with patch("secure_peer_delivery.time.time", return_value=base - 30):
@@ -1119,6 +1225,45 @@ class SecurePeerConnectorTests(unittest.IsolatedAsyncioTestCase):
             self.assertIsNone(admitted)
             self.assertEqual(outcomes, ["failed"])
             self.assertEqual(actual.delivery(envelope["envelope_id"])["state"], "failed")
+        finally:
+            actual.shutdown()
+
+    async def test_unsupported_target_terminalizes_accepted_ownerless_delivery(
+        self,
+    ) -> None:
+        actual = SecurePeerRuntime(
+            self.root / "accepted-unsupported-runtime",
+            server_identity=self.local_identity,
+            server_instance_id="test-instance",
+            display_name="Test server",
+        )
+        agent_server.SECURE_PEER_RUNTIME = actual
+        envelope = self.envelope()
+        record, _created = actual.delivery_ledger.prepare(
+            envelope,
+            transport_role="client",
+            connection_id=self.connection_id,
+            lease_token="lease-token",
+            target_chat_id="target",
+        )
+        record = actual.delivery_ledger.authorize(envelope["envelope_id"])
+        self.assertIsNotNone(record)
+        agent_server.STORE.sessions["target"]["backend"] = "unsupported"
+
+        try:
+            admitted = await agent_server.admit_prepared_secure_peer_delivery(
+                record,  # type: ignore[arg-type]
+            )
+            self.assertIsNone(admitted)
+            self.assertEqual(
+                actual.delivery(envelope["envelope_id"])["state"],
+                "failed",
+            )
+            self.assertEqual(actual.delivery_ledger.pending_admissions(), [])
+            self.assertEqual(
+                actual.delivery_ledger.nonterminal_for_chat("target"),
+                [],
+            )
         finally:
             actual.shutdown()
 

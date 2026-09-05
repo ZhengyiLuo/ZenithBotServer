@@ -407,14 +407,33 @@ class RestartDenialLoggingTests(unittest.IsolatedAsyncioTestCase):
 
 class HistoryImportAnchorTests(unittest.TestCase):
     def select(self, events, items):
-        with patch.object(agent_server, "read_events", return_value=events) as read:
-            fresh = agent_server.unsynced_history_items("chat-x", items)
-        return fresh, read
+        message_keys = []
+        for index, event in enumerate(events, 1):
+            if event.get("type") == "turn_started":
+                key = agent_server.history_dedup_key("user", event.get("prompt"))
+            elif event.get("type") == "assistant_text":
+                key = agent_server.history_dedup_key(
+                    "assistant", event.get("text")
+                )
+            else:
+                continue
+            message_keys.append((index, key))
+        with patch.object(
+            agent_server,
+            "history_timeline_message_keys",
+            return_value=(message_keys, bool(message_keys), False),
+        ) as scan:
+            fresh = agent_server.unsynced_history_items(
+                "chat-x",
+                items,
+                timeline_through_seq=len(events),
+            )
+        return fresh, scan
 
     def test_dedup_scans_the_timeline_tail(self):
         events = [{"type": "turn_started", "prompt": "hello"}]
-        _fresh, read = self.select(events, [{"kind": "user", "text": "hello"}])
-        self.assertTrue(read.call_args.kwargs.get("tail"))
+        _fresh, scan = self.select(events, [{"kind": "user", "text": "hello"}])
+        self.assertTrue(scan.call_args.kwargs.get("tail"))
 
     def test_no_anchor_on_a_populated_timeline_imports_nothing(self):
         # Every transcript item failed to match an existing conversation:
@@ -732,12 +751,15 @@ class ImportedHistoryLifecycleTests(unittest.IsolatedAsyncioTestCase):
     async def test_import_batch_ends_with_a_terminal_event(self):
         appended: list[tuple[str, dict]] = []
 
-        async def record(session_id, event_type, payload):
-            appended.append((event_type, payload))
-            return {"seq": len(appended), **payload}
+        async def record(session_id, event_specs):
+            appended.extend(event_specs)
+            return [
+                {"seq": index, "type": event_type, **payload}
+                for index, (event_type, payload) in enumerate(event_specs, 1)
+            ]
 
         sess = {"id": "chat", "backend": agent_server.BACKEND_CODEX, "codex_thread_id": "t1"}
-        with patch.object(agent_server, "append_event", new=record):
+        with patch.object(agent_server, "append_durable_event_batch", new=record):
             await agent_server.append_imported_history(
                 sess, Path("/tmp/rollout.jsonl"), [{"kind": "user", "text": "hello"}],
             )
@@ -748,20 +770,217 @@ class ImportedHistoryLifecycleTests(unittest.IsolatedAsyncioTestCase):
     async def test_sync_skips_unchanged_transcripts(self):
         sess = {"id": "chat", "backend": agent_server.BACKEND_CODEX, "codex_thread_id": "t1"}
         live = {"chat": dict(sess)}
-        stamp = ["/tmp/rollout.jsonl", 10, 20]
+        stamp = ["/tmp/rollout.jsonl", 10, 20, 30, 40]
+        cursor = {
+            "version": agent_server.HISTORY_SYNC_CURSOR_VERSION,
+            "backend": agent_server.BACKEND_CODEX,
+            "provider_session_id": "t1",
+            "source_path": stamp[0],
+            "source_size": stamp[1],
+            "source_mtime_ns": stamp[2],
+            "source_dev": stamp[3],
+            "source_ino": stamp[4],
+            "source_offset": stamp[1],
+            "source_digest": "a" * 64,
+            "last_item_digest": "",
+            "timeline_seq": 0,
+        }
         with patch.object(agent_server.STORE, "sessions", live), \
              patch.object(agent_server, "provider_history_source_stamp", return_value=stamp), \
              patch.object(
                  agent_server,
-                 "provider_history",
-                 return_value=(Path("/tmp/rollout.jsonl"), [{"kind": "user", "text": "x"}]),
+                 "load_provider_history_with_cursor",
+                 return_value=(
+                     Path("/tmp/rollout.jsonl"),
+                     [{"kind": "user", "text": "x"}],
+                     cursor,
+                     False,
+                 ),
              ) as parse, \
-             patch.object(agent_server, "unsynced_history_items", return_value=[]):
+             patch.object(agent_server, "unsynced_history_items", return_value=[]), \
+             patch.object(agent_server, "last_event_seq_from_file", return_value=0), \
+             patch.object(agent_server.STORE, "save", new=AsyncMock()) as save:
             first = await agent_server.sync_provider_history(dict(sess))
             second = await agent_server.sync_provider_history(dict(sess))
         self.assertEqual(parse.call_count, 1)
+        save.assert_awaited_once_with(durable=True)
         self.assertIn("Already up to date", first["message"])
         self.assertIn("unchanged", second["message"])
+
+    async def test_failed_sync_does_not_cache_source_stamp(self):
+        sess = {
+            "id": "chat",
+            "backend": agent_server.BACKEND_CODEX,
+            "codex_thread_id": "t1",
+        }
+        live = {"chat": dict(sess)}
+        cursor = {
+            "version": agent_server.HISTORY_SYNC_CURSOR_VERSION,
+            "backend": agent_server.BACKEND_CODEX,
+            "provider_session_id": "t1",
+            "source_path": "/tmp/rollout.jsonl",
+            "source_size": 10,
+            "source_mtime_ns": 20,
+            "source_dev": 30,
+            "source_ino": 40,
+            "source_offset": 10,
+            "source_digest": "a" * 64,
+            "last_item_digest": "",
+            "timeline_seq": 0,
+        }
+        with patch.object(agent_server.STORE, "sessions", live), \
+             patch.object(
+                 agent_server,
+                 "load_provider_history_with_cursor",
+                 return_value=(
+                     Path("/tmp/rollout.jsonl"),
+                     [{"kind": "user", "text": "new"}],
+                     cursor,
+                     False,
+                 ),
+             ), patch.object(
+                 agent_server,
+                 "unsynced_history_items",
+                 return_value=[{"kind": "user", "text": "new"}],
+             ), patch.object(
+                 agent_server,
+                 "append_imported_history",
+                 new=AsyncMock(side_effect=OSError("disk full")),
+             ), patch.object(
+                 agent_server.STORE,
+                 "save",
+                 new=AsyncMock(),
+             ) as save:
+            with self.assertRaises(OSError):
+                await agent_server.sync_provider_history(dict(sess))
+        self.assertNotIn("_history_sync_cursor", live["chat"])
+        save.assert_not_awaited()
+
+    async def test_forced_import_only_appends_unsynced_suffix(self):
+        sess = {
+            "id": "chat",
+            "backend": agent_server.BACKEND_CODEX,
+            "codex_thread_id": "t1",
+        }
+        transcript = [
+            {"kind": "user", "text": "already present"},
+            {"kind": "assistant", "text": "also present"},
+        ]
+        with patch.object(
+            agent_server,
+            "load_provider_history_with_cursor",
+            return_value=(Path("/tmp/rollout.jsonl"), transcript, None, False),
+        ), patch.object(
+            agent_server,
+            "unsynced_history_items",
+            return_value=[],
+        ) as unsynced, patch.object(
+            agent_server,
+            "append_imported_history",
+            new=AsyncMock(),
+        ) as append, patch.object(
+            agent_server,
+            "last_event_seq_from_file",
+            return_value=0,
+        ):
+            result = await agent_server.import_session_history(sess, force=True)
+
+        unsynced.assert_called_once_with(
+            "chat",
+            transcript,
+            timeline_through_seq=0,
+        )
+        append.assert_not_awaited()
+        self.assertEqual(result["imported"], 0)
+        self.assertIn("Already up to date", result["message"])
+
+    def test_sync_matches_repeated_text_to_newest_transcript_occurrence(self):
+        transcript = [
+            {"kind": "assistant", "text": "same answer"},
+            {"kind": "user", "text": "latest question"},
+            {"kind": "assistant", "text": "same answer"},
+        ]
+        timeline_keys = [
+            (
+                1,
+                agent_server.history_dedup_key("user", "latest question"),
+            ),
+            (
+                2,
+                agent_server.history_dedup_key("assistant", "same answer"),
+            ),
+        ]
+        with patch.object(
+            agent_server,
+            "history_timeline_message_keys",
+            return_value=(timeline_keys, True, False),
+        ):
+            fresh = agent_server.unsynced_history_items("chat", transcript)
+
+        self.assertEqual(fresh, [])
+
+    async def test_manual_import_rejects_busy_chat_before_reading_provider(self):
+        sess = {
+            "id": "chat",
+            "backend": agent_server.BACKEND_CODEX,
+            "codex_thread_id": "t1",
+        }
+        with patch.dict(agent_server.STORE.sessions, {"chat": sess}, clear=True), \
+             patch.object(agent_server, "SESSION_LIFECYCLE_LOCKS", {}), \
+             patch.object(agent_server, "ACTIVE_LOCK", asyncio.Lock()), \
+             patch.object(agent_server, "BUSY_SESSIONS", {"chat"}), \
+             patch.object(agent_server, "provider_history") as provider:
+            with self.assertRaises(HTTPException) as raised:
+                await agent_server.import_history(
+                    "chat",
+                    agent_server.ImportHistoryRequest(force=True),
+                )
+
+        self.assertEqual(raised.exception.status_code, 409)
+        provider.assert_not_called()
+
+    async def test_prune_revalidates_busy_state_after_lifecycle_wait(self):
+        lifecycle = asyncio.Lock()
+        await lifecycle.acquire()
+        sync = MagicMock(return_value={
+            "dry_run": True,
+            "events_before": 0,
+            "removed_events": 0,
+            "removed_runs": 0,
+            "bytes_before": 0,
+            "bytes_after": 0,
+            "_max_seq_before": 0,
+        })
+        with patch.dict(
+            agent_server.STORE.sessions,
+            {"chat": {"id": "chat"}},
+            clear=True,
+        ), patch.object(
+            agent_server,
+            "SESSION_LIFECYCLE_LOCKS",
+            {"chat": lifecycle},
+        ), patch.object(agent_server, "ACTIVE_LOCK", asyncio.Lock()), \
+             patch.object(agent_server, "BUSY_SESSIONS", set()), \
+             patch.object(
+                 agent_server,
+                 "prune_duplicate_imported_history_sync",
+                 sync,
+             ):
+            operation = asyncio.create_task(
+                agent_server.prune_imported_history(
+                    "chat",
+                    agent_server.PruneImportedHistoryRequest(dry_run=True),
+                )
+            )
+            await asyncio.sleep(0)
+            sync.assert_not_called()
+            agent_server.BUSY_SESSIONS.add("chat")
+            lifecycle.release()
+            with self.assertRaises(HTTPException) as raised:
+                await operation
+
+        self.assertEqual(raised.exception.status_code, 409)
+        sync.assert_not_called()
 
 
 class PruneImportedHistoryTests(unittest.TestCase):

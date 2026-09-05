@@ -133,6 +133,47 @@ class SecurePeerDeliveryLedgerTests(unittest.TestCase):
             "env_1234567890abcdef", queued_id="queued_2", run_id=None
         ))
 
+    def test_ownerless_authorized_failure_cas_preserves_a_racing_owner(self):
+        self.ledger.prepare(
+            envelope(),
+            transport_role="client",
+            connection_id="44444444-4444-4444-8444-444444444444",
+            lease_token="lease." + "a" * 43,
+            target_chat_id="chat-target",
+        )
+        self.ledger.authorize("env_1234567890abcdef")
+        failed = self.ledger.fail_ownerless_authorized(
+            "env_1234567890abcdef",
+            error="target unavailable",
+        )
+        self.assertEqual(failed["state"], "failed")
+        self.assertEqual(self.ledger.pending_admissions(), [])
+        self.assertEqual(self.ledger.nonterminal_for_chat("chat-target"), [])
+
+        second = envelope(
+            envelope_id="env_fedcba0987654321",
+            request_id="bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+        )
+        self.ledger.prepare(
+            second,
+            transport_role="client",
+            connection_id="44444444-4444-4444-8444-444444444444",
+            lease_token="lease." + "b" * 43,
+            target_chat_id="chat-target",
+        )
+        self.ledger.authorize(second["envelope_id"])
+        self.ledger.bind_owner(
+            second["envelope_id"],
+            queued_id="queued-owner",
+            run_id=None,
+        )
+        retained = self.ledger.fail_ownerless_authorized(
+            second["envelope_id"],
+            error="stale unavailable decision",
+        )
+        self.assertEqual(retained["state"], "queued")
+        self.assertEqual(retained["queued_id"], "queued-owner")
+
     def test_invalid_budget_and_cross_envelope_collision_fail_closed(self):
         with self.assertRaisesRegex(ValueError, "leg budget"):
             self.ledger.prepare(

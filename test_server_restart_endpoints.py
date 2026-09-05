@@ -162,7 +162,7 @@ def restart_environment(root: Path):
         stack.enter_context(patch.object(agent_server, "RUN_NOW_TURNS", {}))
         stack.enter_context(patch.object(
             agent_server,
-            "active_provider_background_work_labels",
+            "provider_background_work_labels_from_snapshot",
             return_value=[],
         ))
         stack.enter_context(patch.object(
@@ -785,6 +785,11 @@ class ServerRestartEndpointTests(unittest.IsolatedAsyncioTestCase):
                  patch.object(agent_server, "BUSY_SESSIONS", {"private-chat-id"}), \
                  patch.object(
                      agent_server,
+                     "provider_background_work_labels_from_snapshot",
+                     return_value=["private provider label"],
+                 ), \
+                 patch.object(
+                     agent_server,
                      "active_provider_background_work_labels",
                      return_value=["private provider label"],
                  ):
@@ -836,6 +841,54 @@ class ServerRestartEndpointTests(unittest.IsolatedAsyncioTestCase):
                         http_request(token=None)
                     )
                 self.assertEqual(unavailable.exception.status_code, 503)
+
+    async def test_restart_auth_accepts_one_documented_header_and_rejects_ambiguity(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            with restart_environment(root):
+                accepted = (
+                    [(b"x-agentsdock-token", TOKEN.encode())],
+                    [(b"x-zenithdock-token", TOKEN.encode())],
+                    [(b"authorization", f"Bearer {TOKEN}".encode())],
+                )
+                for headers in accepted:
+                    with self.subTest(accepted=headers):
+                        request = http_request(token=None)
+                        request.scope["headers"] = headers
+                        agent_server.require_server_restart_control(request)
+
+                rejected = (
+                    [
+                        (b"x-agentsdock-token", TOKEN.encode()),
+                        (b"x-agentsdock-token", TOKEN.encode()),
+                    ],
+                    [
+                        (b"x-agentsdock-token", TOKEN.encode()),
+                        (b"x-zenithdock-token", TOKEN.encode()),
+                    ],
+                    [
+                        (b"x-agentsdock-token", TOKEN.encode()),
+                        (b"authorization", f"Bearer {TOKEN}".encode()),
+                    ],
+                )
+                for headers in rejected:
+                    with self.subTest(rejected=headers):
+                        with self.assertRaises(
+                            HTTPException
+                        ) as unauthorized:
+                            request = http_request(token=None)
+                            request.scope["headers"] = headers
+                            agent_server.require_server_restart_control(request)
+                        self.assertEqual(
+                            unauthorized.exception.status_code,
+                            401,
+                        )
+
+                with self.assertRaises(HTTPException) as query_ambiguity:
+                    agent_server.require_server_restart_control(
+                        http_request(query=f"token={TOKEN}")
+                    )
+                self.assertEqual(query_ambiguity.exception.status_code, 401)
 
     async def test_restart_routes_reject_browser_ambient_authority_headers(self):
         forbidden_headers = (
@@ -1026,6 +1079,60 @@ class ServerRestartEndpointTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(tasks.tasks), 1)
         self.assertEqual(list(queued)[0]["queued_id"], "kept")
         self.assertEqual(private["_source_instance_id"], SERVER_INSTANCE_ID)
+
+    async def test_restart_repair_admission_allows_failed_team_hub_startup(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            prepare = AsyncMock(return_value=None)
+            reopen = AsyncMock()
+            with restart_environment(root), \
+                 patch.object(
+                     agent_server.TEAM_HUB_RUNTIME,
+                     "prepare_maintenance",
+                     new=prepare,
+                 ), \
+                 patch.object(
+                     agent_server.TEAM_HUB_RUNTIME,
+                     "reopen_admission",
+                     new=reopen,
+                 ):
+                status = await agent_server.restart_server_endpoint(
+                    restart_body(),
+                    http_request(method="POST"),
+                    BackgroundTasks(),
+                )
+
+        self.assertEqual(status["phase"], "accepted")
+        prepare.assert_awaited_once_with(
+            "server-restart",
+            persistent_fence=False,
+            allow_unavailable_host=True,
+        )
+        reopen.assert_awaited_once_with()
+
+    async def test_forced_restart_repair_attempt_allows_failed_team_hub_startup(self):
+        prepare = AsyncMock(return_value=None)
+        reopen = AsyncMock()
+        with patch.object(
+            agent_server.TEAM_HUB_RUNTIME,
+            "prepare_maintenance",
+            new=prepare,
+        ), patch.object(
+            agent_server.TEAM_HUB_RUNTIME,
+            "reopen_admission",
+            new=reopen,
+        ):
+            succeeded = (
+                await agent_server.forced_server_restart_team_hub_snapshot_attempt()
+            )
+
+        self.assertTrue(succeeded)
+        prepare.assert_awaited_once_with(
+            "server-restart",
+            persistent_fence=False,
+            allow_unavailable_host=True,
+        )
+        reopen.assert_awaited_once_with()
 
     async def test_same_accepted_request_reattaches_one_recovery_worker(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -1350,7 +1457,7 @@ class ServerRestartEndpointTests(unittest.IsolatedAsyncioTestCase):
             root = Path(temporary)
             with restart_environment(root), patch.object(
                 agent_server,
-                "active_provider_background_work_labels",
+                "provider_background_work_labels_from_snapshot",
                 return_value=["private provider label"],
             ):
                 with self.assertRaises(HTTPException) as raised:
@@ -1537,6 +1644,11 @@ class ServerRestartEndpointTests(unittest.IsolatedAsyncioTestCase):
                  patch.object(agent_server, "BUSY_SESSIONS", {"chat-1", "chat-2"}), \
                  patch.object(agent_server, "QUEUED_TURNS", {"chat-1": queued}), \
                  patch.object(agent_server, "RUN_NOW_TURNS", {"chat-5": run_now}), \
+                 patch.object(
+                     agent_server,
+                     "provider_background_work_labels_from_snapshot",
+                     return_value=["private provider label"],
+                 ), \
                  patch.object(
                      agent_server,
                      "active_provider_background_work_labels",
@@ -1746,6 +1858,87 @@ class ServerRestartEndpointTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(status["phase"], "accepted")
         self.assertTrue(status["forced_audit"]["team_hub_snapshot_skipped"])
 
+    async def test_force_restart_hub_snapshot_deadline_retains_late_settlement(
+        self,
+    ) -> None:
+        snapshot_started = asyncio.Event()
+        release_snapshot = asyncio.Event()
+        snapshot_settled = asyncio.Event()
+        cancellation_seen = asyncio.Event()
+        reopened = asyncio.Event()
+        stragglers: set[asyncio.Task[object]] = set()
+
+        async def cancellation_resistant_snapshot(*_args, **_kwargs):
+            snapshot_started.set()
+            try:
+                await release_snapshot.wait()
+            except asyncio.CancelledError:
+                # This is the behavior that made asyncio.wait_for exceed its
+                # deadline: maintenance must finish its native worker first.
+                cancellation_seen.set()
+                await release_snapshot.wait()
+            snapshot_settled.set()
+
+        async def reopen_after_settlement() -> None:
+            self.assertTrue(snapshot_settled.is_set())
+            reopened.set()
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            with (
+                restart_environment(root) as forced_signal,
+                patch.object(
+                    agent_server.TEAM_HUB_RUNTIME,
+                    "prepare_maintenance",
+                    new=AsyncMock(side_effect=cancellation_resistant_snapshot),
+                ),
+                patch.object(
+                    agent_server.TEAM_HUB_RUNTIME,
+                    "reopen_admission",
+                    new=AsyncMock(side_effect=reopen_after_settlement),
+                ) as reopen_admission,
+                patch.object(
+                    agent_server,
+                    "SERVER_RESTART_FORCE_HUB_SNAPSHOT_TIMEOUT_SECONDS",
+                    0.01,
+                ),
+                patch.object(
+                    agent_server,
+                    "SERVER_RESTART_FORCE_HUB_STRAGGLERS",
+                    stragglers,
+                ),
+            ):
+                started_at = asyncio.get_running_loop().time()
+                status = await asyncio.wait_for(
+                    agent_server.restart_server_endpoint(
+                        restart_body(force=True),
+                        http_request(method="POST"),
+                        BackgroundTasks(),
+                    ),
+                    timeout=1,
+                )
+                elapsed = asyncio.get_running_loop().time() - started_at
+
+                self.assertLess(elapsed, 0.5)
+                self.assertTrue(snapshot_started.is_set())
+                self.assertFalse(cancellation_seen.is_set())
+                self.assertFalse(snapshot_settled.is_set())
+                self.assertFalse(reopened.is_set())
+                self.assertEqual(len(stragglers), 1)
+                forced_signal.assert_called_once_with(status["request_id"])
+
+                release_snapshot.set()
+                await asyncio.wait_for(reopened.wait(), 1)
+                for _ in range(100):
+                    if not stragglers:
+                        break
+                    await asyncio.sleep(0)
+                self.assertFalse(stragglers)
+                reopen_admission.assert_awaited_once_with()
+
+        self.assertEqual(status["phase"], "accepted")
+        self.assertTrue(status["forced_audit"]["team_hub_snapshot_skipped"])
+
     async def test_tmux_cgroup_risk_requires_force_and_is_privately_revision_bound(self):
         service_cgroup = (
             "/user.slice/user-1000.slice/user@1000.service/"
@@ -1850,7 +2043,7 @@ class ServerRestartEndpointTests(unittest.IsolatedAsyncioTestCase):
             root = Path(temporary)
             with restart_environment(root), patch.object(
                 agent_server,
-                "active_provider_background_work_labels",
+                "provider_background_work_labels_from_snapshot",
                 return_value=["private provider label", "second private label"],
             ):
                 status = await agent_server.restart_server_endpoint(
@@ -1902,7 +2095,7 @@ class ServerRestartEndpointTests(unittest.IsolatedAsyncioTestCase):
             with restart_environment(root):
                 mutation_task = asyncio.create_task(
                     agent_server.require_agent_token(
-                        http_request(method="PATCH", path="/api/sessions/chat"),
+                        http_request(method="DELETE", path="/api/sessions/chat"),
                         call_next,
                     )
                 )
@@ -1941,7 +2134,7 @@ class ServerRestartEndpointTests(unittest.IsolatedAsyncioTestCase):
                     _source_instance_id=SERVER_INSTANCE_ID,
                 )
                 response = await agent_server.require_agent_token(
-                    http_request(method="POST", path="/api/sessions"),
+                    http_request(method="DELETE", path="/api/sessions/chat"),
                     call_next,
                 )
 

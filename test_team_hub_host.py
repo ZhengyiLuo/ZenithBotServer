@@ -11,6 +11,8 @@ from unittest.mock import MagicMock, patch
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
+import team_hub_host as team_hub_host_module
+import agentsdock_team_hub.store as team_hub_store_module
 from team_hub_host import (
     TEAM_HUB_MODE_DISABLED,
     TEAM_HUB_MODE_HOST,
@@ -36,12 +38,13 @@ TAILNET_HEADERS = {
 }
 
 
-def host(root: Path) -> ManagedTeamHubHost:
+def host(root: Path, **kwargs) -> ManagedTeamHubHost:
     return ManagedTeamHubHost(
         mode=TEAM_HUB_MODE_HOST,
         data_dir=root,
         server_identity=HOST_ID,
         allowed_hosts={"localhost", "127.0.0.1"},
+        **kwargs,
     )
 
 
@@ -244,6 +247,107 @@ class ManagedTeamHubHostTests(unittest.IsolatedAsyncioTestCase):
             self.assertFalse(capability["available"])
             self.assertFalse(capability["designated_host"])
 
+    async def test_startup_failure_exposes_bounded_sanitized_reason(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary) / "private" / "hub"
+            logger = MagicMock()
+            runtime = ManagedTeamHubHost(
+                mode=TEAM_HUB_MODE_HOST,
+                data_dir=root,
+                server_identity=HOST_ID,
+                allowed_hosts={"localhost"},
+                logger=logger,
+            )
+            secret = "owner-recovery-secret-value"
+            failure = RuntimeError(
+                f"could not open {root}/team-hub.sqlite3 token={secret} "
+                + ("x" * 500)
+            )
+            with patch.object(
+                team_hub_host_module,
+                "create_app",
+                side_effect=failure,
+            ):
+                runtime.initialize()
+
+            capability = runtime.capability()
+            reason = capability["startup_failure_reason"]
+            self.assertFalse(capability["available"])
+            self.assertIsInstance(reason, str)
+            self.assertIn("could not open", reason)
+            self.assertIn("token=[redacted]", reason)
+            self.assertNotIn(secret, reason)
+            self.assertNotIn(str(root), reason)
+            self.assertLessEqual(
+                len(reason),
+                team_hub_host_module.TEAM_HUB_STARTUP_FAILURE_REASON_MAX_CHARS,
+            )
+            logged = " ".join(
+                str(value)
+                for call in logger.error.call_args_list
+                for value in call.args
+            )
+            self.assertIn(reason, logged)
+            self.assertNotIn(secret, logged)
+            self.assertNotIn(str(root), logged)
+
+    async def test_failed_host_repair_closes_admission_without_live_snapshot(
+        self,
+    ) -> None:
+        class PeerManager:
+            def __init__(self) -> None:
+                self.admission_open = True
+                self.close_calls = 0
+                self.reopen_calls = 0
+
+            def close_host_admission(self) -> None:
+                self.close_calls += 1
+                self.admission_open = False
+
+            def reopen_host_admission(self) -> None:
+                self.reopen_calls += 1
+                self.admission_open = True
+
+        with tempfile.TemporaryDirectory() as temporary:
+            peer = PeerManager()
+            runtime = ManagedTeamHubHost(
+                mode=TEAM_HUB_MODE_HOST,
+                data_dir=Path(temporary) / "hub",
+                server_identity=HOST_ID,
+                allowed_hosts={"localhost"},
+                secure_peer_manager=peer,
+            )
+            with patch.object(
+                team_hub_host_module,
+                "create_app",
+                side_effect=RuntimeError("migration failed"),
+            ):
+                runtime.initialize()
+
+            snapshot = await runtime.prepare_maintenance(
+                "server-update",
+                operation_id="repair-failed-host",
+                allow_unavailable_host=True,
+            )
+            self.assertIsNone(snapshot)
+            self.assertEqual(peer.close_calls, 1)
+            self.assertEqual(peer.reopen_calls, 0)
+            self.assertFalse(peer.admission_open)
+            self.assertFalse(runtime.capability()["available"])
+
+            # A caller's ordinary abort cleanup must not expose a peer-facing
+            # surface when no live Hub delegate/store can serve it.
+            await runtime.reopen_admission()
+            self.assertEqual(peer.reopen_calls, 0)
+            self.assertFalse(peer.admission_open)
+            self.assertFalse(runtime.capability()["available"])
+
+            with self.assertRaisesRegex(RuntimeError, "unavailable for maintenance"):
+                await runtime.prepare_maintenance(
+                    "server-update",
+                    operation_id="ordinary-failed-host",
+                )
+
     async def test_runtime_lease_blocks_second_host_and_offline_restore(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary) / "hub"
@@ -264,7 +368,12 @@ class ManagedTeamHubHostTests(unittest.IsolatedAsyncioTestCase):
                 expected_operation_id="lease-test",
             )
 
-            second = host(root)
+            second = host(
+                root,
+                update_hub_id=str(first.capability()["hub_id"]),
+                update_operation_id="lease-test",
+                update_snapshot=snapshot,
+            )
             second.initialize()
             self.assertFalse(second.capability()["available"])
             with self.assertRaisesRegex(RuntimeError, "already active"):
@@ -307,40 +416,592 @@ class ManagedTeamHubHostTests(unittest.IsolatedAsyncioTestCase):
             await request
             await runtime.shutdown()
 
+    async def test_post_commit_fence_error_recovers_exact_snapshot_as_success(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            runtime = host(Path(temporary) / "hub")
+            runtime.initialize()
+            store = runtime.store
+            self.assertIsNotNone(store)
+            original_create = team_hub_store_module.create_secret_file
+            original_fsync = store._fsync_directory  # type: ignore[union-attr]
+            reported_failure = False
+            recovery_fsyncs: list[Path] = []
+
+            def create_then_report_failure(path: Path, value: bytes) -> None:
+                nonlocal reported_failure
+                original_create(path, value)
+                if path == store.maintenance_fence_path:  # type: ignore[union-attr]
+                    reported_failure = True
+                    raise OSError("simulated post-commit directory fsync failure")
+
+            def observe_recovery_fsync(path: Path) -> None:
+                if reported_failure:
+                    recovery_fsyncs.append(Path(path))
+                original_fsync(path)
+
+            with (
+                patch.object(
+                    team_hub_store_module,
+                    "create_secret_file",
+                    side_effect=create_then_report_failure,
+                ),
+                patch.object(
+                    store,
+                    "_fsync_directory",
+                    side_effect=observe_recovery_fsync,
+                ),
+            ):
+                snapshot = await runtime.prepare_maintenance(
+                    "server-update",
+                    operation_id="post-commit-fence-error",
+                )
+
+            self.assertIsNotNone(snapshot)
+            self.assertEqual(recovery_fsyncs, [store.data_dir])  # type: ignore[union-attr]
+            marker = store.maintenance_fence()  # type: ignore[union-attr]
+            self.assertEqual(marker["operation_id"], "post-commit-fence-error")
+            self.assertEqual(marker["snapshot"], snapshot.name)  # type: ignore[union-attr]
+            self.assertFalse(runtime.capability()["available"])
+
+            self.assertTrue(
+                await runtime.clear_maintenance(
+                    "server-update",
+                    "post-commit-fence-error",
+                    snapshot,  # type: ignore[arg-type]
+                )
+            )
+            await runtime.reopen_admission()
+            self.assertTrue(runtime.capability()["available"])
+            await runtime.shutdown()
+
+    async def test_ambiguous_fence_error_never_reopens_admission(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            runtime = host(Path(temporary) / "hub")
+            runtime.initialize()
+            store = runtime.store
+            self.assertIsNotNone(store)
+            original_create = team_hub_store_module.create_secret_file
+
+            def create_ambiguous_then_fail(path: Path, value: bytes) -> None:
+                if path == store.maintenance_fence_path:  # type: ignore[union-attr]
+                    original_create(path, b"x" * 64)
+                    raise OSError("simulated ambiguous fence creation")
+                original_create(path, value)
+
+            with patch.object(
+                team_hub_store_module,
+                "create_secret_file",
+                side_effect=create_ambiguous_then_fail,
+            ):
+                with self.assertRaisesRegex(
+                    RuntimeError,
+                    "maintenance fence is invalid",
+                ):
+                    await runtime.prepare_maintenance(
+                        "server-update",
+                        operation_id="ambiguous-fence-error",
+                    )
+
+            self.assertFalse(runtime.capability()["available"])
+            await runtime.shutdown()
+
     async def test_cancelled_persistent_snapshot_settles_and_clears_exact_fence(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             runtime = host(Path(temporary) / "hub")
             runtime.initialize()
             store = runtime.store
             self.assertIsNotNone(store)
-            original = store.maintenance_snapshot_and_fence  # type: ignore[union-attr]
-            started = threading.Event()
-            release = threading.Event()
+            original_snapshot = store.maintenance_snapshot_and_fence  # type: ignore[union-attr]
+            original_clear = store.clear_maintenance_fence  # type: ignore[union-attr]
+            snapshot_started = threading.Event()
+            release_snapshot = threading.Event()
+            clear_started = threading.Event()
+            release_clear = threading.Event()
+            snapshot_join_entered = asyncio.Event()
+            original_join = (
+                team_hub_host_module._join_task_despite_caller_cancellation
+            )
 
             def delayed(reason: str, *, operation_id: str, keep: int = 3):
-                started.set()
-                if not release.wait(timeout=5):
+                snapshot_started.set()
+                if not release_snapshot.wait(timeout=5):
                     raise RuntimeError("test snapshot release timed out")
-                return original(
+                return original_snapshot(
+                    reason,
+                    operation_id=operation_id,
+                    keep=keep,
+                )
+
+            def delayed_clear(**kwargs):
+                clear_started.set()
+                if not release_clear.wait(timeout=5):
+                    raise RuntimeError("test fence-clear release timed out")
+                return original_clear(**kwargs)
+
+            async def observed_join(task):
+                snapshot_join_entered.set()
+                return await original_join(task)
+
+            store.maintenance_snapshot_and_fence = delayed  # type: ignore[method-assign,union-attr]
+            store.clear_maintenance_fence = delayed_clear  # type: ignore[method-assign,union-attr]
+            with patch.object(
+                team_hub_host_module,
+                "_join_task_despite_caller_cancellation",
+                observed_join,
+            ):
+                maintenance = asyncio.create_task(
+                    runtime.prepare_maintenance(
+                        "server-update",
+                        operation_id="update-cancelled",
+                    )
+                )
+                try:
+                    self.assertTrue(
+                        await asyncio.to_thread(snapshot_started.wait, 5)
+                    )
+                    maintenance.cancel()
+                    await asyncio.wait_for(snapshot_join_entered.wait(), 1)
+                    maintenance.cancel()
+                    await asyncio.sleep(0)
+                    self.assertFalse(maintenance.done())
+
+                    release_snapshot.set()
+                    self.assertTrue(
+                        await asyncio.to_thread(clear_started.wait, 5)
+                    )
+                    self.assertIsNotNone(store.maintenance_fence())  # type: ignore[union-attr]
+                    maintenance.cancel()
+                    await asyncio.sleep(0)
+                    self.assertFalse(maintenance.done())
+                    self.assertFalse(runtime.capability()["available"])
+
+                    release_clear.set()
+                    with self.assertRaises(asyncio.CancelledError):
+                        await maintenance
+                finally:
+                    release_snapshot.set()
+                    release_clear.set()
+                    if not maintenance.done():
+                        maintenance.cancel()
+                        await asyncio.gather(maintenance, return_exceptions=True)
+            self.assertIsNone(store.maintenance_fence())  # type: ignore[union-attr]
+            self.assertTrue(runtime.capability()["available"])
+            await runtime.shutdown()
+
+    async def test_cancelled_snapshot_clear_failure_keeps_admission_closed(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            runtime = host(Path(temporary) / "hub")
+            runtime.initialize()
+            store = runtime.store
+            self.assertIsNotNone(store)
+            original_snapshot = store.maintenance_snapshot_and_fence  # type: ignore[union-attr]
+            snapshot_started = threading.Event()
+            release_snapshot = threading.Event()
+
+            def delayed(reason: str, *, operation_id: str, keep: int = 3):
+                snapshot_started.set()
+                if not release_snapshot.wait(timeout=5):
+                    raise RuntimeError("test snapshot release timed out")
+                return original_snapshot(
                     reason,
                     operation_id=operation_id,
                     keep=keep,
                 )
 
             store.maintenance_snapshot_and_fence = delayed  # type: ignore[method-assign,union-attr]
-            maintenance = asyncio.create_task(
-                runtime.prepare_maintenance(
-                    "server-update",
-                    operation_id="update-cancelled",
+            with patch.object(
+                store,
+                "clear_maintenance_fence",
+                side_effect=RuntimeError("fence clear failed"),
+            ) as clear_fence:
+                maintenance = asyncio.create_task(
+                    runtime.prepare_maintenance(
+                        "server-update",
+                        operation_id="update-clear-failed",
+                    )
                 )
+                try:
+                    self.assertTrue(
+                        await asyncio.to_thread(snapshot_started.wait, 5)
+                    )
+                    maintenance.cancel()
+                    release_snapshot.set()
+                    with self.assertRaises(asyncio.CancelledError):
+                        await maintenance
+                finally:
+                    release_snapshot.set()
+                    if not maintenance.done():
+                        maintenance.cancel()
+                        await asyncio.gather(maintenance, return_exceptions=True)
+
+            marker = store.maintenance_fence()  # type: ignore[union-attr]
+            self.assertIsNotNone(marker)
+            self.assertEqual(marker["operation_id"], "update-clear-failed")
+            self.assertFalse(runtime.capability()["available"])
+            clear_fence.assert_called_once()
+            await runtime.shutdown()
+
+    async def test_cancelled_explicit_clear_settles_fence_before_caller_reopens(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            runtime = host(Path(temporary) / "hub")
+            runtime.initialize()
+            store = runtime.store
+            self.assertIsNotNone(store)
+            snapshot = await runtime.prepare_maintenance(
+                "server-update",
+                operation_id="update-clear-cancelled",
             )
-            self.assertTrue(await asyncio.to_thread(started.wait, 5))
-            maintenance.cancel()
-            release.set()
-            with self.assertRaises(asyncio.CancelledError):
-                await maintenance
+            self.assertIsNotNone(snapshot)
+            self.assertIsNotNone(store.maintenance_fence())  # type: ignore[union-attr]
+            self.assertFalse(runtime.capability()["available"])
+
+            original_clear = store.clear_maintenance_fence  # type: ignore[union-attr]
+            clear_started = threading.Event()
+            release_clear = threading.Event()
+            join_entered = asyncio.Event()
+            original_join = (
+                team_hub_host_module._join_task_despite_caller_cancellation
+            )
+
+            def delayed_clear(**kwargs):
+                clear_started.set()
+                if not release_clear.wait(timeout=5):
+                    raise RuntimeError("test fence-clear release timed out")
+                return original_clear(**kwargs)
+
+            async def observed_join(task):
+                join_entered.set()
+                return await original_join(task)
+
+            async def clear_then_reopen() -> None:
+                try:
+                    await runtime.clear_maintenance(
+                        "server-update",
+                        "update-clear-cancelled",
+                        snapshot,  # type: ignore[arg-type]
+                    )
+                finally:
+                    await runtime.reopen_admission()
+
+            store.clear_maintenance_fence = delayed_clear  # type: ignore[method-assign,union-attr]
+            with patch.object(
+                team_hub_host_module,
+                "_join_task_despite_caller_cancellation",
+                observed_join,
+            ):
+                clearing = asyncio.create_task(clear_then_reopen())
+                try:
+                    self.assertTrue(
+                        await asyncio.to_thread(clear_started.wait, 5)
+                    )
+                    clearing.cancel()
+                    await asyncio.wait_for(join_entered.wait(), 1)
+                    clearing.cancel()
+                    await asyncio.sleep(0)
+
+                    self.assertFalse(clearing.done())
+                    self.assertIsNotNone(store.maintenance_fence())  # type: ignore[union-attr]
+                    self.assertFalse(runtime.capability()["available"])
+
+                    release_clear.set()
+                    with self.assertRaises(asyncio.CancelledError):
+                        await clearing
+                finally:
+                    release_clear.set()
+                    if not clearing.done():
+                        clearing.cancel()
+                        await asyncio.gather(clearing, return_exceptions=True)
+
             self.assertIsNone(store.maintenance_fence())  # type: ignore[union-attr]
             self.assertTrue(runtime.capability()["available"])
+            await runtime.shutdown()
+
+    async def test_bounded_shutdown_snapshot_straggler_never_reopens_after_peer_shutdown(
+        self,
+    ) -> None:
+        import agent_server
+
+        class PeerManager:
+            def __init__(self) -> None:
+                self.state = "new"
+                self.reopened_after_shutdown = False
+
+            def attach_host_hub(self, **_kwargs) -> None:
+                self.state = "open"
+
+            def close_host_admission(self) -> None:
+                self.state = "closed"
+
+            def reopen_host_admission(self) -> None:
+                if self.state == "shutdown":
+                    self.reopened_after_shutdown = True
+                self.state = "open"
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary) / "hub"
+            peer = PeerManager()
+            runtime = ManagedTeamHubHost(
+                mode=TEAM_HUB_MODE_HOST,
+                data_dir=root,
+                server_identity=HOST_ID,
+                allowed_hosts={"localhost", "127.0.0.1"},
+                secure_peer_manager=peer,
+            )
+            runtime.initialize()
+            store = runtime.store
+            self.assertIsNotNone(store)
+            original_snapshot = store.maintenance_snapshot  # type: ignore[union-attr]
+            snapshot_started = threading.Event()
+            release_snapshot = threading.Event()
+
+            def delayed_snapshot(reason: str, *, keep: int = 3):
+                snapshot_started.set()
+                if not release_snapshot.wait(timeout=5):
+                    raise RuntimeError("test snapshot release timed out")
+                return original_snapshot(reason, keep=keep)
+
+            store.maintenance_snapshot = delayed_snapshot  # type: ignore[method-assign,union-attr]
+            prior_stragglers = set(agent_server.SERVER_SHUTDOWN_STRAGGLERS)
+            shutdown_phase = asyncio.create_task(
+                agent_server.bounded_shutdown_phase(
+                    "team-hub",
+                    runtime.shutdown(),
+                    timeout=0.02,
+                )
+            )
+            try:
+                self.assertTrue(
+                    await asyncio.to_thread(snapshot_started.wait, 2)
+                )
+                self.assertFalse(await shutdown_phase)
+                retained = (
+                    set(agent_server.SERVER_SHUTDOWN_STRAGGLERS)
+                    - prior_stragglers
+                )
+                self.assertEqual(len(retained), 1)
+                self.assertEqual(peer.state, "closed")
+                self.assertFalse(runtime.capability()["available"])
+                self.assertIsNotNone(runtime._runtime_lease_fd)
+
+                # Lifespan proceeds to SECURE_PEER_RUNTIME.shutdown while the
+                # bounded Hub phase is still settling in the background.
+                peer.state = "shutdown"
+                release_snapshot.set()
+                await asyncio.gather(*retained, return_exceptions=True)
+                await asyncio.sleep(0)
+            finally:
+                release_snapshot.set()
+                if not shutdown_phase.done():
+                    shutdown_phase.cancel()
+                    await asyncio.gather(shutdown_phase, return_exceptions=True)
+
+            self.assertFalse(peer.reopened_after_shutdown)
+            self.assertEqual(peer.state, "shutdown")
+            self.assertFalse(runtime.capability()["available"])
+            self.assertIsNone(runtime._runtime_lease_fd)
+            replacement = host(root)
+            replacement.initialize()
+            self.assertTrue(replacement.capability()["available"])
+            await replacement.shutdown()
+
+    async def test_cancelled_secure_peer_drain_settles_close_before_reopening(
+        self,
+    ) -> None:
+        class BlockingSecurePeerManager:
+            def __init__(self) -> None:
+                self.admission_open = threading.Event()
+                self.close_started = threading.Event()
+                self.release_close = threading.Event()
+                self.reopen_calls = 0
+
+            def attach_host_hub(self, **_kwargs) -> None:
+                self.admission_open.set()
+
+            def close_host_admission(self) -> None:
+                self.admission_open.clear()
+                self.close_started.set()
+                if not self.release_close.wait(timeout=5):
+                    raise RuntimeError("test peer-close release timed out")
+
+            def reopen_host_admission(self) -> None:
+                self.reopen_calls += 1
+                self.admission_open.set()
+
+        with tempfile.TemporaryDirectory() as temporary:
+            peer_manager = BlockingSecurePeerManager()
+            runtime = ManagedTeamHubHost(
+                mode=TEAM_HUB_MODE_HOST,
+                data_dir=Path(temporary) / "hub",
+                server_identity=HOST_ID,
+                allowed_hosts={"localhost", "127.0.0.1"},
+                secure_peer_manager=peer_manager,
+            )
+            runtime.initialize()
+            self.assertTrue(runtime.capability()["available"])
+            self.assertTrue(peer_manager.admission_open.is_set())
+
+            join_entered = asyncio.Event()
+            original_join = (
+                team_hub_host_module._join_task_despite_caller_cancellation
+            )
+
+            async def observed_join(task):
+                join_entered.set()
+                return await original_join(task)
+
+            with patch.object(
+                team_hub_host_module,
+                "_join_task_despite_caller_cancellation",
+                observed_join,
+            ):
+                maintenance = asyncio.create_task(
+                    runtime.prepare_maintenance(
+                        "server-update",
+                        operation_id="update-close-cancelled",
+                    )
+                )
+                try:
+                    self.assertTrue(
+                        await asyncio.to_thread(peer_manager.close_started.wait, 5)
+                    )
+                    maintenance.cancel()
+                    await asyncio.wait_for(join_entered.wait(), 1)
+                    maintenance.cancel()
+                    await asyncio.sleep(0)
+                    self.assertFalse(maintenance.done())
+                    self.assertFalse(peer_manager.admission_open.is_set())
+
+                    peer_manager.release_close.set()
+                    with self.assertRaises(asyncio.CancelledError):
+                        await maintenance
+                finally:
+                    peer_manager.release_close.set()
+                    if not maintenance.done():
+                        maintenance.cancel()
+                        await asyncio.gather(maintenance, return_exceptions=True)
+
+            self.assertTrue(runtime.capability()["available"])
+            self.assertTrue(peer_manager.admission_open.is_set())
+            self.assertEqual(peer_manager.reopen_calls, 1)
+            await runtime.shutdown()
+
+    async def test_peer_reopen_error_keeps_local_and_peer_admission_closed(
+        self,
+    ) -> None:
+        class FailingReopenPeerManager:
+            def __init__(self) -> None:
+                self.admission_open = threading.Event()
+                self.reopen_calls = 0
+
+            def attach_host_hub(self, **_kwargs) -> None:
+                self.admission_open.set()
+
+            def close_host_admission(self) -> None:
+                self.admission_open.clear()
+
+            def reopen_host_admission(self) -> None:
+                self.reopen_calls += 1
+                raise RuntimeError("peer reopen failed")
+
+        with tempfile.TemporaryDirectory() as temporary:
+            peer_manager = FailingReopenPeerManager()
+            runtime = ManagedTeamHubHost(
+                mode=TEAM_HUB_MODE_HOST,
+                data_dir=Path(temporary) / "hub",
+                server_identity=HOST_ID,
+                allowed_hosts={"localhost", "127.0.0.1"},
+                secure_peer_manager=peer_manager,
+            )
+            runtime.initialize()
+            await runtime._close_and_drain()
+
+            with self.assertRaisesRegex(RuntimeError, "peer reopen failed"):
+                await runtime.reopen_admission()
+
+            self.assertFalse(runtime.capability()["available"])
+            self.assertFalse(peer_manager.admission_open.is_set())
+            self.assertEqual(peer_manager.reopen_calls, 1)
+            await runtime.shutdown()
+
+    async def test_cancelled_peer_reopen_publishes_consistent_state_after_worker(
+        self,
+    ) -> None:
+        class BlockingReopenPeerManager:
+            def __init__(self) -> None:
+                self.admission_open = threading.Event()
+                self.reopen_started = threading.Event()
+                self.release_reopen = threading.Event()
+
+            def attach_host_hub(self, **_kwargs) -> None:
+                self.admission_open.set()
+
+            def close_host_admission(self) -> None:
+                self.admission_open.clear()
+
+            def reopen_host_admission(self) -> None:
+                self.reopen_started.set()
+                if not self.release_reopen.wait(timeout=5):
+                    raise RuntimeError("test peer-reopen release timed out")
+                self.admission_open.set()
+
+        with tempfile.TemporaryDirectory() as temporary:
+            peer_manager = BlockingReopenPeerManager()
+            runtime = ManagedTeamHubHost(
+                mode=TEAM_HUB_MODE_HOST,
+                data_dir=Path(temporary) / "hub",
+                server_identity=HOST_ID,
+                allowed_hosts={"localhost", "127.0.0.1"},
+                secure_peer_manager=peer_manager,
+            )
+            runtime.initialize()
+            await runtime._close_and_drain()
+            self.assertFalse(runtime.capability()["available"])
+            self.assertFalse(peer_manager.admission_open.is_set())
+
+            join_entered = asyncio.Event()
+            original_join = (
+                team_hub_host_module._join_task_despite_caller_cancellation
+            )
+
+            async def observed_join(task):
+                join_entered.set()
+                return await original_join(task)
+
+            with patch.object(
+                team_hub_host_module,
+                "_join_task_despite_caller_cancellation",
+                observed_join,
+            ):
+                reopen = asyncio.create_task(runtime.reopen_admission())
+                try:
+                    self.assertTrue(
+                        await asyncio.to_thread(peer_manager.reopen_started.wait, 5)
+                    )
+                    reopen.cancel()
+                    await asyncio.wait_for(join_entered.wait(), 1)
+                    reopen.cancel()
+                    await asyncio.sleep(0)
+                    self.assertFalse(reopen.done())
+                    self.assertFalse(runtime.capability()["available"])
+                    self.assertFalse(peer_manager.admission_open.is_set())
+
+                    peer_manager.release_reopen.set()
+                    with self.assertRaises(asyncio.CancelledError):
+                        await reopen
+                finally:
+                    peer_manager.release_reopen.set()
+                    if not reopen.done():
+                        reopen.cancel()
+                        await asyncio.gather(reopen, return_exceptions=True)
+
+            self.assertTrue(runtime.capability()["available"])
+            self.assertTrue(peer_manager.admission_open.is_set())
             await runtime.shutdown()
 
     async def test_mounted_hub_is_local_only_and_server_bearer_is_not_hub_auth(self) -> None:
@@ -597,6 +1258,93 @@ class ManagedTeamHubHostTests(unittest.IsolatedAsyncioTestCase):
             self.assertTrue((root / "bootstrap-owner.proof").is_file())
             await second.shutdown()
 
+    async def test_same_authority_can_supersede_abandoned_remote_bootstrap(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary) / "hub"
+            runtime = tailnet_host(root, "server-instance-retry")
+            runtime.initialize()
+            first_request_id = "8a086971-b795-48ea-b150-256906ac554f"
+            first = await runtime.issue_tailnet_bootstrap_proof(
+                request_id=first_request_id,
+                server_identity=HOST_ID,
+                server_instance_id="server-instance-retry",
+                hub_url=TAILNET_HUB_URL,
+                tailnet_login="owner@example.com",
+                recipient_email="owner@example.com",
+                display_name="Owner",
+                device_label="Owner Mac",
+            )
+            with self.assertRaises(HubError) as blocked:
+                await runtime.issue_tailnet_bootstrap_proof(
+                    request_id="5d7b05df-23f7-43b9-aedd-016ce4ec0192",
+                    server_identity=HOST_ID,
+                    server_instance_id="server-instance-retry",
+                    hub_url=TAILNET_HUB_URL,
+                    tailnet_login="other@example.com",
+                    recipient_email="other@example.com",
+                    display_name="Other",
+                    device_label="Other Mac",
+                )
+            self.assertEqual(blocked.exception.code, "bootstrap_request_in_progress")
+            self.assertEqual(blocked.exception.status_code, 409)
+            self.assertEqual(
+                blocked.exception.message,
+                "Another bootstrap confirmation is still active",
+            )
+            replacement_request_id = "a3bfa9ce-0097-4190-bbca-cbd3f46fe20b"
+            replacement = await runtime.issue_tailnet_bootstrap_proof(
+                request_id=replacement_request_id,
+                server_identity=HOST_ID,
+                server_instance_id="server-instance-retry",
+                hub_url=TAILNET_HUB_URL,
+                tailnet_login="owner@example.com",
+                recipient_email="owner@example.com",
+                display_name="Renamed Owner",
+                device_label="Replacement Mac",
+            )
+            self.assertNotEqual(
+                replacement["bootstrap_proof"], first["bootstrap_proof"]
+            )
+
+            application = FastAPI()
+            application.mount("/api/team-hub", runtime)
+            serve = TestClient(
+                application,
+                base_url=f"http://{TAILNET_HOST}:8444",
+                client=("127.0.0.1", 41003),
+            )
+            stale = serve.post(
+                "/api/team-hub/v1/bootstrap/redeem",
+                headers={
+                    **TAILNET_HEADERS,
+                    "X-Team-Hub-Bootstrap-Proof": first["bootstrap_proof"],
+                    "X-Team-Hub-Bootstrap-Request-Id": first_request_id,
+                },
+                json={
+                    "email": "owner@example.com",
+                    "display_name": "Owner",
+                    "device_label": "Owner Mac",
+                },
+            )
+            self.assertEqual(stale.status_code, 403, stale.text)
+            redeemed = serve.post(
+                "/api/team-hub/v1/bootstrap/redeem",
+                headers={
+                    **TAILNET_HEADERS,
+                    "X-Team-Hub-Bootstrap-Proof": replacement[
+                        "bootstrap_proof"
+                    ],
+                    "X-Team-Hub-Bootstrap-Request-Id": replacement_request_id,
+                },
+                json={
+                    "email": "owner@example.com",
+                    "display_name": "Renamed Owner",
+                    "device_label": "Replacement Mac",
+                },
+            )
+            self.assertEqual(redeemed.status_code, 200, redeemed.text)
+            await runtime.shutdown()
+
     async def test_direct_ip_remote_bootstrap_is_bound_to_direct_route(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary) / "hub"
@@ -768,6 +1516,20 @@ class ManagedTeamHubHostTests(unittest.IsolatedAsyncioTestCase):
                 expected_hub_id=expected_hub_id,
                 expected_operation_id="bootstrap-drain-test",
             )
+            HubStore.confirm_restored_maintenance_snapshot(
+                runtime.data_dir,
+                snapshot,  # type: ignore[arg-type]
+                expected_host_identity=HOST_ID,
+                expected_hub_id=expected_hub_id,
+                expected_operation_id="bootstrap-drain-test",
+            )
+            HubStore.acknowledge_restored_maintenance_snapshot(
+                runtime.data_dir,
+                snapshot,  # type: ignore[arg-type]
+                expected_host_identity=HOST_ID,
+                expected_hub_id=expected_hub_id,
+                expected_operation_id="bootstrap-drain-test",
+            )
             restored = tailnet_host(runtime.data_dir, "server-instance-restored")
             restored.initialize()
             application = FastAPI()
@@ -803,9 +1565,15 @@ class ManagedTeamHubHostTests(unittest.IsolatedAsyncioTestCase):
                 "server-update",
                 operation_id="update-incomplete",
             )
+            hub_id = str(first.capability()["hub_id"])
             await first.shutdown()
 
-            second = host(root)
+            second = host(
+                root,
+                update_hub_id=hub_id,
+                update_operation_id="update-incomplete",
+                update_snapshot=snapshot,
+            )
             second.initialize()
             application = FastAPI()
             application.mount("/api/team-hub", second)
@@ -839,7 +1607,7 @@ class VendoredTeamHubParityTests(unittest.TestCase):
         expected = {
             "__init__.py": "154fbe20574096cff3a5012d8720d51e024c5f077cc1044c3ea6cd5ad6f96861",
             "auth.py": "8f3ff2c2bf12845041acdb5f3f489cef4a9d827feca4de6b3925e4456be98f3d",
-            "cli.py": "19ac402cceb29b5bb05cd31e507fffe38bc67f40433df336b1f95e4c3aace31d",
+            "cli.py": "c5827f30d90420d2e362389530154255ca6039c1c524edec29a5d219b96328d3",
             "database.py": "c7a9bb1e132e6eba5d20de358e3c83b43d36a893d324643a944ae54a802cfcab",
             "migrations/0001_identity_auth.sql": "f55a62bf6dec527e1f71df91975deaf371e2af8b6e457b9d5577437e914dc186",
             "migrations/0002_teamspace_ledger.sql": "9681100d3d6eb3986e133d761ce9d000dbcf10b5e50954c96bd168391ecacbf3",
@@ -851,12 +1619,13 @@ class VendoredTeamHubParityTests(unittest.TestCase):
             "migrations/0008_managed_server_session.sql": "487b29e425b7c53ef019e9ff476f4b18615c5142975c6d0bac8c134dc84e849c",
             "migrations/0009_team_messages.sql": "2ce774f0934e111c6443bda74fa7e8bbf8617094341c91b01b89cc0415eb05af",
             "migrations/0010_team_attachment_orphan_reclamation.sql": "85192a1c821378743a5abf89f916070cfccb1aa67a79eac95f6a07ec1d888bc5",
+            "migrations/0011_human_admin_paging.sql": "29d165f8397f13451422a63ce948c67de49774de6fbb77b70fdca09647bb46f5",
             "migrations/__init__.py": "aaf340c45c8d39c2939814977ba4cef8eb6b3bd0671b0f7542ebe06f5431d6ec",
             "security.py": "0c1895c7443e7be07a2f53c7e4c4228e3ee04c65d6cd36f039b7bbba1813e4fa",
-            "secure_peer.py": "f5f666b78527220c20462a7abdc6552aa217100b02818080756b52ad7a0de2fa",
-            "secure_peer_hub.py": "83c67c53a906877da9ab75029bbe87837a2b81fd2f45d6c12ef61b0ecf415f3d",
-            "service.py": "c5b2e58f519cc4f23b0f4823a10f24cedbdafd46c8e6a0dd1c3728d3dbf009c0",
-            "store.py": "ae7442c00700f03b8f0350be4ca97ab266cac4540d58519a7c48a90a897bdddf",
+            "secure_peer.py": "f7a1c9ca7296abbf218b6c30f928cc1c0eb7cc4f030334eef61644c0104db3da",
+            "secure_peer_hub.py": "81b2cf0284bc21589f141a42506fe4cfc2eccc5f750558e34608692649cc3100",
+            "service.py": "550ae9675fa64d285e9299f44359531eb2ac88e895d18365377abe38e34114a6",
+            "store.py": "a3568fe51a1ef39751d47c34fb45a2650f350c36138f48f3335400fd07b05145",
         }
         entries = list(vendored.rglob("*"))
         for path in entries:

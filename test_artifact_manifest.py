@@ -32,8 +32,19 @@ class ArtifactManifestContractTests(unittest.IsolatedAsyncioTestCase):
             with (
                 patch.object(agent_server, "STATE_DIR", root / "state"),
                 patch.object(agent_server, "FILES_ROOT", root / "published"),
+                patch.object(agent_server, "CODE_DIFFS_ROOT", root / "code-diffs"),
+                patch.object(
+                    agent_server,
+                    "CROSS_CHAT_AUTHORITY_ROOT",
+                    root / "cross-chat-authority",
+                ),
                 patch.object(agent_server, "EVENT_SEQ_CACHE", {}),
                 patch.object(agent_server.HUB, "broadcast", AsyncMock()),
+                patch.dict(
+                    agent_server.STORE.sessions,
+                    {"sess-artifacts": {"id": "sess-artifacts"}},
+                    clear=True,
+                ),
             ):
                 await agent_server.collect_manifest(
                     "sess-artifacts",

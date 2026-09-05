@@ -1,5 +1,8 @@
 import asyncio
+from contextlib import suppress
+import hashlib
 from pathlib import Path
+import sqlite3
 import tempfile
 import unittest
 from unittest.mock import patch
@@ -8,6 +11,7 @@ import agent_server
 from fastapi.testclient import TestClient
 
 from team_hub_host import TEAM_HUB_MODE_HOST, ManagedTeamHubHost
+from secure_peer_runtime import SecurePeerRuntime
 
 
 HOST_ID = "server-parent-integration-12345678"
@@ -693,6 +697,62 @@ class TeamHubParentIntegrationTests(unittest.TestCase):
                         second.json()["teams"][0]["id"],
                     )
 
+                    team_id = first.json()["teams"][0]["id"]
+                    attachment_bytes = b"server-session attachment"
+                    attachment = client.post(
+                        f"/api/team-hub-server/v1/teams/{team_id}/network/attachments",
+                        headers=headers,
+                        json={
+                            "file_name": "proof.bin",
+                            "media_type": "application/octet-stream",
+                            "byte_size": len(attachment_bytes),
+                            "sha256": hashlib.sha256(attachment_bytes).hexdigest(),
+                            "idempotency_key": "server-session-attachment-1",
+                        },
+                    )
+                    self.assertEqual(attachment.status_code, 200, attachment.text)
+                    attachment_id = attachment.json()["attachment"]["id"]
+                    content_path = (
+                        f"/api/team-hub-server/v1/teams/{team_id}/network/"
+                        f"attachments/{attachment_id}/content"
+                    )
+                    uploaded = client.put(
+                        content_path,
+                        headers={
+                            **headers,
+                            "Content-Type": "application/octet-stream",
+                            "Content-Range": (
+                                f"bytes 0-{len(attachment_bytes) - 1}/"
+                                f"{len(attachment_bytes)}"
+                            ),
+                        },
+                        content=attachment_bytes,
+                    )
+                    self.assertEqual(uploaded.status_code, 200, uploaded.text)
+                    downloaded = client.get(content_path, headers=headers)
+                    self.assertEqual(downloaded.status_code, 200, downloaded.text)
+                    self.assertEqual(downloaded.content, attachment_bytes)
+                    ranged = client.get(
+                        content_path,
+                        headers={**headers, "Range": "bytes=1-5"},
+                    )
+                    self.assertEqual(ranged.status_code, 206, ranged.text)
+                    self.assertEqual(ranged.content, attachment_bytes[1:6])
+                    headed = client.head(content_path, headers=headers)
+                    self.assertEqual(headed.status_code, 200, headed.text)
+                    self.assertEqual(headed.content, b"")
+                    query_rejected = client.get(
+                        content_path + "?download=1",
+                        headers=headers,
+                    )
+                    self.assertEqual(query_rejected.status_code, 422)
+                    malformed_upload = client.put(
+                        content_path,
+                        headers={**headers, "Content-Type": "application/json"},
+                        content=b"{}",
+                    )
+                    self.assertEqual(malformed_upload.status_code, 415)
+
                     for request_headers, expected in (
                         ({}, 401),
                         ({"X-AgentsDock-Token": "wrong"}, 401),
@@ -786,6 +846,77 @@ class TeamHubParentIntegrationTests(unittest.TestCase):
                 hub_mount.app = original_hub_mount
                 server_mount.app = original_server_mount
                 asyncio.run(runtime.shutdown())
+
+
+class TeamHubHealthResponsivenessTests(unittest.IsolatedAsyncioTestCase):
+    async def test_sqlite_lock_does_not_block_health_capability_heartbeat(self) -> None:
+        class DisabledHost:
+            designated_host = False
+
+            @staticmethod
+            def capability() -> dict[str, object]:
+                return {
+                    "available": False,
+                    "designated_host": False,
+                    "version": 1,
+                    "base_path": None,
+                    "transport": None,
+                    "hub_url": None,
+                    "routes": [],
+                    "hub_id": None,
+                    "host_server_identity": None,
+                    "message": "This server is not the designated host.",
+                    "action": None,
+                }
+
+        with tempfile.TemporaryDirectory() as temporary:
+            runtime = SecurePeerRuntime(
+                Path(temporary) / "secure-peers",
+                server_identity="health-source-server",
+                server_instance_id="health-source-instance",
+                display_name="Health source",
+            )
+            blocker = sqlite3.connect(
+                runtime.client.db_path,
+                timeout=1,
+                isolation_level=None,
+            )
+            blocker.execute("PRAGMA journal_mode=DELETE")
+            blocker.execute("BEGIN EXCLUSIVE")
+            state: dict[str, object | None] = {"loop": None, "task": None}
+            loop = asyncio.get_running_loop()
+            started = loop.time()
+            try:
+                with (
+                    patch.object(agent_server, "TEAM_HUB_RUNTIME", DisabledHost()),
+                    patch.object(agent_server, "SECURE_PEER_RUNTIME", runtime),
+                    patch.object(
+                        agent_server,
+                        "TEAM_HUB_HEALTH_CAPABILITY_STATE",
+                        state,
+                    ),
+                    patch.object(
+                        agent_server,
+                        "HEALTH_TEAM_HUB_CAPABILITY_TIMEOUT_SECONDS",
+                        0.02,
+                    ),
+                ):
+                    heartbeat = asyncio.create_task(asyncio.sleep(0.01))
+                    capability = await agent_server.team_hub_capability_for_health()
+                    await asyncio.wait_for(heartbeat, timeout=0.05)
+                    elapsed = loop.time() - started
+                    self.assertFalse(capability["available"])
+                    self.assertLess(elapsed, 0.1)
+
+                    worker = state.get("task")
+                    self.assertIsInstance(worker, asyncio.Task)
+                    blocker.rollback()
+                    blocker.close()
+                    await asyncio.wait_for(worker, timeout=1)  # type: ignore[arg-type]
+            finally:
+                with suppress(sqlite3.Error):
+                    blocker.rollback()
+                blocker.close()
 
 
 if __name__ == "__main__":

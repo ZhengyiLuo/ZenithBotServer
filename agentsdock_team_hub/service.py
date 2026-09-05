@@ -1,6 +1,7 @@
 """Strict loopback-first HTTP boundary for AgentsDock Team Hub V1."""
 
 import asyncio
+from collections import deque
 from dataclasses import dataclass
 import hashlib
 import ipaddress
@@ -10,19 +11,20 @@ from pathlib import Path
 import re
 import threading
 import time
-from typing import Annotated, Any, Literal
+from typing import Annotated, Any, Callable, Literal
 from urllib.parse import quote, urlsplit
 
 from fastapi import Depends, FastAPI, HTTPException, Query, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse, Response, StreamingResponse
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from .auth import AuthenticationError, AuthorizationError
 from .secure_peer import AttachmentFileLease
 from .store import (
     MAX_NETWORK_BODY_BYTES,
     MAX_NETWORK_PAGE_ITEMS,
+    MAX_HUMAN_ADMIN_PAGE_ITEMS,
     MAX_TEAM_MESSAGE_ATTACHMENTS,
     MAX_TEAM_MESSAGE_BODY_BYTES,
     MAX_TEAM_MESSAGE_RECIPIENTS,
@@ -63,29 +65,69 @@ class ManagedTransportIdentity:
     tailnet_user_name: str | None = None
 
 
+@dataclass
+class _RateBucket:
+    bins: deque[tuple[int, int]]
+    count: int
+    last_seen: float
+
+
 class _RateLimiter:
-    def __init__(self) -> None:
+    """Bounded rolling-window limiter with one-second accounting bins."""
+
+    def __init__(self, *, clock: Callable[[], float] | None = None) -> None:
         self._lock = threading.Lock()
-        self._buckets: dict[tuple[str, str], tuple[int, int]] = {}
+        self._clock = time.monotonic if clock is None else clock
+        self._buckets: dict[tuple[str, str], _RateBucket] = {}
+
+    def _prune_locked(self, now: float) -> None:
+        if len(self._buckets) <= 4096:
+            return
+        stale_before = now - 61.0
+        self._buckets = {
+            key: bucket
+            for key, bucket in self._buckets.items()
+            if bucket.last_seen > stale_before
+        }
+        if len(self._buckets) > 4096:
+            oldest = sorted(
+                self._buckets,
+                key=lambda key: self._buckets[key].last_seen,
+            )
+            for key in oldest[: len(self._buckets) - 4096]:
+                self._buckets.pop(key, None)
 
     def allow(self, peer: str, action: str, limit: int) -> bool:
-        window = int(time.monotonic() // 60)
+        if limit <= 0:
+            return False
         key = (peer, action)
         with self._lock:
-            prior_window, count = self._buckets.get(key, (window, 0))
-            if prior_window != window:
-                count = 0
-            count += 1
-            self._buckets[key] = (window, count)
-            if len(self._buckets) > 4096:
-                self._buckets = {
-                    item_key: item_value
-                    for item_key, item_value in self._buckets.items()
-                    if item_value[0] >= window - 1
-                }
-                while len(self._buckets) > 4096:
-                    self._buckets.pop(next(iter(self._buckets)))
-            return count <= limit
+            # Sample the clock only after acquiring the mutation lock. Two
+            # callers can otherwise sample in chronological order but acquire
+            # the lock in reverse order, leaving the pruning deque unsorted
+            # and regressing last_seen.
+            now = self._clock()
+            current_second = int(now)
+            cutoff = now - 60.0
+            bucket = self._buckets.get(key)
+            if bucket is None:
+                bucket = _RateBucket(deque(), 0, now)
+                self._buckets[key] = bucket
+            while bucket.bins and bucket.bins[0][0] + 1.0 <= cutoff:
+                _second, expired_count = bucket.bins.popleft()
+                bucket.count -= expired_count
+            bucket.last_seen = now
+            if bucket.count >= limit:
+                self._prune_locked(now)
+                return False
+            if bucket.bins and bucket.bins[-1][0] == current_second:
+                second, count = bucket.bins[-1]
+                bucket.bins[-1] = (second, count + 1)
+            else:
+                bucket.bins.append((current_second, 1))
+            bucket.count += 1
+            self._prune_locked(now)
+            return True
 
 
 class StrictModel(BaseModel):
@@ -110,6 +152,17 @@ class InviteRequest(StrictModel):
     invitee_email: str = Field(min_length=3, max_length=320)
     role: Literal["admin", "member", "guest"]
     ttl_seconds: int = Field(default=900, ge=30, le=86_400)
+
+
+class MembershipUpdateRequest(StrictModel):
+    role: Literal["admin", "member", "guest"] | None = None
+    status: Literal["active", "suspended", "revoked"] | None = None
+
+    @model_validator(mode="after")
+    def exactly_one_change(self) -> "MembershipUpdateRequest":
+        if (self.role is None) == (self.status is None):
+            raise ValueError("exactly one membership change is required")
+        return self
 
 
 class RedeemInviteRequest(StrictModel):
@@ -233,8 +286,19 @@ class TeamMessageRequest(StrictModel):
     )
     in_reply_to_message_id: str | None = Field(default=None, min_length=8, max_length=240)
     skill: TeamSkillDetailsRequest | None = None
-    provenance: dict[str, str] | None = None
+    provenance: dict[str, str | None] | None = None
     idempotency_key: str = Field(min_length=8, max_length=240)
+
+    @field_validator("provenance")
+    @classmethod
+    def validate_provenance_keys(
+        cls, value: dict[str, str | None] | None
+    ) -> dict[str, str | None] | None:
+        if value is not None and not set(value).issubset(
+            {"via", "backend", "chat_id", "run_id"}
+        ):
+            raise ValueError("Team Message provenance contains unknown fields")
+        return value
 
 
 class TeamReceiptRequest(StrictModel):
@@ -578,6 +642,12 @@ def create_app(
     managed_hub_url: str | None = None,
     managed_routes: dict[str, str] | None = None,
     secure_peer_manager: Any | None = None,
+    managed_reactivation_hub_id: str | None = None,
+    managed_reactivation_operation_id: str | None = None,
+    managed_reactivation_snapshot: Path | None = None,
+    managed_update_hub_id: str | None = None,
+    managed_update_operation_id: str | None = None,
+    managed_update_snapshot: Path | None = None,
     require_https_for_non_loopback: bool = False,
     require_loopback_transport: bool = False,
 ) -> FastAPI:
@@ -585,6 +655,12 @@ def create_app(
         Path(data_dir),
         managed_host_identity=managed_host_identity,
         managed_server_instance_id=managed_server_instance_id,
+        managed_reactivation_hub_id=managed_reactivation_hub_id,
+        managed_reactivation_operation_id=managed_reactivation_operation_id,
+        managed_reactivation_snapshot=managed_reactivation_snapshot,
+        managed_update_hub_id=managed_update_hub_id,
+        managed_update_operation_id=managed_update_operation_id,
+        managed_update_snapshot=managed_update_snapshot,
     )
     hosts = allowed_hosts or {"127.0.0.1", "localhost", "[::1]", "::1"}
     origins = allowed_origins or set()
@@ -689,7 +765,7 @@ def create_app(
             )
         if request.method == "OPTIONS":
             requested_method = request.headers.get("access-control-request-method")
-            if origin is None or requested_method not in {"GET", "POST"}:
+            if origin is None or requested_method not in {"GET", "POST", "PUT", "PATCH"}:
                 return _error("origin_forbidden", "Origin is not permitted", 403)
             requested_headers = request.headers.get("access-control-request-headers", "")
             allowed_request_headers = {
@@ -698,6 +774,7 @@ def create_app(
             if not allowed_request_headers.issubset(
                 {
                     "authorization",
+                    "content-range",
                     "content-type",
                     "x-team-hub-bootstrap-proof",
                     "x-team-hub-bootstrap-request-id",
@@ -710,26 +787,36 @@ def create_app(
                 status_code=204,
                 headers={
                     "Access-Control-Allow-Origin": origin,
-                    "Access-Control-Allow-Methods": "GET, POST",
+                    "Access-Control-Allow-Methods": "GET, POST, PUT, PATCH",
                     "Access-Control-Allow-Headers": requested_headers,
                     "Vary": "Origin",
                 },
             )
+
+        def with_allowed_origin(response: Response) -> Response:
+            if origin is not None:
+                response.headers["Access-Control-Allow-Origin"] = origin
+                response.headers["Vary"] = "Origin"
+            return response
+
         binary_lane_path = _mounted_route_path(request)
         binary_upload = (
             request.method == "PUT"
             and TEAM_ATTACHMENT_CONTENT_RE.fullmatch(binary_lane_path) is not None
         )
-        if request.method == "POST" or binary_upload:
+        unsafe_method = request.method not in {"GET", "HEAD", "OPTIONS"}
+        if unsafe_method:
             try:
                 maintenance_fenced = store.maintenance_fence() is not None
             except Exception:
                 maintenance_fenced = True
             if maintenance_fenced:
-                return _error(
-                    "hub_maintenance",
-                    "Team Hub is unavailable during server maintenance",
-                    503,
+                return with_allowed_origin(
+                    _error(
+                        "hub_maintenance",
+                        "Team Hub is unavailable during server maintenance",
+                        503,
+                    )
                 )
             if (
                 managed_identity is not None
@@ -754,72 +841,108 @@ def create_app(
             if binary_upload:
                 action, limit = "attachment_upload", 1_200
             else:
-                action = route_path if route_path in sensitive_limits else "other_post"
+                action = (
+                    route_path
+                    if route_path in sensitive_limits
+                    else f"other_{request.method.lower()}"
+                )
                 limit = sensitive_limits.get(route_path, 120)
             if (
                 not rate_limiter.allow(peer, action, limit)
                 or not rate_limiter.allow("*", action, limit * 100)
             ):
-                return _error("rate_limited", "Too many requests", 429)
+                return with_allowed_origin(
+                    _error("rate_limited", "Too many requests", 429)
+                )
         if values.get(b"transfer-encoding"):
-            return _error("invalid_request", "Transfer-Encoding is not accepted", 400)
+            return with_allowed_origin(
+                _error("invalid_request", "Transfer-Encoding is not accepted", 400)
+            )
         lengths = values.get(b"content-length", [])
         if len(lengths) > 1:
-            return _error("invalid_request", "Duplicate Content-Length is not accepted", 400)
+            return with_allowed_origin(
+                _error("invalid_request", "Duplicate Content-Length is not accepted", 400)
+            )
         if binary_upload:
             # Attachment chunks: exact octet-stream body, one Content-Range, no
             # JSON parsing. The route handler and store re-validate the range.
             if len(lengths) != 1:
-                return _error("invalid_request", "Exactly one Content-Length is required", 400)
+                return with_allowed_origin(
+                    _error("invalid_request", "Exactly one Content-Length is required", 400)
+                )
             try:
                 raw_length = lengths[0].decode("ascii")
                 body_length = int(raw_length, 10)
             except (UnicodeDecodeError, ValueError):
-                return _error("invalid_request", "Content-Length is invalid", 400)
+                return with_allowed_origin(
+                    _error("invalid_request", "Content-Length is invalid", 400)
+                )
             if raw_length != str(body_length) or not 1 <= body_length <= TEAM_ATTACHMENT_CHUNK_BYTES:
-                return _error("request_too_large", "Attachment chunk size is invalid", 413)
+                return with_allowed_origin(
+                    _error("request_too_large", "Attachment chunk size is invalid", 413)
+                )
             if values.get(b"content-type", []) != [b"application/octet-stream"]:
-                return _error(
-                    "invalid_request", "Content-Type must be application/octet-stream", 415
+                return with_allowed_origin(
+                    _error(
+                        "invalid_request",
+                        "Content-Type must be application/octet-stream",
+                        415,
+                    )
                 )
             if len(values.get(b"content-range", [])) != 1:
-                return _error("invalid_request", "Exactly one Content-Range is required", 400)
+                return with_allowed_origin(
+                    _error("invalid_request", "Exactly one Content-Range is required", 400)
+                )
         elif request.method in {"POST", "PUT", "PATCH"}:
             if len(lengths) != 1:
-                return _error("invalid_request", "Exactly one Content-Length is required", 400)
+                return with_allowed_origin(
+                    _error("invalid_request", "Exactly one Content-Length is required", 400)
+                )
             try:
                 raw_length = lengths[0].decode("ascii")
                 body_length = int(raw_length, 10)
             except (UnicodeDecodeError, ValueError):
-                return _error("invalid_request", "Content-Length is invalid", 400)
+                return with_allowed_origin(
+                    _error("invalid_request", "Content-Length is invalid", 400)
+                )
             if raw_length != str(body_length) or not 2 <= body_length <= MAX_JSON_BODY_BYTES:
-                return _error("invalid_request", "JSON body size is invalid", 413)
+                return with_allowed_origin(
+                    _error("invalid_request", "JSON body size is invalid", 413)
+                )
             content_types = values.get(b"content-type", [])
             if content_types != [b"application/json"]:
-                return _error("invalid_request", "Content-Type must be application/json", 415)
+                return with_allowed_origin(
+                    _error("invalid_request", "Content-Type must be application/json", 415)
+                )
             try:
                 body = await asyncio.wait_for(
                     request.body(), timeout=BODY_READ_TIMEOUT_SECONDS
                 )
-            except TimeoutError:
-                return _error("request_timeout", "Request body timed out", 408)
+            except asyncio.TimeoutError:
+                return with_allowed_origin(
+                    _error("request_timeout", "Request body timed out", 408)
+                )
             if len(body) != body_length:
-                return _error("invalid_request", "Content-Length does not match body", 400)
+                return with_allowed_origin(
+                    _error("invalid_request", "Content-Length does not match body", 400)
+                )
             try:
                 parsed = json.loads(body)
             except (UnicodeDecodeError, json.JSONDecodeError):
-                return _error("invalid_request", "Request body must be valid JSON", 400)
+                return with_allowed_origin(
+                    _error("invalid_request", "Request body must be valid JSON", 400)
+                )
             if not isinstance(parsed, dict):
-                return _error("invalid_request", "Request body must be a JSON object", 400)
+                return with_allowed_origin(
+                    _error("invalid_request", "Request body must be a JSON object", 400)
+                )
             try:
                 json.dumps(parsed, ensure_ascii=False).encode("utf-8")
             except UnicodeEncodeError:
-                return _error("invalid_request", "Request body contains invalid Unicode", 400)
-        response = await call_next(request)
-        if origin is not None:
-            response.headers["Access-Control-Allow-Origin"] = origin
-            response.headers["Vary"] = "Origin"
-        return response
+                return with_allowed_origin(
+                    _error("invalid_request", "Request body contains invalid Unicode", 400)
+                )
+        return with_allowed_origin(await call_next(request))
 
     @app.exception_handler(HubError)
     async def hub_error_handler(_request: Request, exc: HubError):
@@ -981,6 +1104,22 @@ def create_app(
     def revoke_session(body: RevokeSessionRequest, claims: Auth) -> dict[str, Any]:
         return store.revoke_session(claims, body.refresh_token)
 
+    @app.get("/v1/sessions")
+    def device_sessions(
+        claims: Auth,
+        limit: Annotated[int, Query(ge=1, le=MAX_HUMAN_ADMIN_PAGE_ITEMS)] = 50,
+        cursor: Annotated[str | None, Query(max_length=512)] = None,
+    ) -> dict[str, Any]:
+        return store.list_device_sessions_page(
+            claims,
+            limit=limit,
+            cursor=cursor,
+        )
+
+    @app.post("/v1/sessions/{session_id}/revoke")
+    def revoke_device_session(session_id: str, claims: Auth) -> dict[str, Any]:
+        return store.revoke_device_session(claims, session_id)
+
     @app.get("/v1/session")
     def session(claims: Auth) -> dict[str, Any]:
         return store.session_snapshot(claims)
@@ -994,14 +1133,64 @@ def create_app(
         return store.get_team(claims, team_id)
 
     @app.get("/v1/teams/{team_id}/members")
-    def members(team_id: str, claims: Auth) -> dict[str, Any]:
-        return store.list_members(claims, team_id)
+    def members(
+        team_id: str,
+        claims: Auth,
+        limit: Annotated[int, Query(ge=1, le=MAX_HUMAN_ADMIN_PAGE_ITEMS)] = 50,
+        cursor: Annotated[str | None, Query(max_length=512)] = None,
+    ) -> dict[str, Any]:
+        return store.list_members(claims, team_id, limit=limit, cursor=cursor)
+
+    @app.get("/v1/teams/{team_id}/members/{principal_id}")
+    def member(
+        team_id: str,
+        principal_id: str,
+        claims: Auth,
+    ) -> dict[str, Any]:
+        return store.get_member(claims, team_id, principal_id)
+
+    @app.patch("/v1/teams/{team_id}/members/{principal_id}")
+    def update_member(
+        team_id: str,
+        principal_id: str,
+        body: MembershipUpdateRequest,
+        claims: Auth,
+    ) -> dict[str, Any]:
+        return store.update_human_membership(
+            claims,
+            team_id,
+            principal_id,
+            role=body.role,
+            status=body.status,
+        )
 
     @app.post("/v1/teams/{team_id}/invitations")
     def invite(team_id: str, body: InviteRequest, claims: Auth) -> dict[str, Any]:
         return store.issue_invite(
             claims, team_id, body.invitee_email, body.role, body.ttl_seconds
         )
+
+    @app.get("/v1/teams/{team_id}/invitations")
+    def pending_invitations(
+        team_id: str,
+        claims: Auth,
+        limit: Annotated[int, Query(ge=1, le=MAX_HUMAN_ADMIN_PAGE_ITEMS)] = 50,
+        cursor: Annotated[str | None, Query(max_length=512)] = None,
+    ) -> dict[str, Any]:
+        return store.list_pending_invitations(
+            claims,
+            team_id,
+            limit=limit,
+            cursor=cursor,
+        )
+
+    @app.post("/v1/teams/{team_id}/invitations/{invitation_id}/revoke")
+    def revoke_invitation(
+        team_id: str,
+        invitation_id: str,
+        claims: Auth,
+    ) -> dict[str, Any]:
+        return store.revoke_invitation(claims, team_id, invitation_id)
 
     @app.post("/v1/invitations/redeem")
     def redeem_invite(body: RedeemInviteRequest) -> dict[str, Any]:
@@ -1088,6 +1277,14 @@ def create_app(
             after_server_id=after_server_id,
             limit=limit,
         )
+
+    @app.get("/v1/teams/{team_id}/network/servers/{server_id}")
+    def network_server(
+        team_id: str,
+        server_id: str,
+        claims: Auth,
+    ) -> dict[str, Any]:
+        return store.get_network_server(claims, team_id, server_id)
 
     @app.post("/v1/teams/{team_id}/network/agents")
     def register_network_agent(

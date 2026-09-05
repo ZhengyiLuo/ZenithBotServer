@@ -5,7 +5,7 @@ requires-python = ">=3.10"
 dependencies = [
   "claude-agent-sdk==0.2.130",
   "croniter>=6,<7",
-  "cryptography>=44,<47",
+  "cryptography>=50.0.1,<51",
   "fastapi>=0.115,<1",
   "pydantic>=2.10,<3",
   "python-dateutil>=2.9,<3",
@@ -18,3 +18,12 @@ dependencies = [
 [tool.uv]
 package = false
 no-binary-package = ["claude-agent-sdk"]
+build-constraint-dependencies = [
+  "hatchling==1.32.0",
+  "packaging==26.3",
+  "pathspec==1.1.1",
+  "pluggy==1.6.0",
+  "tomli==2.4.1; python_version < '3.11'",
+  "tomlkit==0.15.1",
+  "trove-classifiers==2026.6.1.19",
+]

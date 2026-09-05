@@ -6,7 +6,8 @@ from collections import deque
 from pathlib import Path
 from unittest.mock import AsyncMock, Mock, patch
 
-from fastapi import HTTPException
+from fastapi import HTTPException, Request
+from fastapi.testclient import TestClient
 
 import agent_server
 
@@ -75,6 +76,153 @@ class CodexGoalsAdminTests(unittest.IsolatedAsyncioTestCase):
         agent_server.CODEX_SUBAGENT_LIVE_GENERATIONS = (
             self.previous_live_generations
         )
+
+    async def test_admin_endpoint_direct_invocation_repeats_native_auth(self) -> None:
+        request = Request({
+            "type": "http",
+            "method": "PUT",
+            "path": "/api/admin/codex/goals",
+            "headers": [
+                (b"x-agentsdock-token", b"test-secret"),
+                (b"x-zenithdock-token", b"test-secret"),
+            ],
+            "query_string": b"",
+            "scheme": "http",
+            "server": ("127.0.0.1", 7850),
+            "client": ("127.0.0.1", 41000),
+        })
+        with patch.object(agent_server, "AGENT_TOKEN", "test-secret"):
+            with self.assertRaises(HTTPException) as raised:
+                await agent_server.put_codex_goals_admin_endpoint(
+                    agent_server.CodexGoalsAdminRequest(enabled=False),
+                    request,
+                )
+
+        self.assertEqual(raised.exception.status_code, 401)
+
+    def test_admin_routes_reject_query_and_browser_credentials_before_parsing(self) -> None:
+        with patch.object(agent_server, "AGENT_TOKEN", "test-secret"):
+            client = TestClient(agent_server.app)
+            cases = (
+                ("GET", "/api/admin/codex/goals?token=test-secret", {}, None, 401),
+                (
+                    "PUT",
+                    "/api/admin/codex/goals?token=test-secret",
+                    {"Content-Type": "application/json"},
+                    b"{",
+                    401,
+                ),
+                (
+                    "GET",
+                    "/api/admin/codex/goals",
+                    {
+                        "Origin": "https://attacker.example",
+                        "X-AgentsDock-Token": "test-secret",
+                    },
+                    None,
+                    403,
+                ),
+                (
+                    "PUT",
+                    "/api/admin/codex/goals",
+                    {
+                        "Origin": "https://attacker.example",
+                        "X-AgentsDock-Token": "test-secret",
+                        "Content-Type": "application/json",
+                    },
+                    b"{",
+                    403,
+                ),
+            )
+            for method, path, headers, body, expected in cases:
+                with self.subTest(method=method, path=path, expected=expected):
+                    response = client.request(
+                        method,
+                        path,
+                        headers=headers,
+                        content=body,
+                    )
+
+                    self.assertEqual(response.status_code, expected)
+
+    def test_admin_routes_require_exactly_one_supported_token_header(self) -> None:
+        cases = (
+            [("Authorization", "Bearer test-secret")],
+            [
+                ("X-AgentsDock-Token", "test-secret"),
+                ("X-AgentsDock-Token", "test-secret"),
+            ],
+            [
+                ("X-AgentsDock-Token", "test-secret"),
+                ("X-ZenithDock-Token", "test-secret"),
+            ],
+        )
+        with patch.object(agent_server, "AGENT_TOKEN", "test-secret"):
+            client = TestClient(agent_server.app)
+            for headers in cases:
+                with self.subTest(headers=headers):
+                    response = client.get(
+                        "/api/admin/codex/goals",
+                        headers=headers,
+                    )
+
+                    self.assertEqual(response.status_code, 401)
+
+    def test_admin_put_has_exact_small_json_transport_contract(self) -> None:
+        cases = (
+            (
+                {
+                    "X-AgentsDock-Token": "test-secret",
+                    "Content-Type": "text/plain",
+                },
+                b'{"enabled":true}',
+                415,
+            ),
+            (
+                {
+                    "X-AgentsDock-Token": "test-secret",
+                    "Content-Type": "application/json",
+                    "Transfer-Encoding": "chunked",
+                },
+                b'{"enabled":true}',
+                400,
+            ),
+            (
+                {
+                    "X-AgentsDock-Token": "test-secret",
+                    "Content-Type": "application/json",
+                    # This endpoint has one boolean field; 256 bytes leaves
+                    # ample wire-format headroom without permitting an
+                    # attacker-controlled generic JSON allocation.
+                    "Content-Length": "257",
+                },
+                b'{"enabled":true}',
+                413,
+            ),
+        )
+        with patch.object(agent_server, "AGENT_TOKEN", "test-secret"):
+            client = TestClient(agent_server.app)
+            for headers, body, expected in cases:
+                with self.subTest(headers=headers, expected=expected):
+                    response = client.put(
+                        "/api/admin/codex/goals",
+                        headers=headers,
+                        content=body,
+                    )
+
+                    self.assertEqual(response.status_code, expected)
+
+    def test_admin_routes_keep_both_current_native_client_headers(self) -> None:
+        with patch.object(agent_server, "AGENT_TOKEN", "test-secret"):
+            client = TestClient(agent_server.app)
+            for name in ("X-AgentsDock-Token", "X-ZenithDock-Token"):
+                with self.subTest(header=name):
+                    response = client.get(
+                        "/api/admin/codex/goals",
+                        headers={name: "test-secret"},
+                    )
+
+                    self.assertEqual(response.status_code, 200)
 
     def test_setting_defaults_enabled_and_reads_persisted_choice(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

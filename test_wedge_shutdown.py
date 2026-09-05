@@ -4,6 +4,7 @@ restart that never finishes, and forced kills that orphan Codex children."""
 import asyncio
 import json
 import os
+import re
 import signal
 import subprocess
 import tempfile
@@ -31,6 +32,24 @@ def fake_ps(table: dict[int, dict[str, str]]):
         return subprocess.CompletedProcess(args, 0, stdout=stdout + "\n", stderr="")
 
     return run
+
+
+def provider_child_entry(
+    pid: int,
+    *,
+    command: str = "node codex app-server --listen stdio://",
+) -> dict[str, object]:
+    return {
+        "pid": pid,
+        "pgid": pid,
+        "kind": "codex-app-server",
+        "boot_identity": "test-boot",
+        "process_start_identity": f"start-{pid}",
+        "executable_identity": "/usr/bin/node",
+        "command_fingerprint": (
+            agent_server.provider_child_command_fingerprint(command)
+        ),
+    }
 
 
 class RestartWatchdogTests(unittest.TestCase):
@@ -112,6 +131,26 @@ class RestartWatchdogTests(unittest.TestCase):
                  patch.object(agent_server.os, "kill", side_effect=record_kill), \
                  patch.object(agent_server.os, "killpg", side_effect=record_killpg), \
                  patch.object(
+                     agent_server,
+                     "provider_host_boot_identity",
+                     return_value="test-boot",
+                 ), \
+                 patch.object(
+                     agent_server,
+                     "provider_child_process_start_identity",
+                     side_effect=lambda pid: f"start-{pid}",
+                 ), \
+                 patch.object(
+                     agent_server,
+                     "provider_child_executable_identity",
+                     return_value="/usr/bin/node",
+                 ), \
+                 patch.object(
+                     agent_server,
+                     "process_group_for_pid",
+                     side_effect=lambda pid: pid,
+                 ), \
+                 patch.object(
                      agent_server.subprocess,
                      "run",
                      side_effect=fake_ps({
@@ -120,12 +159,12 @@ class RestartWatchdogTests(unittest.TestCase):
                      }),
                  ):
                 agent_server.write_provider_children_registry([
-                    {"pid": 4321, "pgid": 4321, "kind": "codex-app-server"},
+                    provider_child_entry(4321),
                     # Recycled pid now running something else: never signal.
-                    {"pid": 4444, "pgid": 4444, "kind": "codex-app-server"},
-                    # Leader already gone; its group may still hold helpers,
-                    # so the group is signalled anyway (harmless when empty).
-                    {"pid": 4555, "pgid": 4555, "kind": "codex-app-server"},
+                    provider_child_entry(4444),
+                    # A dead leader cannot authenticate a surviving numeric
+                    # PGID; it may have been reused after a reboot/hard kill.
+                    provider_child_entry(4555),
                 ])
                 agent_server.force_kill_managed_server_after_deadline("req", 321)
 
@@ -133,7 +172,6 @@ class RestartWatchdogTests(unittest.TestCase):
             order,
             [
                 ("killpg", 4321, signal.SIGKILL),
-                ("killpg", 4555, signal.SIGKILL),
                 ("kill", 321, signal.SIGKILL),
             ],
         )
@@ -165,7 +203,32 @@ class ProviderChildRegistryTests(unittest.TestCase):
     def test_register_and_unregister_round_trip(self):
         with tempfile.TemporaryDirectory() as temporary:
             registry = Path(temporary) / "admin" / "provider-children.json"
-            with patch.object(agent_server, "PROVIDER_CHILDREN_FILE", registry):
+            with patch.object(agent_server, "PROVIDER_CHILDREN_FILE", registry), \
+                 patch.object(
+                     agent_server,
+                     "provider_host_boot_identity",
+                     return_value="test-boot",
+                 ), \
+                 patch.object(
+                     agent_server,
+                     "provider_child_process_start_identity",
+                     return_value="start-4321",
+                 ), \
+                 patch.object(
+                     agent_server,
+                     "provider_child_executable_identity",
+                     return_value="/usr/bin/node",
+                 ), \
+                 patch.object(
+                     agent_server,
+                     "provider_child_command_line",
+                     return_value="node codex app-server --listen stdio://",
+                 ), \
+                 patch.object(
+                     agent_server,
+                     "process_group_for_pid",
+                     return_value=4321,
+                 ):
                 agent_server.register_provider_child(4321, 4321)
                 children = agent_server.read_provider_children_registry()
                 on_disk = json.loads(registry.read_text())
@@ -179,6 +242,10 @@ class ProviderChildRegistryTests(unittest.TestCase):
         self.assertEqual(children[0]["kind"], "codex-app-server")
         self.assertEqual(children[0]["owner_pid"], os.getpid())
         self.assertTrue(children[0]["started_at"])
+        self.assertEqual(children[0]["boot_identity"], "test-boot")
+        self.assertEqual(children[0]["process_start_identity"], "start-4321")
+        self.assertEqual(children[0]["executable_identity"], "/usr/bin/node")
+        self.assertRegex(children[0]["command_fingerprint"], r"^[0-9a-f]{64}$")
         self.assertEqual(on_disk["children"][0]["pid"], 4321)
         self.assertEqual(after_remove, [])
         self.assertEqual(after_remove_on_disk, {"children": []})
@@ -226,6 +293,26 @@ class ProviderChildSweepTests(unittest.TestCase):
                  patch.object(agent_server.os, "kill") as kill, \
                  patch.object(agent_server.os, "killpg") as killpg, \
                  patch.object(
+                     agent_server,
+                     "provider_host_boot_identity",
+                     return_value="test-boot",
+                 ), \
+                 patch.object(
+                     agent_server,
+                     "provider_child_process_start_identity",
+                     side_effect=lambda pid: f"start-{pid}",
+                 ), \
+                 patch.object(
+                     agent_server,
+                     "provider_child_executable_identity",
+                     return_value="/usr/bin/node",
+                 ), \
+                 patch.object(
+                     agent_server,
+                     "process_group_for_pid",
+                     side_effect=lambda pid: pid,
+                 ), \
+                 patch.object(
                      agent_server.subprocess,
                      "run",
                      side_effect=fake_ps({
@@ -234,12 +321,15 @@ class ProviderChildSweepTests(unittest.TestCase):
                          # Reparented but no longer Codex: leave it alone.
                          7000: {"ppid": "1", "command": "sleep 100"},
                      }),
-                 ), \
+                ), \
                  self.assertLogs(agent_server.logger, level="WARNING") as logs:
                 agent_server.write_provider_children_registry([
-                    {"pid": 5000, "pgid": 5000, "kind": "codex-app-server"},
-                    {"pid": 6000, "pgid": 6000, "kind": "codex-app-server"},
-                    {"pid": 7000, "pgid": 7000, "kind": "codex-app-server"},
+                    provider_child_entry(
+                        5000,
+                        command="codex app-server --listen stdio://",
+                    ),
+                    provider_child_entry(6000, command="codex app-server"),
+                    provider_child_entry(7000),
                 ])
                 reaped = agent_server.sweep_orphaned_provider_children()
                 remaining = agent_server.read_provider_children_registry()
@@ -267,14 +357,14 @@ class ProviderChildSweepTests(unittest.TestCase):
                 self.assertEqual(agent_server.sweep_orphaned_provider_children(), 0)
                 self.assertFalse(registry.exists())
                 agent_server.write_provider_children_registry([
-                    {"pid": 5000, "pgid": 5000, "kind": "codex-app-server"},
+                    provider_child_entry(5000),
                 ])
                 self.assertEqual(agent_server.sweep_orphaned_provider_children(), 0)
                 remaining = agent_server.read_provider_children_registry()
 
-        # A dead leader does not prove the group is gone (helpers such as
-        # codex-code-mode-host outlive it), so the group is still signalled.
-        killpg.assert_called_once_with(5000, signal.SIGKILL)
+        # A dead leader cannot prove the numeric group still belongs to this
+        # boot/process. Dropping the stale row is safer than killpg reuse.
+        killpg.assert_not_called()
         self.assertEqual(remaining, [])
 
 
@@ -343,6 +433,41 @@ class BoundedShutdownPhaseTests(unittest.IsolatedAsyncioTestCase):
             self.assertFalse(await agent_server.bounded_shutdown_phase("broken", broken()))
         self.assertTrue(await agent_server.bounded_shutdown_phase("fine", fine()))
 
+    async def test_phase_suppressing_cancellation_cannot_defeat_deadline(self):
+        release = asyncio.Event()
+        cancellation_suppressed = asyncio.Event()
+        prior_stragglers = set(agent_server.SERVER_SHUTDOWN_STRAGGLERS)
+
+        async def stubborn() -> None:
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                cancellation_suppressed.set()
+                await release.wait()
+
+        loop = asyncio.get_running_loop()
+        started = loop.time()
+        completed = await agent_server.bounded_shutdown_phase(
+            "stubborn",
+            stubborn(),
+            timeout=0.01,
+        )
+        elapsed = loop.time() - started
+        await asyncio.wait_for(cancellation_suppressed.wait(), timeout=1)
+        retained = (
+            set(agent_server.SERVER_SHUTDOWN_STRAGGLERS) - prior_stragglers
+        )
+
+        self.assertFalse(completed)
+        self.assertLess(elapsed, 0.5)
+        self.assertEqual(len(retained), 1)
+        release.set()
+        await asyncio.gather(*retained, return_exceptions=True)
+        await asyncio.sleep(0)
+        self.assertFalse(
+            retained.intersection(agent_server.SERVER_SHUTDOWN_STRAGGLERS)
+        )
+
     async def test_join_cancelled_tasks_swallows_cancellation(self):
         async def forever() -> None:
             await asyncio.sleep(3600)
@@ -370,6 +495,34 @@ class UvicornShutdownSettingTests(unittest.TestCase):
             {"AGENTSDOCK_UVICORN_GRACEFUL_SHUTDOWN_SECONDS": "not-a-number"},
         ):
             self.assertEqual(agent_server.uvicorn_graceful_shutdown_seconds(), 20)
+
+    def test_override_is_finite_and_capped_to_installer_stop_budget(self):
+        for configured in ("600", "inf", "nan"):
+            with self.subTest(configured=configured), patch.dict(
+                os.environ,
+                {"AGENTSDOCK_UVICORN_GRACEFUL_SHUTDOWN_SECONDS": configured},
+            ):
+                value = agent_server.uvicorn_graceful_shutdown_seconds()
+                self.assertGreaterEqual(value, 1)
+                self.assertLessEqual(
+                    value,
+                    agent_server.MAX_UVICORN_GRACEFUL_SHUTDOWN_SECONDS,
+                )
+
+        installer = Path(agent_server.__file__).with_name("install.sh").read_text()
+        attempts = int(
+            re.search(r"^LAUNCHCTL_STOP_ATTEMPTS=(\d+)$", installer, re.MULTILINE).group(1)
+        )
+        delay = float(
+            re.search(r"^LAUNCHCTL_STOP_DELAY=([0-9.]+)$", installer, re.MULTILINE).group(1)
+        )
+        watchdog_budget = (
+            agent_server.MAX_UVICORN_GRACEFUL_SHUTDOWN_SECONDS
+            + agent_server.SERVER_SHUTDOWN_PHASE_COUNT
+            * agent_server.SERVER_SHUTDOWN_PHASE_TIMEOUT_SECONDS
+            + 5.0
+        )
+        self.assertGreaterEqual(attempts * delay, watchdog_budget + 30.0)
 
 
 if __name__ == "__main__":

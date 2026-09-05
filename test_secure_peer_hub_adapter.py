@@ -109,6 +109,76 @@ class SecurePeerHubAdapterTests(unittest.TestCase):
         self.assertEqual(value["teams"][0]["role"], "automation")
         self.assertEqual(value["teams"][0]["status"], "active")
 
+    def test_member_projection_pages_past_fifty_without_truncation(self) -> None:
+        timestamp = int(time.time())
+        connection = self.store.connect()
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            for index in range(55):
+                principal_id = f"principal_page_member_{index:04d}"
+                connection.execute(
+                    """
+                    INSERT INTO principals(
+                        id,kind,scope_team_id,display_name,status,created_at,updated_at
+                    ) VALUES (?, 'human', NULL, ?, 'active', ?, ?)
+                    """,
+                    (principal_id, f"Member {index:04d}", timestamp, timestamp),
+                )
+                connection.execute(
+                    "INSERT INTO human_accounts(principal_id,email_normalized,created_at) "
+                    "VALUES (?,?,?)",
+                    (principal_id, f"member-{index:04d}@example.test", timestamp),
+                )
+                connection.execute(
+                    """
+                    INSERT INTO memberships(
+                        id,team_id,principal_id,role,status,invited_by_principal_id,
+                        created_at,updated_at
+                    ) VALUES (?,?,?,'member','active',?,?,?)
+                    """,
+                    (
+                        f"membership_page_member_{index:04d}",
+                        self.team_id,
+                        principal_id,
+                        self.owner.principal_id,
+                        timestamp,
+                        timestamp,
+                    ),
+                )
+            connection.execute("COMMIT")
+        except BaseException:
+            if connection.in_transaction:
+                connection.execute("ROLLBACK")
+            raise
+        finally:
+            connection.close()
+
+        first = self.request(
+            "GET",
+            f"/v1/teams/{self.team_id}/members",
+            query="limit=50",
+        )
+        self.assertEqual(first.status, 200, first.body)
+        first_value = json.loads(first.body)
+        self.assertEqual(len(first_value["members"]), 50)
+        self.assertTrue(first_value["has_more"])
+        self.assertIsInstance(first_value["next_cursor"], str)
+        second = self.request(
+            "GET",
+            f"/v1/teams/{self.team_id}/members",
+            query="limit=50&cursor=" + first_value["next_cursor"],
+        )
+        self.assertEqual(second.status, 200, second.body)
+        second_value = json.loads(second.body)
+        self.assertFalse(second_value["has_more"])
+        projected = first_value["members"] + second_value["members"]
+        projected_ids = {item["principal_id"] for item in projected}
+        self.assertEqual(len(projected_ids), len(projected))
+        self.assertTrue(
+            {f"principal_page_member_{index:04d}" for index in range(55)}
+            .issubset(projected_ids)
+        )
+
     def test_message_round_trip_uses_no_bearer_and_rejects_extra_fields(self) -> None:
         created = self.request(
             "POST",

@@ -51,7 +51,7 @@ class DatabaseTests(unittest.TestCase):
         connection = open_database()
         self.addCleanup(connection.close)
 
-        self.assertEqual(LATEST_SCHEMA_VERSION, 10)
+        self.assertEqual(LATEST_SCHEMA_VERSION, 11)
         self.assertEqual(
             connection.execute("PRAGMA user_version").fetchone()[0],
             LATEST_SCHEMA_VERSION,

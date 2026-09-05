@@ -9,10 +9,226 @@ from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import agent_server
-from fastapi import HTTPException
+from fastapi import HTTPException, Request
+from fastapi.testclient import TestClient
 
 
 class ServerUpdateEndpointTests(unittest.IsolatedAsyncioTestCase):
+    async def test_update_endpoint_direct_invocation_repeats_native_auth(self):
+        request = Request({
+            "type": "http",
+            "method": "POST",
+            "path": "/api/admin/update/start",
+            "headers": [(b"authorization", b"Bearer test-secret")],
+            "query_string": b"",
+            "scheme": "http",
+            "server": ("127.0.0.1", 7850),
+            "client": ("127.0.0.1", 41000),
+        })
+        with patch.object(agent_server, "AGENT_TOKEN", "test-secret"):
+            with self.assertRaises(HTTPException) as raised:
+                await agent_server.start_server_update_endpoint(
+                    agent_server.ServerUpdateRequest(
+                        version="1.1.0",
+                        expected_server_identity="server-test",
+                        expected_server_instance_id="instance-test",
+                    ),
+                    request,
+                )
+
+        self.assertEqual(raised.exception.status_code, 401)
+
+    def test_update_admin_routes_reject_query_credentials_before_body_parsing(self):
+        cases = (
+            ("GET", "/api/admin/update?token=test-secret", None),
+            ("POST", "/api/admin/update/check?token=test-secret", b"{"),
+            ("POST", "/api/admin/update/start?token=test-secret", b"{"),
+            ("POST", "/api/admin/update/cancel?token=test-secret", b"{"),
+        )
+        with patch.object(agent_server, "AGENT_TOKEN", "test-secret"):
+            client = TestClient(agent_server.app)
+            for method, path, body in cases:
+                with self.subTest(method=method, path=path):
+                    response = client.request(
+                        method,
+                        path,
+                        content=body,
+                        headers=(
+                            {"Content-Type": "application/json"}
+                            if body is not None
+                            else None
+                        ),
+                    )
+
+                    self.assertEqual(response.status_code, 401)
+
+    def test_update_admin_routes_reject_browser_origins_before_body_parsing(self):
+        cases = (
+            ("GET", "/api/admin/update", None),
+            ("POST", "/api/admin/update/check", b"{"),
+            ("POST", "/api/admin/update/start", b"{"),
+            ("POST", "/api/admin/update/cancel", b"{"),
+        )
+        with patch.object(agent_server, "AGENT_TOKEN", "test-secret"):
+            client = TestClient(agent_server.app)
+            for method, path, body in cases:
+                with self.subTest(method=method, path=path):
+                    response = client.request(
+                        method,
+                        path,
+                        content=body,
+                        headers={
+                            "Origin": "https://attacker.example",
+                            "X-AgentsDock-Token": "test-secret",
+                            **(
+                                {"Content-Type": "application/json"}
+                                if body is not None
+                                else {}
+                            ),
+                        },
+                    )
+
+                    self.assertEqual(response.status_code, 403)
+
+    def test_update_admin_routes_require_exactly_one_supported_token_header(self):
+        cases = (
+            [("Authorization", "Bearer test-secret")],
+            [
+                ("X-AgentsDock-Token", "test-secret"),
+                ("X-AgentsDock-Token", "test-secret"),
+            ],
+            [
+                ("X-AgentsDock-Token", "test-secret"),
+                ("X-ZenithDock-Token", "test-secret"),
+            ],
+        )
+        with patch.object(agent_server, "AGENT_TOKEN", "test-secret"):
+            client = TestClient(agent_server.app)
+            for headers in cases:
+                with self.subTest(headers=headers):
+                    response = client.get(
+                        "/api/admin/update",
+                        headers=headers,
+                    )
+
+                    self.assertEqual(response.status_code, 401)
+
+    def test_update_admin_routes_bound_body_before_model_parsing(self):
+        with patch.object(agent_server, "AGENT_TOKEN", "test-secret"):
+            client = TestClient(agent_server.app)
+            response = client.post(
+                "/api/admin/update/start",
+                headers={
+                    "X-AgentsDock-Token": "test-secret",
+                    "Content-Type": "application/json",
+                    "Content-Length": str(
+                        agent_server.PRIVILEGED_NATIVE_UPDATE_MAX_BODY_BYTES + 1
+                    ),
+                },
+                content=b"{",
+            )
+
+        self.assertEqual(response.status_code, 413)
+
+    def test_update_status_and_cancel_keep_legacy_mobile_header_and_unbound_shape(self):
+        with tempfile.TemporaryDirectory() as temporary, \
+             patch.object(agent_server, "AGENT_TOKEN", "test-secret"), \
+             patch.object(
+                 agent_server,
+                 "SERVER_UPDATE_STATUS_FILE",
+                 Path(temporary) / "status.json",
+             ), \
+             patch.object(
+                 agent_server,
+                 "schedule_rebuilt_queued_turns",
+                 return_value=0,
+             ):
+            pending = agent_server.write_fresh_server_update_status(
+                phase=agent_server.SERVER_UPDATE_PENDING_PHASE,
+                schedule_id="a" * 32,
+                target_version="1.1.0",
+                latest_version="1.1.0",
+                track="stable",
+                when_idle=True,
+                cancelable=True,
+            )
+            client = TestClient(agent_server.app)
+
+            canonical_status_response = client.get(
+                "/api/admin/update",
+                headers={"X-AgentsDock-Token": "test-secret"},
+            )
+            status_response = client.get(
+                "/api/admin/update",
+                headers={"X-ZenithDock-Token": "test-secret"},
+            )
+            cancel_response = client.post(
+                "/api/admin/update/cancel",
+                headers={"X-ZenithDock-Token": "test-secret"},
+                json={"schedule_id": pending["schedule_id"]},
+            )
+
+        self.assertEqual(canonical_status_response.status_code, 200)
+        self.assertEqual(canonical_status_response.json()["phase"], "pending")
+        self.assertEqual(status_response.status_code, 200)
+        self.assertEqual(status_response.json()["phase"], "pending")
+        self.assertEqual(cancel_response.status_code, 200)
+        self.assertEqual(cancel_response.json()["phase"], "available")
+
+    def test_update_check_and_start_require_exact_live_target(self):
+        with tempfile.TemporaryDirectory() as temporary, \
+             patch.object(agent_server, "AGENT_TOKEN", "test-secret"), \
+             patch.object(agent_server, "SERVER_VERSION", "1.0.0"), \
+             patch.object(agent_server, "SERVER_INSTANCE_ID", "instance-test"), \
+             patch.object(agent_server, "server_identity", return_value="server-test"), \
+             patch.object(
+                 agent_server,
+                 "SERVER_UPDATE_STATUS_FILE",
+                 Path(temporary) / "status.json",
+             ), \
+             patch.object(
+                 agent_server,
+                 "signed_release_manifest",
+                 AsyncMock(return_value={"version": "1.0.0"}),
+             ):
+            client = TestClient(agent_server.app)
+            headers = {"X-AgentsDock-Token": "test-secret"}
+
+            missing_check = client.post(
+                "/api/admin/update/check",
+                headers=headers,
+                json={"track": "stable"},
+            )
+            missing_start = client.post(
+                "/api/admin/update/start",
+                headers=headers,
+                json={"version": "1.0.0", "track": "stable"},
+            )
+            bound_check = client.post(
+                "/api/admin/update/check",
+                headers=headers,
+                json={
+                    "track": "stable",
+                    "expected_server_identity": "server-test",
+                    "expected_server_instance_id": "instance-test",
+                },
+            )
+            bound_start = client.post(
+                "/api/admin/update/start",
+                headers=headers,
+                json={
+                    "version": "1.0.0",
+                    "track": "stable",
+                    "expected_server_identity": "server-test",
+                    "expected_server_instance_id": "instance-test",
+                },
+            )
+
+        self.assertEqual(missing_check.status_code, 400)
+        self.assertEqual(missing_start.status_code, 400)
+        self.assertEqual(bound_check.status_code, 200)
+        self.assertEqual(bound_start.status_code, 200)
+
     def test_agents_server_systemd_cgroup_handles_unified_and_legacy_paths(self):
         paths = (
             "/user.slice/user-1000.slice/user@1000.service/app.slice/agents-server.service",
@@ -421,11 +637,23 @@ class ServerUpdateEndpointTests(unittest.IsolatedAsyncioTestCase):
         cgroup = "/user.slice/user@1000.service/app.slice/agents-server.service"
         entered = asyncio.Event()
         release = asyncio.Event()
+        cleanup_entered = asyncio.Event()
+        release_cleanup = asyncio.Event()
+        operation_lock = asyncio.Lock()
+        contender_acquired = asyncio.Event()
 
         async def slow_quiesce(*, service_cgroup):
             self.assertEqual(service_cgroup, cgroup)
             entered.set()
             await release.wait()
+
+        async def slow_reopen() -> None:
+            cleanup_entered.set()
+            await release_cleanup.wait()
+
+        async def operation_contender() -> None:
+            async with operation_lock:
+                contender_acquired.set()
 
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -434,37 +662,248 @@ class ServerUpdateEndpointTests(unittest.IsolatedAsyncioTestCase):
             status_path = root / "status.json"
             runner.write_text("# runner\n")
             key.write_text("public key\n")
-            with patch.object(agent_server, "SERVER_VERSION", "1.0.0"), \
-                 patch.object(agent_server, "SERVER_UPDATE_STATUS_FILE", status_path), \
-                 patch.object(agent_server, "SERVER_UPDATE_RUNNER", runner), \
-                 patch.object(agent_server, "SERVER_UPDATE_PUBLIC_KEY", key), \
-                 patch.object(agent_server, "server_update_is_active", return_value=False), \
-                 patch.object(agent_server, "working_tmux_bin", return_value="/usr/bin/tmux"), \
-                 patch.object(
-                     agent_server,
-                     "ensure_managed_update_tmux_isolated",
-                     return_value=cgroup,
-                 ), \
-                 patch.object(
-                     agent_server,
-                     "quiesce_managed_update_service_cgroup",
-                     side_effect=slow_quiesce,
-                 ), \
-                 patch.object(agent_server, "run_tmux") as run_tmux:
+            terminal_attachments = MagicMock()
+            terminal_attachments.reopen_admission = AsyncMock()
+            with ExitStack() as patches:
+                for target, name, value in (
+                    (agent_server, "SERVER_VERSION", "1.0.0"),
+                    (agent_server, "SERVER_UPDATE_STATUS_FILE", status_path),
+                    (agent_server, "SERVER_UPDATE_RUNNER", runner),
+                    (agent_server, "SERVER_UPDATE_PUBLIC_KEY", key),
+                    (agent_server, "SERVER_UPDATE_OPERATION_LOCK", operation_lock),
+                    (agent_server, "AGENT_TOKEN", ""),
+                    (agent_server, "BUSY_SESSIONS", set()),
+                    (agent_server, "ACTIVE", {}),
+                    (agent_server, "QUEUED_TURNS", {}),
+                    (agent_server, "RUN_NOW_TURNS", {}),
+                    (agent_server, "SERVER_MAINTENANCE_SESSIONS", set()),
+                    (agent_server, "TERMINAL_ATTACHMENTS", terminal_attachments),
+                ):
+                    patches.enter_context(patch.object(target, name, value))
+                patches.enter_context(patch.object(
+                    agent_server,
+                    "managed_server_restart_blocks_work",
+                    return_value=False,
+                ))
+                patches.enter_context(patch.object(
+                    agent_server,
+                    "prepare_provider_background_work_snapshot",
+                    new=AsyncMock(return_value={}),
+                ))
+                patches.enter_context(patch.object(
+                    agent_server,
+                    "provider_background_work_labels_from_snapshot",
+                    return_value=[],
+                ))
+                patches.enter_context(patch.object(
+                    agent_server,
+                    "server_update_is_active",
+                    return_value=False,
+                ))
+                patches.enter_context(patch.object(
+                    agent_server,
+                    "working_tmux_bin",
+                    return_value="/usr/bin/tmux",
+                ))
+                patches.enter_context(patch.object(
+                    agent_server,
+                    "ensure_managed_update_tmux_isolated",
+                    return_value=cgroup,
+                ))
+                patches.enter_context(patch.object(
+                    agent_server,
+                    "quiesce_managed_update_service_cgroup",
+                    side_effect=slow_quiesce,
+                ))
+                patches.enter_context(patch.object(
+                    agent_server.TEAM_HUB_RUNTIME,
+                    "prepare_maintenance",
+                    new=AsyncMock(return_value=None),
+                ))
+                patches.enter_context(patch.object(
+                    agent_server.TEAM_HUB_RUNTIME,
+                    "capability",
+                    return_value={},
+                ))
+                patches.enter_context(patch.object(
+                    agent_server.TEAM_HUB_RUNTIME,
+                    "reopen_admission_sync",
+                ))
+                patches.enter_context(patch.object(
+                    agent_server.TEAM_HUB_RUNTIME,
+                    "reopen_admission",
+                    side_effect=slow_reopen,
+                ))
+                run_tmux = patches.enter_context(
+                    patch.object(agent_server, "run_tmux")
+                )
                 task = asyncio.create_task(agent_server.start_server_update(
                     agent_server.ServerUpdateRequest(version="1.1.0"),
                 ))
                 await asyncio.wait_for(entered.wait(), timeout=1)
                 task.cancel()
+                await asyncio.sleep(0)
+                self.assertFalse(task.done())
+                task.cancel()
+                contender = asyncio.create_task(operation_contender())
+                await asyncio.sleep(0)
+                self.assertFalse(contender_acquired.is_set())
                 release.set()
+                await asyncio.wait_for(cleanup_entered.wait(), timeout=1)
+                task.cancel()
+                await asyncio.sleep(0)
+                self.assertFalse(task.done())
+                self.assertFalse(contender_acquired.is_set())
+                release_cleanup.set()
                 with self.assertRaises(asyncio.CancelledError):
                     await task
+                await contender
                 status = agent_server.read_server_update_status()
                 admission_blocker = agent_server.managed_server_update_blocker()
 
         self.assertEqual(status["phase"], "failed")
         self.assertIsNone(admission_blocker)
+        self.assertTrue(contender_acquired.is_set())
+        terminal_attachments.reopen_admission.assert_awaited_once_with()
         run_tmux.assert_not_called()
+
+    async def test_double_cancelled_launch_failure_finishes_cleanup_under_lock(self):
+        launch_entered = threading.Event()
+        release_launch = threading.Event()
+        cleanup_entered = asyncio.Event()
+        release_cleanup = asyncio.Event()
+        operation_lock = asyncio.Lock()
+        contender_acquired = asyncio.Event()
+
+        def failed_launch(_args):
+            launch_entered.set()
+            self.assertTrue(release_launch.wait(timeout=2))
+            raise RuntimeError("tmux launch failed")
+
+        async def slow_reopen() -> None:
+            cleanup_entered.set()
+            await release_cleanup.wait()
+
+        async def operation_contender() -> None:
+            async with operation_lock:
+                contender_acquired.set()
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            runner = root / "update_runner.py"
+            key = root / "release-public-key.pem"
+            status_path = root / "status.json"
+            runner.write_text("# runner\n")
+            key.write_text("public key\n")
+            terminal_attachments = MagicMock()
+            terminal_attachments.reopen_admission = AsyncMock()
+            with ExitStack() as patches:
+                for target, name, value in (
+                    (agent_server, "SERVER_VERSION", "1.0.0"),
+                    (agent_server, "SERVER_UPDATE_STATUS_FILE", status_path),
+                    (agent_server, "SERVER_UPDATE_RUNNER", runner),
+                    (agent_server, "SERVER_UPDATE_PUBLIC_KEY", key),
+                    (agent_server, "SERVER_UPDATE_OPERATION_LOCK", operation_lock),
+                    (agent_server, "AGENT_TOKEN", ""),
+                    (agent_server, "BUSY_SESSIONS", set()),
+                    (agent_server, "ACTIVE", {}),
+                    (agent_server, "QUEUED_TURNS", {}),
+                    (agent_server, "RUN_NOW_TURNS", {}),
+                    (agent_server, "SERVER_MAINTENANCE_SESSIONS", set()),
+                    (agent_server, "TERMINAL_ATTACHMENTS", terminal_attachments),
+                ):
+                    patches.enter_context(patch.object(target, name, value))
+                patches.enter_context(patch.object(
+                    agent_server,
+                    "managed_server_restart_blocks_work",
+                    return_value=False,
+                ))
+                patches.enter_context(patch.object(
+                    agent_server,
+                    "prepare_provider_background_work_snapshot",
+                    new=AsyncMock(return_value={}),
+                ))
+                patches.enter_context(patch.object(
+                    agent_server,
+                    "provider_background_work_labels_from_snapshot",
+                    return_value=[],
+                ))
+                patches.enter_context(patch.object(
+                    agent_server,
+                    "server_update_is_active",
+                    return_value=False,
+                ))
+                patches.enter_context(patch.object(
+                    agent_server,
+                    "working_tmux_bin",
+                    return_value="/usr/bin/tmux",
+                ))
+                patches.enter_context(patch.object(
+                    agent_server,
+                    "ensure_managed_update_tmux_isolated",
+                    return_value=None,
+                ))
+                patches.enter_context(patch.object(
+                    agent_server,
+                    "quiesce_managed_update_service_cgroup",
+                    new=AsyncMock(),
+                ))
+                patches.enter_context(patch.object(
+                    agent_server.TEAM_HUB_RUNTIME,
+                    "prepare_maintenance",
+                    new=AsyncMock(return_value=None),
+                ))
+                patches.enter_context(patch.object(
+                    agent_server.TEAM_HUB_RUNTIME,
+                    "capability",
+                    return_value={},
+                ))
+                patches.enter_context(patch.object(
+                    agent_server.TEAM_HUB_RUNTIME,
+                    "reopen_admission_sync",
+                ))
+                patches.enter_context(patch.object(
+                    agent_server.TEAM_HUB_RUNTIME,
+                    "reopen_admission",
+                    side_effect=slow_reopen,
+                ))
+                run_tmux = patches.enter_context(patch.object(
+                    agent_server,
+                    "run_tmux",
+                    side_effect=failed_launch,
+                ))
+                task = asyncio.create_task(agent_server.start_server_update(
+                    agent_server.ServerUpdateRequest(version="1.1.0"),
+                ))
+                try:
+                    self.assertTrue(
+                        await asyncio.to_thread(launch_entered.wait, 1)
+                    )
+                    task.cancel()
+                    await asyncio.sleep(0)
+                    self.assertFalse(task.done())
+                    task.cancel()
+                    contender = asyncio.create_task(operation_contender())
+                    await asyncio.sleep(0)
+                    self.assertFalse(contender_acquired.is_set())
+                finally:
+                    release_launch.set()
+                await asyncio.wait_for(cleanup_entered.wait(), timeout=1)
+                task.cancel()
+                await asyncio.sleep(0)
+                self.assertFalse(task.done())
+                self.assertFalse(contender_acquired.is_set())
+                release_cleanup.set()
+                with self.assertRaises(asyncio.CancelledError):
+                    await task
+                await contender
+                status = agent_server.read_server_update_status()
+
+        self.assertEqual(status["phase"], "failed")
+        self.assertFalse(agent_server.managed_server_update_blocks_work(status))
+        self.assertTrue(contender_acquired.is_set())
+        terminal_attachments.reopen_admission.assert_awaited_once_with()
+        run_tmux.assert_called_once()
 
     def test_linux_runner_environment_restores_the_user_service_bus(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -999,6 +1438,45 @@ class ServerUpdateEndpointTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(status["phase"], "failed")
             runtime.clear_maintenance_sync.assert_called_once()
 
+    async def test_preinstall_orphan_recovers_when_team_hub_initialization_failed(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            status_path = root / "status.json"
+            hub_data = root / "hub"
+            runtime = MagicMock()
+            runtime.capability.side_effect = RuntimeError("Hub init failed")
+            runtime.maintenance_fence_sync.return_value = {
+                "reason": "server-update",
+                "operation_id": "update-preinstall",
+                "snapshot": "snapshot_preinstall",
+            }
+            with patch.object(agent_server, "SERVER_VERSION", "1.0.0"), \
+                 patch.object(agent_server, "SERVER_UPDATE_STATUS_FILE", status_path), \
+                 patch.object(agent_server, "TEAM_HUB_DATA_DIR", hub_data), \
+                 patch.object(agent_server, "TEAM_HUB_RUNTIME", runtime), \
+                 patch.object(agent_server, "server_update_is_active", return_value=False), \
+                 patch.object(agent_server, "server_update_status_age_seconds", return_value=60.0):
+                agent_server.write_server_update_status(
+                    update_id="update-preinstall",
+                    phase="downloading",
+                    target_version="1.1.0",
+                    team_hub_id="hub_test12345678",
+                    team_hub_host_server_identity="server-test-identity",
+                    team_hub_snapshot_generation="snapshot_preinstall",
+                )
+                status = (
+                    await agent_server.reconcile_server_update_status_after_startup()
+                )
+
+            self.assertEqual(status["phase"], "failed")
+            self.assertFalse(agent_server.managed_server_update_blocks_work(status))
+            runtime.capability.assert_not_called()
+            runtime.clear_maintenance_sync.assert_called_once_with(
+                "server-update",
+                "update-preinstall",
+                hub_data / "maintenance-backups" / "snapshot_preinstall",
+            )
+
     async def test_current_candidate_with_missing_hub_cannot_finalize_complete(self):
         with tempfile.TemporaryDirectory() as temporary:
             status_path = Path(temporary) / "status.json"
@@ -1026,6 +1504,92 @@ class ServerUpdateEndpointTests(unittest.IsolatedAsyncioTestCase):
 
             self.assertEqual(status["phase"], "restarting")
             runtime.clear_maintenance_sync.assert_not_called()
+
+    async def test_abandoned_failed_host_repair_requires_exact_repaired_hub(self):
+        invalid_capabilities = (
+            {
+                "available": False,
+                "designated_host": True,
+                "version": 1,
+                "base_path": "/api/team-hub",
+                "hub_id": None,
+                "host_server_identity": "server-test-identity",
+                "transport": "loopback",
+                "hub_url": None,
+                "routes": [{"transport": "loopback", "hub_url": None}],
+            },
+            {
+                "available": True,
+                "designated_host": True,
+                "version": 1,
+                "base_path": "/api/team-hub",
+                "hub_id": "hub_repaired12345678",
+                "host_server_identity": "server-foreign-identity",
+                "transport": "loopback",
+                "hub_url": None,
+                "routes": [{"transport": "loopback", "hub_url": None}],
+            },
+        )
+        for capability in invalid_capabilities:
+            with self.subTest(capability=capability), tempfile.TemporaryDirectory() as temporary:
+                status_path = Path(temporary) / "status.json"
+                runtime = MagicMock()
+                runtime.capability.return_value = capability
+                runtime.maintenance_fence_sync.return_value = None
+                with patch.object(agent_server, "SERVER_VERSION", "1.1.0"), \
+                     patch.object(agent_server, "SERVER_UPDATE_STATUS_FILE", status_path), \
+                     patch.object(agent_server, "TEAM_HUB_RUNTIME", runtime), \
+                     patch.object(agent_server, "server_identity", return_value="server-test-identity"), \
+                     patch.object(agent_server, "server_update_is_active", return_value=False), \
+                     patch.object(agent_server, "server_update_status_age_seconds", return_value=60.0):
+                    agent_server.write_server_update_status(
+                        update_id="update-repair-orphan",
+                        phase="installing",
+                        target_version="1.1.0",
+                        update_available=True,
+                        team_hub_id=None,
+                        team_hub_repair_mode="failed_start",
+                        team_hub_host_server_identity="server-test-identity",
+                        team_hub_snapshot_generation=None,
+                        team_hub_transport="loopback",
+                        team_hub_url=None,
+                        team_hub_direct_ip_url="",
+                        team_hub_routes=[
+                            {"transport": "loopback", "hub_url": None}
+                        ],
+                    )
+                    status = await agent_server.server_update_status()
+
+                self.assertEqual(status["phase"], "installing")
+                self.assertTrue(status["update_available"])
+                runtime.clear_maintenance_sync.assert_not_called()
+
+        valid = {
+            "available": True,
+            "designated_host": True,
+            "version": 1,
+            "base_path": "/api/team-hub",
+            "hub_id": "hub_repaired12345678",
+            "host_server_identity": "server-test-identity",
+            "transport": "loopback",
+            "hub_url": None,
+            "routes": [{"transport": "loopback", "hub_url": None}],
+        }
+        with patch.object(agent_server, "TEAM_HUB_RUNTIME") as runtime, \
+             patch.object(agent_server, "server_identity", return_value="server-test-identity"):
+            runtime.capability.return_value = valid
+            agent_server._verify_server_update_team_hub_identity(
+                {
+                    "team_hub_repair_mode": "failed_start",
+                    "team_hub_host_server_identity": "server-test-identity",
+                    "team_hub_transport": "loopback",
+                    "team_hub_url": None,
+                    "team_hub_direct_ip_url": "",
+                    "team_hub_routes": [
+                        {"transport": "loopback", "hub_url": None}
+                    ],
+                }
+            )
 
     def test_update_identity_verification_binds_exact_team_hub_transport(self):
         runtime = MagicMock()
@@ -1184,12 +1748,20 @@ class ServerUpdateEndpointTests(unittest.IsolatedAsyncioTestCase):
                  agent_server,
                  "server_update_is_active",
                  return_value=False,
+             ), \
+             patch.object(
+                 agent_server,
+                 "server_update_status_age_seconds",
+                 return_value=60.0,
              ):
             agent_server.write_server_update_status(
                 update_id="orphaned-update",
                 phase="restarting",
                 target_version="1.1.0",
                 update_available=True,
+                runner_pid=424242,
+                heartbeat_at="2026-09-05T00:00:00Z",
+                elapsed_seconds=90,
             )
             status = (
                 await agent_server.reconcile_server_update_status_after_startup()
@@ -1197,6 +1769,9 @@ class ServerUpdateEndpointTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(status["phase"], "complete")
         self.assertEqual(status["installed_version"], "1.1.0")
+        self.assertIsNone(status["runner_pid"])
+        self.assertIsNone(status["heartbeat_at"])
+        self.assertIsNone(status["elapsed_seconds"])
         self.assertFalse(agent_server.managed_server_update_blocks_work(status))
 
     async def test_startup_reconciliation_fails_an_uninstalled_orphan(self):
@@ -1211,11 +1786,19 @@ class ServerUpdateEndpointTests(unittest.IsolatedAsyncioTestCase):
                  agent_server,
                  "server_update_is_active",
                  return_value=False,
+             ), \
+             patch.object(
+                 agent_server,
+                 "server_update_status_age_seconds",
+                 return_value=60.0,
              ):
             agent_server.write_server_update_status(
                 update_id="orphaned-update",
                 phase="downloading",
                 target_version="1.1.0",
+                runner_pid=424242,
+                heartbeat_at="2026-09-05T00:00:00Z",
+                elapsed_seconds=90,
             )
             status = (
                 await agent_server.reconcile_server_update_status_after_startup()
@@ -1223,6 +1806,9 @@ class ServerUpdateEndpointTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(status["phase"], "failed")
         self.assertIn("detached updater exited", status["message"])
+        self.assertIsNone(status["runner_pid"])
+        self.assertIsNone(status["heartbeat_at"])
+        self.assertIsNone(status["elapsed_seconds"])
         self.assertFalse(agent_server.managed_server_update_blocks_work(status))
 
     async def test_startup_reconciliation_keeps_a_live_update_drained(self):
@@ -1324,6 +1910,55 @@ class ServerUpdateEndpointTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("--expected-version 1.1.0", command[-1])
         self.assertIn("--current-version 1.0.0", command[-1])
         self.assertIn("--track stable", command[-1])
+
+    async def test_failed_team_hub_start_admits_only_identity_bound_repair_update(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            runner = root / "update_runner.py"
+            key = root / "release-public-key.pem"
+            runner.write_text("# runner\n")
+            key.write_text("public key\n")
+            failed_capability = {
+                "available": False,
+                "designated_host": True,
+                "version": 1,
+                "base_path": "/api/team-hub",
+                "hub_id": None,
+                "host_server_identity": "server-repair-test",
+                "transport": "loopback",
+                "hub_url": None,
+                "routes": [{"transport": "loopback", "hub_url": None}],
+                "startup_failure_reason": "database unavailable",
+            }
+            prepare = AsyncMock(return_value=None)
+            with patch.object(agent_server, "SERVER_VERSION", "1.0.0"), \
+                 patch.object(agent_server, "SERVER_UPDATE_STATUS_FILE", root / "status.json"), \
+                 patch.object(agent_server, "SERVER_UPDATE_RUNNER", runner), \
+                 patch.object(agent_server, "SERVER_UPDATE_PUBLIC_KEY", key), \
+                 patch.object(agent_server, "server_identity", return_value="server-repair-test"), \
+                 patch.object(agent_server, "server_update_is_active", return_value=False), \
+                 patch.object(agent_server, "working_tmux_bin", return_value="/usr/bin/tmux"), \
+                 patch.object(agent_server.TEAM_HUB_RUNTIME, "capability", return_value=failed_capability), \
+                 patch.object(agent_server.TEAM_HUB_RUNTIME, "prepare_maintenance", new=prepare), \
+                 patch.object(agent_server.TEAM_HUB_RUNTIME, "reopen_admission_sync"), \
+                 patch.object(agent_server, "run_tmux", return_value=None) as run_tmux:
+                status = await agent_server.start_server_update(
+                    agent_server.ServerUpdateRequest(version="1.1.0")
+                )
+
+        prepare.assert_awaited_once()
+        self.assertEqual(prepare.await_args.args, ("server-update",))
+        self.assertRegex(
+            prepare.await_args.kwargs["operation_id"], r"^[0-9a-f]{32}$"
+        )
+        self.assertTrue(prepare.await_args.kwargs["allow_unavailable_host"])
+        self.assertEqual(status["team_hub_repair_mode"], "failed_start")
+        self.assertEqual(status["team_hub_host_server_identity"], "server-repair-test")
+        self.assertEqual(status["team_hub_transport"], "loopback")
+        command = run_tmux.call_args.args[0][-1]
+        self.assertIn("--repair-failed-team-hub-host", command)
+        self.assertIn("--expected-team-hub-transport loopback", command)
+        self.assertIn("--expected-team-hub-url ''", command)
 
     async def test_start_rejects_update_while_an_agent_turn_is_active(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -1519,6 +2154,91 @@ class ServerUpdateEndpointTests(unittest.IsolatedAsyncioTestCase):
             "durable-paused",
         )
         run_tmux.assert_called_once()
+
+    async def test_stale_pending_reconcile_cannot_overwrite_new_starting_row(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            status_path = Path(temporary) / "status.json"
+            reconcile_entered = threading.Event()
+            release_reconcile = threading.Event()
+            operation_lock = asyncio.Lock()
+            contender_acquired = asyncio.Event()
+            real_reconcile = (
+                agent_server.reconcile_pending_server_update_after_startup
+            )
+
+            def delayed_reconcile(status):
+                reconcile_entered.set()
+                self.assertTrue(release_reconcile.wait(timeout=2))
+                return real_reconcile(status)
+
+            async def operation_contender() -> None:
+                async with operation_lock:
+                    contender_acquired.set()
+
+            with (
+                patch.object(agent_server, "SERVER_VERSION", "1.0.0"),
+                patch.object(
+                    agent_server,
+                    "SERVER_UPDATE_STATUS_FILE",
+                    status_path,
+                ),
+                patch.object(
+                    agent_server,
+                    "SERVER_UPDATE_OPERATION_LOCK",
+                    operation_lock,
+                ),
+                patch.object(
+                    agent_server,
+                    "reconcile_pending_server_update_after_startup",
+                    side_effect=delayed_reconcile,
+                ),
+            ):
+                stale = agent_server.write_fresh_server_update_status(
+                    phase=agent_server.SERVER_UPDATE_PENDING_PHASE,
+                    schedule_id="a" * 32,
+                    target_version=None,
+                    latest_version="1.1.0",
+                    track="stable",
+                    when_idle=True,
+                    cancelable=True,
+                )
+                advance = asyncio.create_task(
+                    agent_server.advance_pending_server_update_once()
+                )
+                try:
+                    self.assertTrue(
+                        await asyncio.to_thread(reconcile_entered.wait, 1)
+                    )
+                    contender = asyncio.create_task(operation_contender())
+                    await asyncio.sleep(0)
+                    self.assertFalse(contender_acquired.is_set())
+
+                    # Model a current updater/status owner that does not share
+                    # this process's asyncio lock. The stale worker's file CAS
+                    # must observe and preserve this exact replacement row.
+                    starting = agent_server.write_fresh_server_update_status(
+                        phase="starting",
+                        schedule_id="b" * 32,
+                        update_id="c" * 32,
+                        target_version="1.1.0",
+                        latest_version="1.1.0",
+                        track="stable",
+                        when_idle=True,
+                        cancelable=False,
+                    )
+                finally:
+                    release_reconcile.set()
+                reconciled = await advance
+                await contender
+                final = agent_server.read_server_update_status()
+
+        self.assertEqual(stale["phase"], "pending")
+        self.assertEqual(reconciled["phase"], "starting")
+        self.assertEqual(reconciled["update_id"], starting["update_id"])
+        self.assertEqual(final["phase"], "starting")
+        self.assertEqual(final["schedule_id"], "b" * 32)
+        self.assertEqual(final["update_id"], "c" * 32)
+        self.assertTrue(contender_acquired.is_set())
 
     async def test_pending_waiter_defers_for_cancelled_mutation_then_transitions(self):
         def request(path: str):
@@ -2126,7 +2846,7 @@ class ServerUpdateEndpointTests(unittest.IsolatedAsyncioTestCase):
 
             for method, path in (
                 ("POST", "/api/sessions/chat/unread"),
-                ("PATCH", "/api/sessions/chat"),
+                ("DELETE", "/api/sessions/chat"),
             ):
                 response = await agent_server.require_agent_token(
                     request(method, path),
@@ -2139,7 +2859,7 @@ class ServerUpdateEndpointTests(unittest.IsolatedAsyncioTestCase):
             observed,
             [
                 ("POST", "/api/sessions/chat/unread", 1),
-                ("PATCH", "/api/sessions/chat", 1),
+                ("DELETE", "/api/sessions/chat", 1),
             ],
         )
         self.assertEqual(agent_server.unsafe_http_mutation_count_locked(), 0)
@@ -2877,6 +3597,11 @@ class ServerUpdateEndpointTests(unittest.IsolatedAsyncioTestCase):
                  patch.object(agent_server, "SERVER_UPDATE_PUBLIC_KEY", key), \
                  patch.object(agent_server, "server_update_is_active", return_value=False), \
                  patch.object(agent_server, "working_tmux_bin", return_value="/usr/bin/tmux"), \
+                 patch.object(
+                     agent_server,
+                     "signed_release_manifest",
+                     new=AsyncMock(return_value={"version": "1.0.0"}),
+                 ), \
                  patch.object(agent_server, "run_tmux", return_value=None) as run_tmux:
                 status = await agent_server.start_server_update(
                     agent_server.ServerUpdateRequest(
@@ -2888,6 +3613,90 @@ class ServerUpdateEndpointTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(status["phase"], "starting")
         self.assertTrue(status["channel_switch"])
         self.assertIn("--track stable", run_tmux.call_args.args[0][-1])
+
+    async def test_start_rejects_beta_switch_to_an_older_nonlatest_stable(self):
+        latest = AsyncMock(return_value={"version": "1.0.1"})
+        with tempfile.TemporaryDirectory() as temporary, \
+             patch.object(agent_server, "SERVER_VERSION", "9.0.0-beta.1"), \
+             patch.object(
+                 agent_server,
+                 "SERVER_UPDATE_STATUS_FILE",
+                 Path(temporary) / "status.json",
+             ), \
+             patch.object(
+                 agent_server,
+                 "managed_server_restart_blocks_work",
+                 return_value=False,
+             ), \
+             patch.object(
+                 agent_server,
+                 "signed_release_manifest",
+                 new=latest,
+             ), \
+             patch.object(agent_server, "run_tmux") as run_tmux:
+            with self.assertRaises(HTTPException) as raised:
+                await agent_server.start_server_update(
+                    agent_server.ServerUpdateRequest(
+                        version="0.1.0",
+                        track="stable",
+                    )
+                )
+
+        self.assertEqual(raised.exception.status_code, 409)
+        self.assertEqual(
+            raised.exception.detail["code"],
+            "server_update_target_superseded",
+        )
+        self.assertEqual(raised.exception.detail["latest_version"], "1.0.1")
+        latest.assert_awaited_once_with("stable")
+        run_tmux.assert_not_called()
+
+    async def test_recovered_pending_beta_switch_revalidates_latest_stable(self):
+        schedule_id = "b" * 32
+        latest = AsyncMock(return_value={"version": "1.0.1"})
+        with tempfile.TemporaryDirectory() as temporary, \
+             patch.object(agent_server, "SERVER_VERSION", "9.0.0-beta.1"), \
+             patch.object(
+                 agent_server,
+                 "SERVER_UPDATE_STATUS_FILE",
+                 Path(temporary) / "status.json",
+             ), \
+             patch.object(
+                 agent_server,
+                 "managed_server_restart_blocks_work",
+                 return_value=False,
+             ), \
+             patch.object(
+                 agent_server,
+                 "signed_release_manifest",
+                 new=latest,
+             ), \
+             patch.object(agent_server, "run_tmux") as run_tmux:
+            agent_server.write_fresh_server_update_status(
+                phase="pending",
+                schedule_id=schedule_id,
+                target_version="0.1.0",
+                latest_version="0.1.0",
+                track="stable",
+                when_idle=True,
+                cancelable=True,
+            )
+            with self.assertRaises(HTTPException) as raised:
+                await agent_server.advance_pending_server_update_once()
+            status = agent_server.fail_pending_server_update(
+                schedule_id,
+                raised.exception,
+            )
+
+        self.assertEqual(status["phase"], "available")
+        self.assertIsNone(status["schedule_id"])
+        self.assertIsNone(status["target_version"])
+        self.assertEqual(status["latest_version"], "1.0.1")
+        self.assertEqual(status["error_code"], "server_update_target_superseded")
+        self.assertTrue(status["update_available"])
+        self.assertTrue(status["checked_at"])
+        latest.assert_awaited_once_with("stable")
+        run_tmux.assert_not_called()
 
     async def test_start_rejects_version_that_does_not_match_track(self):
         with tempfile.TemporaryDirectory() as temporary, \

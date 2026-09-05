@@ -57,6 +57,10 @@ class HeldTerminalWebSocket(RecordingWebSocket):
 
 
 class TerminalWebSocketRejectionTests(unittest.IsolatedAsyncioTestCase):
+    def test_non_ascii_token_candidate_is_rejected_without_type_error(self) -> None:
+        with patch.object(agent_server, "AGENT_TOKEN", "server-token"):
+            self.assertFalse(agent_server.token_matches("not-the-token-é"))
+
     async def test_capable_client_gets_fixed_protocol_before_terminal_close(self) -> None:
         encoded = agent_server.base64.urlsafe_b64encode(
             b"server-token",
@@ -159,6 +163,84 @@ class TerminalWebSocketRejectionTests(unittest.IsolatedAsyncioTestCase):
             authorized=True,
             session={"id": "archived-terminal", "archived": True},
         )
+
+    async def test_unauthorized_events_accepts_before_custom_close(self) -> None:
+        websocket = RecordingWebSocket()
+        with patch.object(agent_server, "websocket_authorized", return_value=False), \
+             patch.dict(agent_server.STORE.sessions, {}, clear=True):
+            await agent_server.session_events(  # type: ignore[arg-type]
+                "unauthorized-events",
+                websocket,
+            )
+        self.assertEqual(websocket.calls, [
+            ("accept", None),
+            ("close", 4401),
+        ])
+
+    async def test_missing_chat_events_selects_fixed_protocol_then_4404(self) -> None:
+        encoded = agent_server.base64.urlsafe_b64encode(
+            b"server-token",
+        ).decode("ascii").rstrip("=")
+        websocket = RecordingWebSocket()
+        websocket.headers = {
+            "sec-websocket-protocol": (
+                f"{agent_server.EVENTS_WEBSOCKET_PROTOCOL}, "
+                f"agentsdock-token.{encoded}"
+            ),
+        }
+        with patch.object(agent_server, "AGENT_TOKEN", "server-token"), \
+             patch.dict(agent_server.STORE.sessions, {}, clear=True):
+            await agent_server.session_events(  # type: ignore[arg-type]
+                "missing-events",
+                websocket,
+            )
+        self.assertEqual(
+            websocket.accepted_subprotocol,
+            agent_server.EVENTS_WEBSOCKET_PROTOCOL,
+        )
+        self.assertEqual(websocket.calls, [
+            ("accept", None),
+            ("close", 4404),
+        ])
+
+    async def test_unauthorized_emergency_accepts_fixed_protocol_then_4401(self) -> None:
+        encoded = agent_server.base64.urlsafe_b64encode(
+            b"wrong-token",
+        ).decode("ascii").rstrip("=")
+        websocket = RecordingWebSocket()
+        websocket.headers = {
+            "sec-websocket-protocol": (
+                f"{agent_server.EMERGENCY_WEBSOCKET_PROTOCOL}, "
+                f"agentsdock-token.{encoded}"
+            ),
+        }
+        with patch.object(agent_server, "AGENT_TOKEN", "server-token"):
+            await agent_server.emergency_alert_events(websocket)  # type: ignore[arg-type]
+
+        self.assertEqual(
+            websocket.accepted_subprotocol,
+            agent_server.EMERGENCY_WEBSOCKET_PROTOCOL,
+        )
+        self.assertEqual(websocket.calls, [
+            ("accept", None),
+            ("close", 4401),
+        ])
+
+    async def test_emergency_missing_fixed_protocol_accepts_token_then_4406(self) -> None:
+        encoded = agent_server.base64.urlsafe_b64encode(
+            b"server-token",
+        ).decode("ascii").rstrip("=")
+        token_protocol = f"agentsdock-token.{encoded}"
+        websocket = RecordingWebSocket()
+        websocket.headers = {"sec-websocket-protocol": token_protocol}
+        with patch.object(agent_server, "AGENT_TOKEN", "server-token"):
+            await agent_server.emergency_alert_events(websocket)  # type: ignore[arg-type]
+
+        self.assertEqual(websocket.accepted_subprotocol, token_protocol)
+        self.assertEqual(websocket.calls, [
+            ("accept", None),
+            ("close", 4406),
+        ])
 
     async def test_disconnect_exits_copy_mode_owned_by_terminal_scrolling(self) -> None:
         session_id = "scrolling-terminal"

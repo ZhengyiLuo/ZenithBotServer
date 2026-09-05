@@ -1,12 +1,17 @@
 from pathlib import Path
+import hashlib
+import json
 import os
+import socket
 import tempfile
 import threading
+import time
 import unittest
 import uuid
 from unittest import mock
 
 from agentsdock_team_hub.secure_peer import (
+    AttachmentFileLease,
     PAIRING_STATUS_LIMIT,
     SecurePeerError,
     SecurePeerStore,
@@ -16,6 +21,137 @@ from secure_peer_runtime import SecurePeerRuntime
 
 
 class SecurePeerRuntimeTests(unittest.TestCase):
+    def test_human_mention_uses_exact_lookup_beyond_inventory_scale_locally_and_remotely(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            runtime = SecurePeerRuntime(
+                Path(temporary) / "secure-peers",
+                server_identity="source_server",
+                server_instance_id="source_instance",
+                display_name="Source",
+            )
+            target_id = "principal_target_12345678"
+            exact_member = {
+                "member": {
+                    "principal_id": target_id,
+                    "display_name": "Target Member",
+                    "status": "active",
+                    "role": "member",
+                }
+            }
+
+            class FakeHostStore:
+                hub_id = "hub_1"
+
+                @staticmethod
+                def local_agent_mail_claims(team_id):
+                    return {"team_id": team_id}
+
+                @staticmethod
+                def list_members(*_args, **_kwargs):
+                    raise AssertionError(
+                        "mention resolution must not enumerate a >10k inventory"
+                    )
+
+                @staticmethod
+                def get_member(_claims, team_id, principal_id):
+                    if (team_id, principal_id) != ("team_1", target_id):
+                        raise AssertionError("exact member identity changed")
+                    return exact_member
+
+            reference = {
+                "team_id": "team_1",
+                "recipient_kind": "human",
+                "target_id": target_id,
+                "display_name_snapshot": "Target Member",
+            }
+            try:
+                runtime._hub_store = FakeHostStore()
+                with mock.patch.object(
+                    runtime,
+                    "team_realms",
+                    return_value=[
+                        {"realm": "host", "team_id": "team_1", "hub_id": "hub_1"}
+                    ],
+                ):
+                    self.assertEqual(
+                        runtime.resolve_team_references([reference])[0]["target_id"],
+                        target_id,
+                    )
+
+                def remote_get(_realm, path, query, *, preserve_not_found=False):
+                    self.assertTrue(preserve_not_found)
+                    self.assertEqual(
+                        path,
+                        f"/v1/teams/team_1/members/{target_id}",
+                    )
+                    self.assertEqual(query, {})
+                    return exact_member
+
+                with mock.patch.object(
+                    runtime,
+                    "team_realms",
+                    return_value=[
+                        {
+                            "realm": "secure_peer",
+                            "team_id": "team_1",
+                            "hub_id": "hub_1",
+                            "connection_id": "connection_12345678",
+                        }
+                    ],
+                ), mock.patch.object(
+                    runtime, "_team_hub_get", side_effect=remote_get
+                ) as remote:
+                    self.assertEqual(
+                        runtime.resolve_team_references([reference])[0]["target_id"],
+                        target_id,
+                    )
+                    self.assertEqual(remote.call_count, 1)
+            finally:
+                runtime.shutdown()
+
+    def test_human_mention_rejects_mismatched_exact_projection(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            runtime = SecurePeerRuntime(
+                Path(temporary) / "secure-peers",
+                server_identity="source_server",
+                server_instance_id="source_instance",
+                display_name="Source",
+            )
+            realm = {
+                "realm": "secure_peer",
+                "team_id": "team_1",
+                "hub_id": "hub_1",
+                "connection_id": "connection_12345678",
+            }
+            mismatched = {
+                "member": {
+                    "principal_id": "principal_other_12345678",
+                    "display_name": "Target Member",
+                    "status": "active",
+                    "role": "member",
+                },
+            }
+            try:
+                with mock.patch.object(
+                    runtime, "team_realms", return_value=[realm]
+                ), mock.patch.object(
+                    runtime, "_team_hub_get", return_value=mismatched
+                ):
+                    with self.assertRaises(SecurePeerError) as denied:
+                        runtime.resolve_team_references(
+                            [
+                                {
+                                    "team_id": "team_1",
+                                    "recipient_kind": "human",
+                                    "target_id": "principal_target_12345678",
+                                    "display_name_snapshot": "Target Member",
+                                }
+                            ]
+                        )
+                self.assertEqual(denied.exception.code, "team_reference_invalid")
+            finally:
+                runtime.shutdown()
+
     def test_agent_mail_receipt_rejects_remote_mismatch(self) -> None:
         valid = {
             "item": {
@@ -260,6 +396,124 @@ class SecurePeerRuntimeTests(unittest.TestCase):
             self.assertTrue(runtime.status()["host"]["available"])
             self.assertIsNone(runtime.status()["host"]["error"])
             runtime.shutdown()
+
+    def test_failed_agent_mail_provision_preserves_host_attachment_retry(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            runtime = SecurePeerRuntime(
+                root / "secure-peers",
+                server_identity="server_identity_test",
+                server_instance_id="server_instance_test",
+                display_name="Test server",
+            )
+            hub_store = HubStore(root / "hub")
+            provision = hub_store.provision_local_agent_mail
+            attempts = 0
+
+            def fail_once():
+                nonlocal attempts
+                attempts += 1
+                if attempts == 1:
+                    raise OSError("transient Agent Mail projection failure")
+                return provision()
+
+            with mock.patch.object(
+                hub_store,
+                "provision_local_agent_mail",
+                side_effect=fail_once,
+            ):
+                with self.assertRaisesRegex(OSError, "projection failure"):
+                    runtime.attach_host_hub(
+                        hub_id=hub_store.hub_id,
+                        hub_data_dir=root / "hub",
+                        hub_store=hub_store,
+                    )
+                self.assertIsNotNone(runtime._pending_host_attachment)
+                runtime.mark_host_unavailable(
+                    "The secure peer host could not finish recovery.",
+                    error_code="secure_peer_host_recovery_failed",
+                )
+                self.assertTrue(runtime.retry_host_attachment())
+
+            self.assertEqual(attempts, 2)
+            self.assertIsNone(runtime._pending_host_attachment)
+            self.assertTrue(runtime.status()["host"]["available"])
+            runtime.shutdown()
+
+    def test_gateway_thread_start_failure_releases_listener_for_attach_retry(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            runtime = SecurePeerRuntime(
+                root / "secure-peers",
+                server_identity="server_identity_test",
+                server_instance_id="server_instance_test",
+                display_name="Test server",
+            )
+            hub_store = HubStore(root / "hub")
+            probe = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            try:
+                probe.bind(("127.0.0.1", 0))
+                port = int(probe.getsockname()[1])
+            finally:
+                probe.close()
+            runtime._config = {
+                **runtime._config,
+                "enabled": True,
+                "advertised_host": "127.0.0.1",
+                "listen_port": port,
+            }
+            real_start = threading.Thread.start
+            starts = 0
+
+            def fail_once(thread):
+                nonlocal starts
+                if thread.name != "agentsdock-secure-peer-gateway":
+                    return real_start(thread)
+                starts += 1
+                if starts == 1:
+                    raise RuntimeError("injected gateway thread start failure")
+                return real_start(thread)
+
+            try:
+                with (
+                    mock.patch(
+                        "agentsdock_team_hub.secure_peer.canonical_peer_ipv4",
+                        side_effect=lambda value: value,
+                    ),
+                    mock.patch.object(
+                        threading.Thread,
+                        "start",
+                        autospec=True,
+                        side_effect=fail_once,
+                    ),
+                ):
+                    with self.assertRaisesRegex(
+                        RuntimeError, "gateway thread start failure"
+                    ):
+                        runtime.attach_host_hub(
+                            hub_id=hub_store.hub_id,
+                            hub_data_dir=root / "hub",
+                            hub_store=hub_store,
+                        )
+                    self.assertIsNone(runtime._gateway)
+                    self.assertIsNotNone(runtime._pending_host_attachment)
+                    # Rebinding the same port proves the failed gateway did
+                    # not leak its already-activated listening socket. Retry
+                    # directly so enabled hosting cannot be mistaken for an
+                    # already-complete attachment when no gateway is live.
+                    self.assertTrue(runtime.retry_host_attachment())
+                    self.assertIsNotNone(runtime._gateway)
+                    self.assertIsNone(runtime._pending_host_attachment)
+                    self.assertEqual(starts, 2)
+                # Probe only after restoring Thread.start: accepting this
+                # connection creates a separate worker thread, whose timing
+                # must not be confused with gateway listener startup.
+                connection = socket.create_connection(
+                    ("127.0.0.1", port), timeout=1
+                )
+                connection.close()
+            finally:
+                runtime.shutdown()
 
     def test_status_separates_durable_trust_from_transport_presence(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -640,6 +894,8 @@ class SecurePeerRuntimeTests(unittest.TestCase):
             active = {
                 **self.outgoing_pairing(123),
                 "scopes": ["teamspace.read", "cross_chat.instruction"],
+                "certificate_expires_at": int(time.time()) + 3600,
+                "last_validated_at": int(time.time()),
             }
             connection_id = active["connection_id"]
             calls: list[str] = []
@@ -703,7 +959,1254 @@ class SecurePeerRuntimeTests(unittest.TestCase):
                 runtime._remote_routes_cache[connection_id],
                 [{"route_id": "remote-route"}],
             )
+            self.assertIsNone(runtime._client_error)
+            with mock.patch.object(
+                runtime.client, "list_connections", return_value=[active]
+            ):
+                self.assertIsNotNone(runtime.team_hub_capability())
             runtime.shutdown()
+
+    def test_relay_claim_failure_does_not_suppress_fresh_team_hub_capability(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            runtime = SecurePeerRuntime(
+                Path(temporary) / "secure-peers",
+                server_identity="server_identity_test",
+                server_instance_id="server_instance_test",
+                display_name="Test server",
+            )
+            connection_id = str(uuid.uuid4())
+            active = {
+                **self.outgoing_pairing(int(time.time())),
+                "connection_id": connection_id,
+                "hub_id": "hub-remote",
+                "certificate_expires_at": int(time.time()) + 3_600,
+                "last_validated_at": int(time.time()),
+                "remote_route_delivery_available": True,
+            }
+            with (
+                mock.patch.object(
+                    runtime.client,
+                    "list_connections",
+                    return_value=[active],
+                ),
+                mock.patch.object(
+                    runtime,
+                    "remote_route_delivery_available",
+                    return_value=True,
+                ),
+                mock.patch.object(
+                    runtime.client,
+                    "claim_inbox",
+                    side_effect=SecurePeerError(
+                        "relay_unavailable",
+                        "relay inbox is unavailable",
+                        503,
+                    ),
+                ),
+            ):
+                self.assertIsNotNone(runtime.team_hub_capability())
+                self.assertEqual(runtime.claim_deliveries_once(limit=1), [])
+                self.assertIsNone(runtime._client_error)
+                self.assertEqual(
+                    runtime._delivery_error,
+                    "relay inbox is unavailable",
+                )
+                self.assertEqual(
+                    runtime.status()["delivery_error"],
+                    "relay inbox is unavailable",
+                )
+                self.assertIsNotNone(runtime.team_hub_capability())
+
+                runtime._client_error = "authenticated heartbeat failed"
+                self.assertIsNone(runtime.team_hub_capability())
+            runtime.shutdown()
+
+    def test_expired_connection_forget_uses_local_exact_retirement(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            runtime = SecurePeerRuntime(
+                Path(temporary) / "secure-peers",
+                server_identity="server_identity_test",
+                server_instance_id="server_instance_test",
+                display_name="Test server",
+            )
+            connection_id = str(uuid.uuid4())
+            fingerprint = "sha256:" + "a" * 64
+            expired = {
+                **self.outgoing_pairing(123),
+                "connection_id": connection_id,
+                "hub_id": "hub-remote",
+                "host_server_identity": "server_remote",
+                "certificate_fingerprint": fingerprint,
+                "certificate_expires_at": int(time.time()) - 1,
+            }
+            with (
+                mock.patch.object(
+                    runtime.client, "list_connections", return_value=[expired]
+                ),
+                mock.patch.object(
+                    runtime.client, "forget_expired_connection"
+                ) as local_forget,
+                mock.patch.object(
+                    runtime.client, "revoke_remote_connection"
+                ) as remote_revoke,
+                mock.patch.object(runtime, "status", return_value={"ok": True}),
+            ):
+                result = runtime.forget_connection(
+                    connection_id,
+                    expected_host_server_identity="server_remote",
+                    expected_hub_id="hub-remote",
+                    expected_certificate_fingerprint=fingerprint,
+                )
+            self.assertEqual(result, {"ok": True})
+            local_forget.assert_called_once_with(
+                connection_id,
+                expected_host_server_identity="server_remote",
+                expected_hub_id="hub-remote",
+                expected_certificate_fingerprint=fingerprint,
+            )
+            remote_revoke.assert_not_called()
+            runtime.shutdown()
+
+    def test_attachment_download_releases_global_locks_and_deduplicates_entry(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            runtime = SecurePeerRuntime(
+                Path(temporary) / "secure-peers",
+                server_identity="server_identity_test",
+                server_instance_id="server_instance_test",
+                display_name="Test server",
+                team_cache_max_bytes=32 * 1024,
+            )
+            connection_id = str(uuid.uuid4())
+            payload = b"attachment bytes"
+            attachment_id = "attachment-1"
+            team_id = "team-1"
+            active = {
+                "connection_id": connection_id,
+                "active": True,
+                "status": "connected",
+                "team_id": team_id,
+                "hub_id": "hub-1",
+            }
+            attachment = {
+                "id": attachment_id,
+                "message_id": "message-1",
+                "file_name": "example.txt",
+                "media_type": "text/plain",
+                "byte_size": len(payload),
+                "sha256": hashlib.sha256(payload).hexdigest(),
+                "state": "ready",
+                "received_bytes": len(payload),
+            }
+            entered = threading.Event()
+            release = threading.Event()
+            calls = 0
+            results: list[Path] = []
+            errors: list[BaseException] = []
+
+            def download(_connection_id, _path, destination, *, expected_size):
+                nonlocal calls
+                calls += 1
+                self.assertEqual(expected_size, len(payload))
+                entered.set()
+                self.assertTrue(release.wait(5))
+                destination.write_bytes(payload)
+                return (
+                    ("etag", f'"{attachment["sha256"]}"'),
+                    ("content-type", "text/plain"),
+                    ("accept-ranges", "bytes"),
+                )
+
+            def cache() -> None:
+                try:
+                    results.append(
+                        runtime.cache_team_attachment(
+                            connection_id, team_id, attachment_id
+                        )[1]
+                    )
+                except BaseException as exc:
+                    errors.append(exc)
+
+            with (
+                mock.patch.object(
+                    runtime,
+                    "_team_attachment_metadata",
+                    return_value=(active, attachment),
+                ),
+                mock.patch.object(
+                    runtime.client, "list_connections", return_value=[active]
+                ),
+                mock.patch.object(
+                    runtime.client,
+                    "download_attachment_to",
+                    side_effect=download,
+                ),
+            ):
+                first = threading.Thread(target=cache)
+                second = threading.Thread(target=cache)
+                first.start()
+                self.assertTrue(entered.wait(5))
+                second.start()
+                time.sleep(0.05)
+                self.assertEqual(calls, 1)
+                self.assertTrue(runtime._team_cache_guard.acquire(timeout=1))
+                runtime._team_cache_guard.release()
+                self.assertTrue(runtime._outbound_guard.acquire(timeout=1))
+                runtime._outbound_guard.release()
+                with runtime._team_cache_guard:
+                    self.assertEqual(len(runtime._team_cache_reservations), 1)
+                release.set()
+                first.join(5)
+                second.join(5)
+            self.assertFalse(first.is_alive())
+            self.assertFalse(second.is_alive())
+            self.assertEqual(errors, [])
+            self.assertEqual(calls, 1)
+            self.assertEqual(len(results), 2)
+            self.assertEqual(results[0], results[1])
+            self.assertEqual(results[0].read_bytes(), payload)
+            self.assertEqual(runtime._team_cache_reservations, {})
+            self.assertEqual(runtime._team_cache_entry_locks, {})
+            runtime.shutdown()
+
+    def test_host_attachment_local_path_is_a_verified_cache_copy(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            runtime = SecurePeerRuntime(
+                root / "secure-peers",
+                server_identity="server_identity_test",
+                server_instance_id="server_instance_test",
+                display_name="Test server",
+            )
+            canonical = root / "hub" / "blobs" / "canonical"
+            canonical.parent.mkdir(parents=True)
+            payload = b"canonical hub bytes"
+            canonical.write_bytes(payload)
+            attachment_id = "attachment-1"
+            team_id = "team-1"
+            public = {
+                "id": attachment_id,
+                "message_id": "message-1",
+                "file_name": "canonical.txt",
+                "media_type": "text/plain",
+                "byte_size": len(payload),
+                "sha256": hashlib.sha256(payload).hexdigest(),
+                "state": "ready",
+                "received_bytes": len(payload),
+            }
+
+            class HostStore:
+                hub_id = "hub-1"
+
+                @staticmethod
+                def local_agent_mail_claims(_team_id):
+                    return object()
+
+                @staticmethod
+                def open_team_attachment(_claims, _team_id, _attachment_id):
+                    descriptor = os.open(canonical, os.O_RDONLY)
+                    return dict(public), AttachmentFileLease(
+                        descriptor, lambda: os.close(descriptor)
+                    )
+
+            runtime._hub_store = HostStore()
+            with mock.patch.object(
+                runtime,
+                "team_realm",
+                return_value={"realm": "host", "team_id": team_id},
+            ):
+                first = runtime.team_attachment_local_paths(
+                    [{"id": attachment_id}], team_id=team_id
+                )[0]
+                exported = Path(first["local_path"])
+                self.assertNotEqual(exported.resolve(), canonical.resolve())
+                self.assertNotIn(canonical.parent, exported.resolve().parents)
+                original = exported.stat()
+                exported.write_bytes(b"x" * len(payload))
+                os.utime(
+                    exported,
+                    ns=(original.st_atime_ns, original.st_mtime_ns),
+                )
+                self.assertEqual(exported.stat().st_size, original.st_size)
+                self.assertEqual(exported.stat().st_mtime_ns, original.st_mtime_ns)
+                second = runtime.team_attachment_local_paths(
+                    [{"id": attachment_id}], team_id=team_id
+                )[0]
+            self.assertEqual(canonical.read_bytes(), payload)
+            self.assertEqual(Path(second["local_path"]).read_bytes(), payload)
+            runtime.shutdown()
+
+    def test_cache_reuse_hashes_outside_global_lock_and_cas_rechecks_inode(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            runtime = SecurePeerRuntime(
+                Path(temporary) / "secure-peers",
+                server_identity="server_identity_test",
+                server_instance_id="server_instance_test",
+                display_name="Test server",
+                team_cache_max_bytes=32 * 1024,
+            )
+            connection_id = str(uuid.uuid4())
+            team_id = "team-1"
+            attachment_id = "attachment-1"
+            payload = b"verified attachment bytes"
+            active = {
+                "connection_id": connection_id,
+                "active": True,
+                "status": "connected",
+                "team_id": team_id,
+                "hub_id": "hub-1",
+            }
+            attachment = {
+                "id": attachment_id,
+                "message_id": "message-1",
+                "file_name": "verified.txt",
+                "media_type": "text/plain",
+                "byte_size": len(payload),
+                "sha256": hashlib.sha256(payload).hexdigest(),
+                "state": "ready",
+                "received_bytes": len(payload),
+            }
+            downloads = 0
+
+            def download(_connection_id, _path, destination, *, expected_size):
+                nonlocal downloads
+                downloads += 1
+                self.assertEqual(expected_size, len(payload))
+                destination.write_bytes(payload)
+                return (
+                    ("etag", f'"{attachment["sha256"]}"'),
+                    ("content-type", "text/plain"),
+                    ("accept-ranges", "bytes"),
+                )
+
+            common_patches = (
+                mock.patch.object(
+                    runtime,
+                    "_team_attachment_metadata",
+                    return_value=(active, attachment),
+                ),
+                mock.patch.object(
+                    runtime.client, "list_connections", return_value=[active]
+                ),
+                mock.patch.object(
+                    runtime.client,
+                    "download_attachment_to",
+                    side_effect=download,
+                ),
+            )
+            with common_patches[0], common_patches[1], common_patches[2]:
+                _public, cached = runtime.cache_team_attachment(
+                    connection_id, team_id, attachment_id
+                )
+                original = cached.stat()
+                hashed = threading.Event()
+                release = threading.Event()
+                errors: list[BaseException] = []
+                results: list[Path] = []
+                descriptor_sha256 = runtime._team_descriptor_sha256
+
+                def pause_after_hash(descriptor, size):
+                    digest = descriptor_sha256(descriptor, size)
+                    hashed.set()
+                    if not release.wait(5):
+                        raise TimeoutError("test did not release cache hash")
+                    return digest
+
+                def reuse() -> None:
+                    try:
+                        results.append(
+                            runtime.cache_team_attachment(
+                                connection_id, team_id, attachment_id
+                            )[1]
+                        )
+                    except BaseException as exc:
+                        errors.append(exc)
+
+                with mock.patch.object(
+                    runtime,
+                    "_team_descriptor_sha256",
+                    side_effect=pause_after_hash,
+                ):
+                    worker = threading.Thread(target=reuse)
+                    worker.start()
+                    self.assertTrue(hashed.wait(5))
+                    self.assertTrue(runtime._team_cache_guard.acquire(timeout=1))
+                    runtime._team_cache_guard.release()
+                    cached.write_bytes(b"z" * len(payload))
+                    os.utime(
+                        cached,
+                        ns=(original.st_atime_ns, original.st_mtime_ns),
+                    )
+                    release.set()
+                    worker.join(5)
+
+            self.assertFalse(worker.is_alive())
+            self.assertEqual(errors, [])
+            self.assertEqual(downloads, 2)
+            self.assertEqual(len(results), 1)
+            self.assertEqual(results[0].read_bytes(), payload)
+            runtime.shutdown()
+
+    def test_attachment_path_batch_pins_earlier_entries_or_fails_whole_call(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            payloads = {
+                "attachment-1": b"a" * 128,
+                "attachment-2": b"b" * 128,
+            }
+            runtime = SecurePeerRuntime(
+                root / "secure-peers",
+                server_identity="server_identity_test",
+                server_instance_id="server_instance_test",
+                display_name="Test server",
+                team_cache_max_bytes=4096 + 128,
+            )
+            team_id = "team-1"
+
+            class HostStore:
+                hub_id = "hub-1"
+
+                @staticmethod
+                def local_agent_mail_claims(_team_id):
+                    return object()
+
+                @staticmethod
+                def open_team_attachment(_claims, _team_id, attachment_id):
+                    payload = payloads[attachment_id]
+                    source = root / f"{attachment_id}.source"
+                    source.write_bytes(payload)
+                    descriptor = os.open(source, os.O_RDONLY)
+                    public = {
+                        "id": attachment_id,
+                        "message_id": "message-1",
+                        "file_name": f"{attachment_id}.txt",
+                        "media_type": "text/plain",
+                        "byte_size": len(payload),
+                        "sha256": hashlib.sha256(payload).hexdigest(),
+                        "state": "ready",
+                        "received_bytes": len(payload),
+                    }
+                    return public, AttachmentFileLease(
+                        descriptor, lambda: os.close(descriptor)
+                    )
+
+            runtime._hub_store = HostStore()
+            with mock.patch.object(
+                runtime,
+                "team_realm",
+                return_value={"realm": "host", "team_id": team_id},
+            ):
+                with self.assertRaises(SecurePeerError) as too_small:
+                    runtime.team_attachment_local_paths(
+                        [{"id": "attachment-1"}, {"id": "attachment-2"}],
+                        team_id=team_id,
+                    )
+                self.assertEqual(too_small.exception.code, "cache_unavailable")
+
+                runtime.team_cache_max_bytes = 32 * 1024
+                resolved = runtime.team_attachment_local_paths(
+                    [{"id": "attachment-1"}, {"id": "attachment-2"}],
+                    team_id=team_id,
+                )
+
+            self.assertEqual(len(resolved), 2)
+            for item in resolved:
+                path = Path(item["local_path"])
+                self.assertTrue(path.is_file())
+                self.assertEqual(path.read_bytes(), payloads[item["id"]])
+            runtime.shutdown()
+
+    def test_returned_attachment_export_survives_concurrent_cache_eviction(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            payloads = {
+                "attachment-1": b"a" * 128,
+                "attachment-2": b"b" * 128,
+            }
+            runtime = SecurePeerRuntime(
+                root / "secure-peers",
+                server_identity="server_identity_test",
+                server_instance_id="server_instance_test",
+                display_name="Test server",
+                team_cache_max_bytes=4096 + 128,
+            )
+            team_id = "team-1"
+
+            class HostStore:
+                hub_id = "hub-1"
+
+                @staticmethod
+                def local_agent_mail_claims(_team_id):
+                    return object()
+
+                @staticmethod
+                def open_team_attachment(_claims, _team_id, attachment_id):
+                    payload = payloads[attachment_id]
+                    source = root / f"{attachment_id}.source"
+                    source.write_bytes(payload)
+                    descriptor = os.open(source, os.O_RDONLY)
+                    public = {
+                        "id": attachment_id,
+                        "message_id": "message-1",
+                        "file_name": f"{attachment_id}.txt",
+                        "media_type": "text/plain",
+                        "byte_size": len(payload),
+                        "sha256": hashlib.sha256(payload).hexdigest(),
+                        "state": "ready",
+                        "received_bytes": len(payload),
+                    }
+                    return public, AttachmentFileLease(
+                        descriptor, lambda: os.close(descriptor)
+                    )
+
+            runtime._hub_store = HostStore()
+            with mock.patch.object(
+                runtime,
+                "team_realm",
+                return_value={"realm": "host", "team_id": team_id},
+            ):
+                held = runtime.team_attachment_local_paths(
+                    [{"id": "attachment-1"}], team_id=team_id
+                )
+                response_body = json.dumps({"attachments": held})
+                held_path = Path(
+                    json.loads(response_body)["attachments"][0]["local_path"]
+                )
+                del held
+                first_cache, _sidecar = runtime._team_cache_paths(
+                    {"hub_id": "hub-1"},
+                    team_id,
+                    "attachment-1",
+                    "attachment-1.txt",
+                )
+                errors: list[BaseException] = []
+                replacements: list[list[dict]] = []
+
+                def competing_fill() -> None:
+                    try:
+                        replacements.append(
+                            runtime.team_attachment_local_paths(
+                                [{"id": "attachment-2"}], team_id=team_id
+                            )
+                        )
+                    except BaseException as exc:
+                        errors.append(exc)
+
+                worker = threading.Thread(target=competing_fill)
+                worker.start()
+                worker.join(5)
+                self.assertFalse(worker.is_alive())
+                self.assertEqual(errors, [])
+                self.assertEqual(len(replacements), 1)
+                self.assertFalse(first_cache.exists())
+                self.assertTrue(held_path.is_file())
+                self.assertEqual(held_path.read_bytes(), payloads["attachment-1"])
+                replacement_path = Path(replacements[0][0]["local_path"])
+                self.assertEqual(
+                    replacement_path.read_bytes(), payloads["attachment-2"]
+                )
+            runtime.shutdown()
+
+    def test_fresh_download_staging_inode_is_cas_checked_before_publish(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            runtime = SecurePeerRuntime(
+                Path(temporary) / "secure-peers",
+                server_identity="server_identity_test",
+                server_instance_id="server_instance_test",
+                display_name="Test server",
+                team_cache_max_bytes=32 * 1024,
+            )
+            connection_id = str(uuid.uuid4())
+            team_id = "team-1"
+            attachment_id = "attachment-1"
+            payload = b"fresh verified attachment"
+            active = {
+                "connection_id": connection_id,
+                "active": True,
+                "status": "connected",
+                "team_id": team_id,
+                "hub_id": "hub-1",
+            }
+            attachment = {
+                "id": attachment_id,
+                "message_id": "message-1",
+                "file_name": "fresh.txt",
+                "media_type": "text/plain",
+                "byte_size": len(payload),
+                "sha256": hashlib.sha256(payload).hexdigest(),
+                "state": "ready",
+                "received_bytes": len(payload),
+            }
+            downloads = 0
+
+            def download(_connection_id, _path, destination, *, expected_size):
+                nonlocal downloads
+                downloads += 1
+                self.assertEqual(expected_size, len(payload))
+                destination.write_bytes(payload)
+                return (
+                    ("etag", f'"{attachment["sha256"]}"'),
+                    ("content-type", "text/plain"),
+                    ("accept-ranges", "bytes"),
+                )
+
+            hashed = threading.Event()
+            release = threading.Event()
+            errors: list[BaseException] = []
+            descriptor_sha256 = runtime._team_descriptor_sha256
+
+            def pause_after_first_hash(descriptor, size):
+                digest = descriptor_sha256(descriptor, size)
+                if not hashed.is_set():
+                    hashed.set()
+                    if not release.wait(5):
+                        raise TimeoutError("test did not release staging hash")
+                return digest
+
+            def first_fill() -> None:
+                try:
+                    runtime.cache_team_attachment(
+                        connection_id, team_id, attachment_id
+                    )
+                except BaseException as exc:
+                    errors.append(exc)
+
+            with (
+                mock.patch.object(
+                    runtime,
+                    "_team_attachment_metadata",
+                    return_value=(active, attachment),
+                ),
+                mock.patch.object(
+                    runtime.client, "list_connections", return_value=[active]
+                ),
+                mock.patch.object(
+                    runtime.client,
+                    "download_attachment_to",
+                    side_effect=download,
+                ),
+            ):
+                with mock.patch.object(
+                    runtime,
+                    "_team_descriptor_sha256",
+                    side_effect=pause_after_first_hash,
+                ):
+                    worker = threading.Thread(target=first_fill)
+                    worker.start()
+                    self.assertTrue(hashed.wait(5))
+                    staging = next(
+                        runtime.team_cache_dir.rglob(".download.*")
+                    )
+                    original = staging.stat()
+                    staging.write_bytes(b"z" * len(payload))
+                    os.utime(
+                        staging,
+                        ns=(original.st_atime_ns, original.st_mtime_ns),
+                    )
+                    self.assertEqual(staging.stat().st_size, original.st_size)
+                    self.assertEqual(
+                        staging.stat().st_mtime_ns, original.st_mtime_ns
+                    )
+                    release.set()
+                    worker.join(5)
+
+                self.assertFalse(worker.is_alive())
+                self.assertEqual(len(errors), 1)
+                self.assertIsInstance(errors[0], SecurePeerError)
+                self.assertEqual(errors[0].code, "attachment_hash_mismatch")
+                self.assertEqual(runtime._team_cache_reservations, {})
+                self.assertEqual(runtime._team_cache_pins, {})
+                self.assertEqual(
+                    list(runtime.team_cache_dir.rglob(".download.*")), []
+                )
+                target, sidecar = runtime._team_cache_paths(
+                    active,
+                    team_id,
+                    attachment_id,
+                    attachment["file_name"],
+                )
+                self.assertFalse(target.exists())
+                self.assertFalse(sidecar.exists())
+
+                _public, recovered = runtime.cache_team_attachment(
+                    connection_id, team_id, attachment_id
+                )
+                self.assertEqual(recovered.read_bytes(), payload)
+
+            self.assertEqual(downloads, 2)
+            runtime.shutdown()
+
+    def test_failed_distinct_cache_ids_prune_empty_directories_boundedly(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            runtime = SecurePeerRuntime(
+                Path(temporary) / "secure-peers",
+                server_identity="server_identity_test",
+                server_instance_id="server_instance_test",
+                display_name="Test server",
+                team_cache_max_bytes=4096 + 8,
+            )
+            connection_id = str(uuid.uuid4())
+            team_id = "team-1"
+            active = {
+                "connection_id": connection_id,
+                "active": True,
+                "status": "connected",
+                "team_id": team_id,
+                "hub_id": "hub-1",
+            }
+
+            def metadata(_connection_id, _team_id, attachment_id):
+                payload = b"12345678"
+                return active, {
+                    "id": attachment_id,
+                    "message_id": "message-1",
+                    "file_name": f"{attachment_id}.txt",
+                    "media_type": "text/plain",
+                    "byte_size": len(payload),
+                    "sha256": hashlib.sha256(payload).hexdigest(),
+                    "state": "ready",
+                    "received_bytes": len(payload),
+                }
+
+            with (
+                mock.patch.object(
+                    runtime,
+                    "_team_attachment_metadata",
+                    side_effect=metadata,
+                ),
+                mock.patch.object(
+                    runtime.client, "list_connections", return_value=[active]
+                ),
+                mock.patch.object(
+                    runtime.client,
+                    "download_attachment_to",
+                    side_effect=SecurePeerError(
+                        "attachment_unavailable", "synthetic download failure", 502
+                    ),
+                ),
+            ):
+                for index in range(200):
+                    with self.assertRaises(SecurePeerError):
+                        runtime.cache_team_attachment(
+                            connection_id,
+                            team_id,
+                            f"attachment-{index}",
+                        )
+
+            self.assertEqual(
+                [path for path in runtime.team_cache_dir.rglob("*")], []
+            )
+            runtime.shutdown()
+
+    def test_empty_cache_pruning_never_traverses_symlink_or_nonempty_tree(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            runtime = SecurePeerRuntime(
+                root / "secure-peers",
+                server_identity="server_identity_test",
+                server_instance_id="server_instance_test",
+                display_name="Test server",
+            )
+            external = root / "external"
+            external.mkdir()
+            marker = external / "marker.txt"
+            marker.write_text("preserve")
+            runtime.team_cache_dir.mkdir(mode=0o700)
+            linked = runtime.team_cache_dir / "linked"
+            linked.symlink_to(external, target_is_directory=True)
+            nonempty = runtime.team_cache_dir / "owned" / "nonempty"
+            nonempty.mkdir(parents=True)
+            protected = nonempty / "marker.txt"
+            protected.write_text("preserve")
+            empty = runtime.team_cache_dir / "empty" / "nested"
+            empty.mkdir(parents=True)
+
+            with runtime._team_cache_guard:
+                runtime._prune_empty_team_cache_directories_locked()
+
+            self.assertTrue(linked.is_symlink())
+            self.assertEqual(marker.read_text(), "preserve")
+            self.assertEqual(protected.read_text(), "preserve")
+            self.assertFalse(empty.exists())
+            runtime.shutdown()
+
+    def test_cache_directory_creation_is_atomic_with_concurrent_pruning(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            runtime = SecurePeerRuntime(
+                Path(temporary) / "secure-peers",
+                server_identity="server_identity_test",
+                server_instance_id="server_instance_test",
+                display_name="Test server",
+                team_cache_max_bytes=32 * 1024,
+            )
+            connection_id = str(uuid.uuid4())
+            team_id = "team-1"
+            attachment_id = "attachment-1"
+            payload = b"atomic cache hierarchy"
+            active = {
+                "connection_id": connection_id,
+                "active": True,
+                "status": "connected",
+                "team_id": team_id,
+                "hub_id": "hub-1",
+            }
+            attachment = {
+                "id": attachment_id,
+                "message_id": "message-1",
+                "file_name": "atomic.txt",
+                "media_type": "text/plain",
+                "byte_size": len(payload),
+                "sha256": hashlib.sha256(payload).hexdigest(),
+                "state": "ready",
+                "received_bytes": len(payload),
+            }
+            created = threading.Event()
+            release = threading.Event()
+            prune_done = threading.Event()
+            results: list[Path] = []
+            errors: list[BaseException] = []
+            original_paths = runtime._team_cache_paths_locked
+
+            def gated_paths(*args, **kwargs):
+                result = original_paths(*args, **kwargs)
+                created.set()
+                if not release.wait(5):
+                    raise TimeoutError("test did not release cache hierarchy")
+                return result
+
+            def download(_connection_id, _path, destination, *, expected_size):
+                self.assertTrue(destination.parent.is_dir())
+                self.assertEqual(expected_size, len(payload))
+                destination.write_bytes(payload)
+                return (
+                    ("etag", f'"{attachment["sha256"]}"'),
+                    ("content-type", "text/plain"),
+                    ("accept-ranges", "bytes"),
+                )
+
+            def materialize() -> None:
+                try:
+                    results.append(
+                        runtime.cache_team_attachment(
+                            connection_id, team_id, attachment_id
+                        )[1]
+                    )
+                except BaseException as exc:
+                    errors.append(exc)
+
+            def prune() -> None:
+                with runtime._team_cache_guard:
+                    runtime._prune_empty_team_cache_directories_locked()
+                prune_done.set()
+
+            with (
+                mock.patch.object(
+                    runtime,
+                    "_team_attachment_metadata",
+                    return_value=(active, attachment),
+                ),
+                mock.patch.object(
+                    runtime.client, "list_connections", return_value=[active]
+                ),
+                mock.patch.object(
+                    runtime.client,
+                    "download_attachment_to",
+                    side_effect=download,
+                ),
+                mock.patch.object(
+                    runtime,
+                    "_team_cache_paths_locked",
+                    side_effect=gated_paths,
+                ),
+            ):
+                worker = threading.Thread(target=materialize)
+                worker.start()
+                self.assertTrue(created.wait(5))
+                pruner = threading.Thread(target=prune)
+                pruner.start()
+                time.sleep(0.05)
+                self.assertFalse(prune_done.is_set())
+                release.set()
+                worker.join(5)
+                pruner.join(5)
+
+            self.assertFalse(worker.is_alive())
+            self.assertFalse(pruner.is_alive())
+            self.assertEqual(errors, [])
+            self.assertEqual(len(results), 1)
+            self.assertEqual(results[0].read_bytes(), payload)
+            runtime.shutdown()
+
+    def test_cache_scan_tolerates_active_writer_directory_mutation(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            runtime = SecurePeerRuntime(
+                Path(temporary) / "secure-peers",
+                server_identity="server_identity_test",
+                server_instance_id="server_instance_test",
+                display_name="Test server",
+                team_cache_max_bytes=32 * 1024,
+            )
+            target, sidecar = runtime._team_cache_paths(
+                {"hub_id": "hub-1"},
+                "team-1",
+                "attachment-1",
+                "attachment.txt",
+            )
+            staging = sidecar.parent / f".download.{uuid.uuid4().hex}"
+            staging.write_bytes(b"x")
+            hub_directory = runtime.team_cache_dir / "hub-1"
+            real_open = os.open
+            mutated = False
+
+            def mutate_before_open(path, *args, **kwargs):
+                nonlocal mutated
+                if (
+                    path == "hub-1"
+                    and kwargs.get("dir_fd") is not None
+                    and not mutated
+                ):
+                    mutated = True
+                    transient = hub_directory / "concurrent-writer"
+                    transient.mkdir()
+                    transient.rmdir()
+                return real_open(path, *args, **kwargs)
+
+            try:
+                with runtime._team_cache_guard:
+                    runtime._team_cache_reservations[staging] = 1
+                with mock.patch(
+                    "secure_peer_runtime.os.open",
+                    side_effect=mutate_before_open,
+                ):
+                    with runtime._team_cache_guard:
+                        # This is the capacity reservation made by a second
+                        # download while the first staging writer is active.
+                        runtime._evict_team_cache(
+                            reserve_bytes=1,
+                            prune_empty=False,
+                        )
+                self.assertTrue(mutated)
+            finally:
+                with runtime._team_cache_guard:
+                    runtime._team_cache_reservations.pop(staging, None)
+                staging.unlink(missing_ok=True)
+                runtime.shutdown()
+
+    def test_legacy_cache_count_overflow_is_recovered_in_bounded_passes(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            runtime = SecurePeerRuntime(
+                Path(temporary) / "secure-peers",
+                server_identity="server_identity_test",
+                server_instance_id="server_instance_test",
+                display_name="Test server",
+                team_cache_max_bytes=32 * 1024,
+            )
+            for index in range(10):
+                target, sidecar = runtime._team_cache_paths(
+                    {"hub_id": "hub-1"},
+                    "team-1",
+                    f"legacy-{index}",
+                    f"legacy-{index}.txt",
+                )
+                target.write_bytes(bytes([index]) * 64)
+                sidecar.write_text("{}")
+
+            with mock.patch(
+                "secure_peer_runtime._TEAM_CACHE_DIRECTORY_SCAN_LIMIT", 12
+            ):
+                with runtime._team_cache_guard:
+                    runtime._evict_team_cache(
+                        reserve_bytes=runtime.team_cache_max_bytes
+                    )
+                    regular, scan_status = (
+                        runtime._bounded_team_cache_regular_files_locked()
+                    )
+            self.assertEqual(scan_status, "complete")
+            self.assertEqual(sum(item.st_size for item in regular.values()), 0)
+            self.assertLessEqual(
+                runtime.team_cache_max_bytes
+                + sum(item.st_size for item in regular.values()),
+                runtime.team_cache_max_bytes,
+            )
+            runtime.shutdown()
+
+    def test_unsafe_cache_scan_never_admits_reserved_capacity(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            runtime = SecurePeerRuntime(
+                Path(temporary) / "secure-peers",
+                server_identity="server_identity_test",
+                server_instance_id="server_instance_test",
+                display_name="Test server",
+                team_cache_max_bytes=32 * 1024,
+            )
+            target, _sidecar = runtime._team_cache_paths(
+                {"hub_id": "hub-1"},
+                "team-1",
+                "attachment-1",
+                "attachment.txt",
+            )
+            target.write_bytes(b"must not be undercounted")
+            partial = {target: target.stat()}
+            with (
+                mock.patch.object(
+                    runtime,
+                    "_bounded_team_cache_regular_files_locked",
+                    return_value=(partial, "unsafe"),
+                ),
+                runtime._team_cache_guard,
+                self.assertRaises(SecurePeerError) as unavailable,
+            ):
+                runtime._evict_team_cache(
+                    reserve_bytes=runtime.team_cache_max_bytes
+                )
+            self.assertEqual(unavailable.exception.code, "cache_unavailable")
+            self.assertEqual(target.read_bytes(), b"must not be undercounted")
+            runtime.shutdown()
+
+    def test_export_reservation_skips_active_writer_directory(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            runtime = SecurePeerRuntime(
+                Path(temporary) / "secure-peers",
+                server_identity="server_identity_test",
+                server_instance_id="server_instance_test",
+                display_name="Test server",
+                team_cache_max_bytes=32 * 1024,
+            )
+            reservations: list[tuple[int, int, str, Path]] = []
+            try:
+                with runtime._team_cache_guard:
+                    first = runtime._reserve_team_export_locked(8)
+                reservations.append(first)
+                first_root, first_directory, first_name, _first_path = first
+                first_identity = runtime._team_directory_identity(
+                    os.fstat(first_directory)
+                )
+                real_open = os.open
+                real_scandir = os.scandir
+                mutated = False
+
+                def mutate_before_open(path, *args, **kwargs):
+                    nonlocal mutated
+                    if (
+                        path == first_name
+                        and kwargs.get("dir_fd") is not None
+                        and not mutated
+                    ):
+                        mutated = True
+                        output = real_open(
+                            "in-flight",
+                            os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+                            0o600,
+                            dir_fd=first_directory,
+                        )
+                        try:
+                            os.write(output, b"12345678")
+                        finally:
+                            os.close(output)
+                    return real_open(path, *args, **kwargs)
+
+                def reject_active_child_scan(path):
+                    if isinstance(path, int):
+                        try:
+                            identity = runtime._team_directory_identity(
+                                os.fstat(path)
+                            )
+                        except OSError:
+                            identity = None
+                        if identity == first_identity:
+                            raise AssertionError(
+                                "active export directory must not be enumerated"
+                            )
+                    return real_scandir(path)
+
+                with (
+                    mock.patch(
+                        "secure_peer_runtime.os.open",
+                        side_effect=mutate_before_open,
+                    ),
+                    mock.patch(
+                        "secure_peer_runtime.os.scandir",
+                        side_effect=reject_active_child_scan,
+                    ),
+                ):
+                    with runtime._team_cache_guard:
+                        second = runtime._reserve_team_export_locked(8)
+                reservations.append(second)
+                self.assertTrue(mutated)
+            finally:
+                with runtime._team_cache_guard:
+                    for root_descriptor, directory_descriptor, name, path in reversed(
+                        reservations
+                    ):
+                        runtime._team_export_reservations.pop(path, None)
+                        runtime._remove_team_export_directory_fd(
+                            root_descriptor,
+                            name,
+                            directory_descriptor,
+                        )
+                        os.close(directory_descriptor)
+                        os.close(root_descriptor)
+                runtime.shutdown()
+
+    def test_cache_prune_rejects_component_swapped_to_external_symlink(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            runtime = SecurePeerRuntime(
+                root / "secure-peers",
+                server_identity="server_identity_test",
+                server_instance_id="server_instance_test",
+                display_name="Test server",
+            )
+            runtime.team_cache_dir.mkdir(mode=0o700)
+            victim = runtime.team_cache_dir / "victim"
+            (victim / "nested").mkdir(parents=True)
+            external = root / "external"
+            outside_empty = external / "must-survive"
+            outside_empty.mkdir(parents=True)
+            parked = runtime.team_cache_dir / "parked"
+            real_open = os.open
+            swapped = False
+
+            def swap_before_child_open(path, *args, **kwargs):
+                nonlocal swapped
+                if path == "victim" and kwargs.get("dir_fd") is not None and not swapped:
+                    swapped = True
+                    victim.rename(parked)
+                    victim.symlink_to(external, target_is_directory=True)
+                return real_open(path, *args, **kwargs)
+
+            with mock.patch(
+                "secure_peer_runtime.os.open",
+                side_effect=swap_before_child_open,
+            ):
+                with runtime._team_cache_guard:
+                    runtime._prune_empty_team_cache_directories_locked()
+
+            self.assertTrue(swapped)
+            self.assertTrue(victim.is_symlink())
+            self.assertTrue(outside_empty.is_dir())
+            self.assertTrue(parked.is_dir())
+            runtime.shutdown()
+
+    def test_cache_eviction_cannot_follow_swapped_root_or_component(self) -> None:
+        for swap_root in (True, False):
+            with self.subTest(scope="root" if swap_root else "component"):
+                with tempfile.TemporaryDirectory() as temporary:
+                    root = Path(temporary)
+                    runtime = SecurePeerRuntime(
+                        root / "secure-peers",
+                        server_identity="server_identity_test",
+                        server_instance_id="server_instance_test",
+                        display_name="Test server",
+                        team_cache_max_bytes=32 * 1024,
+                    )
+                    connection_id = str(uuid.uuid4())
+                    team_id = "team-1"
+                    attachment_id = "attachment-1"
+                    payload = b"eviction swap payload"
+                    active = {
+                        "connection_id": connection_id,
+                        "active": True,
+                        "status": "connected",
+                        "team_id": team_id,
+                        "hub_id": "hub-1",
+                    }
+                    attachment = {
+                        "id": attachment_id,
+                        "message_id": "message-1",
+                        "file_name": "swap.txt",
+                        "media_type": "text/plain",
+                        "byte_size": len(payload),
+                        "sha256": hashlib.sha256(payload).hexdigest(),
+                        "state": "ready",
+                        "received_bytes": len(payload),
+                    }
+
+                    def download(
+                        _connection_id, _path, destination, *, expected_size
+                    ):
+                        self.assertEqual(expected_size, len(payload))
+                        destination.write_bytes(payload)
+                        return (
+                            ("etag", f'"{attachment["sha256"]}"'),
+                            ("content-type", "text/plain"),
+                            ("accept-ranges", "bytes"),
+                        )
+
+                    with (
+                        mock.patch.object(
+                            runtime,
+                            "_team_attachment_metadata",
+                            return_value=(active, attachment),
+                        ),
+                        mock.patch.object(
+                            runtime.client,
+                            "list_connections",
+                            return_value=[active],
+                        ),
+                        mock.patch.object(
+                            runtime.client,
+                            "download_attachment_to",
+                            side_effect=download,
+                        ),
+                    ):
+                        runtime.cache_team_attachment(
+                            connection_id, team_id, attachment_id
+                        )
+
+                    external = root / "outside-cache"
+                    relative = (
+                        Path("hub-1") / "team-1" / "attachment-1" / "payload"
+                        if swap_root
+                        else Path("team-1") / "attachment-1" / "payload"
+                    )
+                    outside_payload = external / relative / "swap.txt"
+                    outside_payload.parent.mkdir(parents=True)
+                    outside_payload.write_bytes(b"outside must survive")
+                    original_parent = (
+                        runtime.team_cache_dir
+                        if swap_root
+                        else runtime.team_cache_dir / "hub-1"
+                    )
+                    parked = original_parent.with_name(
+                        original_parent.name + "-parked"
+                    )
+                    original_open_parent = (
+                        runtime._open_team_cache_parent_descriptor_locked
+                    )
+                    swapped = False
+
+                    def swap_before_delete(candidate):
+                        nonlocal swapped
+                        if not swapped:
+                            swapped = True
+                            original_parent.rename(parked)
+                            original_parent.symlink_to(
+                                external, target_is_directory=True
+                            )
+                        return original_open_parent(candidate)
+
+                    with (
+                        mock.patch.object(
+                            runtime,
+                            "_open_team_cache_parent_descriptor_locked",
+                            side_effect=swap_before_delete,
+                        ),
+                        runtime._team_cache_guard,
+                        self.assertRaises(SecurePeerError) as unavailable,
+                    ):
+                        runtime._evict_team_cache(
+                            reserve_bytes=runtime.team_cache_max_bytes
+                        )
+                    self.assertEqual(unavailable.exception.code, "cache_unavailable")
+                    self.assertTrue(swapped)
+                    self.assertEqual(
+                        outside_payload.read_bytes(), b"outside must survive"
+                    )
+                    self.assertTrue(original_parent.is_symlink())
+                    self.assertTrue(parked.is_dir())
+                    runtime.shutdown()
 
     def test_revocation_replay_failure_does_not_block_other_peers_or_leases(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

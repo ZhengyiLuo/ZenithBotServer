@@ -9,6 +9,7 @@ import json
 import logging
 import os
 import tempfile
+import threading
 import unittest
 from contextlib import suppress
 from pathlib import Path
@@ -136,6 +137,34 @@ class CoalescedSessionSaveTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(reloaded.sessions["sess_x"]["title"], "Ünïcode ✓")
         self.assertEqual(reloaded.sessions["sess_x"]["nested"], store.sessions["sess_x"]["nested"])
 
+    async def test_unreadable_session_registry_fails_closed_without_replacement(self) -> None:
+        self.state_dir.mkdir(parents=True, exist_ok=True)
+        original = b'{"chat":'
+        self.sessions_file.write_bytes(original)
+        store = self.make_store()
+        store.sessions = {"in-memory": {"id": "in-memory"}}
+
+        with self.assertRaisesRegex(RuntimeError, "unreadable sessions registry"):
+            await store.load()
+
+        self.assertEqual(self.sessions_file.read_bytes(), original)
+        self.assertEqual(store.sessions, {"in-memory": {"id": "in-memory"}})
+
+    async def test_unreadable_job_registry_fails_closed_without_replacement(self) -> None:
+        jobs_file = self.state_dir / "jobs.json"
+        self.state_dir.mkdir(parents=True, exist_ok=True)
+        original = b"[]"
+        jobs_file.write_bytes(original)
+        store = agent_server.JobStore()
+        store.jobs = {"in-memory": {"id": "in-memory"}}
+
+        with patch.object(agent_server, "JOBS_FILE", jobs_file):
+            with self.assertRaisesRegex(RuntimeError, "unreadable jobs registry"):
+                await store.load()
+
+        self.assertEqual(jobs_file.read_bytes(), original)
+        self.assertEqual(store.jobs, {"in-memory": {"id": "in-memory"}})
+
     async def test_durable_save_fsyncs_and_write_errors_propagate(self) -> None:
         store = self.make_store()
         store.sessions = {"a": {"id": "a"}}
@@ -215,6 +244,497 @@ class CoalescedSessionSaveTests(unittest.IsolatedAsyncioTestCase):
             # the event path.
             await store.flush_pending_save()
             self.assertTrue(blocked.is_set())
+
+
+class EventLogRecoveryTests(unittest.IsolatedAsyncioTestCase):
+    def setUp(self) -> None:
+        self._temp = tempfile.TemporaryDirectory()
+        self.root = Path(self._temp.name)
+        self._patches = [
+            patch.object(agent_server, "EVENT_SEQ_CACHE", {}),
+            patch.object(agent_server, "EVENT_SEQ_LOCK", asyncio.Lock()),
+            patch.object(agent_server, "EVENT_SEQ_REPAIR_LOCKS", {}),
+            patch.object(agent_server, "EVENT_DELIVERY_LOCKS", {}),
+            patch.object(agent_server, "ensure_dirs", return_value=None),
+            patch.object(
+                agent_server,
+                "events_path",
+                side_effect=lambda session_id: self.root / f"{session_id}.jsonl",
+            ),
+            patch.object(
+                agent_server,
+                "update_session_event_metadata",
+                new=AsyncMock(),
+            ),
+            patch.object(agent_server.HUB, "broadcast", new=AsyncMock()),
+        ]
+        for item in self._patches:
+            item.start()
+        self.addCleanup(self._temp.cleanup)
+        for item in reversed(self._patches):
+            self.addCleanup(item.stop)
+
+    @staticmethod
+    def write_torn_log(path: Path, *, seq: int = 1) -> None:
+        path.write_bytes(
+            json.dumps({"seq": seq, "type": "assistant_text"}).encode()
+            + b"\n"
+            + b'{"seq":'
+        )
+
+    def parsed_events(self, path: Path) -> list[dict]:
+        return [
+            json.loads(line)
+            for line in path.read_text(encoding="utf-8").splitlines()
+            if line.strip()
+        ]
+
+    async def test_each_writer_repairs_a_torn_tail_before_appending(self) -> None:
+        async def append_single(session_id: str) -> None:
+            await agent_server.append_event(session_id, "error", {"message": "x"})
+
+        async def append_import(session_id: str) -> None:
+            written = await agent_server.append_imported_events(
+                session_id,
+                [("assistant_text", {"text": "x", "imported": True})],
+            )
+            self.assertEqual(written, 1)
+
+        async def append_durable(session_id: str) -> None:
+            await agent_server.append_durable_event_batch(
+                session_id,
+                [("artifact_error", {"message": "x"})],
+            )
+
+        for session_id, writer in (
+            ("ordinary", append_single),
+            ("imported", append_import),
+            ("durable", append_durable),
+        ):
+            with self.subTest(writer=session_id):
+                path = self.root / f"{session_id}.jsonl"
+                self.write_torn_log(path)
+                with patch.dict(
+                    agent_server.STORE.sessions,
+                    {session_id: {"id": session_id, "latest_event_seq": 1}},
+                    clear=True,
+                ):
+                    await writer(session_id)
+                events = self.parsed_events(path)
+                self.assertEqual([event["seq"] for event in events], [1, 2])
+
+    async def test_batch_write_failures_repair_tail_and_invalidate_cache(self) -> None:
+        for function_name, call in (
+            (
+                "append_imported_events_sync",
+                lambda session_id: agent_server.append_imported_events(
+                    session_id,
+                    [("assistant_text", {"text": "x", "imported": True})],
+                ),
+            ),
+            (
+                "append_durable_event_batch_sync",
+                lambda session_id: agent_server.append_durable_event_batch(
+                    session_id,
+                    [("artifact_error", {"message": "x"})],
+                ),
+            ),
+        ):
+            session_id = function_name
+            path = self.root / f"{session_id}.jsonl"
+            path.write_text(
+                json.dumps({"seq": 1, "type": "assistant_text"}) + "\n",
+                encoding="utf-8",
+            )
+
+            def fail_after_fragment(*_args, **_kwargs):
+                with path.open("ab") as stream:
+                    stream.write(b'{"seq":2')
+                raise OSError("simulated short write")
+
+            with self.subTest(writer=function_name), patch.dict(
+                agent_server.STORE.sessions,
+                {session_id: {"id": session_id, "latest_event_seq": 1}},
+                clear=True,
+            ), patch.object(agent_server, function_name, side_effect=fail_after_fragment):
+                with self.assertRaises(OSError):
+                    await call(session_id)
+            self.assertTrue(path.read_bytes().endswith(b"\n"))
+            self.assertEqual([event["seq"] for event in self.parsed_events(path)], [1])
+            self.assertEqual(agent_server.EVENT_SEQ_CACHE[session_id], 1)
+
+    def test_invalid_json_value_without_newline_is_truncated(self) -> None:
+        for suffix in (b"{}", b"[]"):
+            with self.subTest(suffix=suffix):
+                path = self.root / f"invalid-{len(suffix)}-{suffix[:1].hex()}.jsonl"
+                path.write_bytes(
+                    json.dumps({"seq": 7, "type": "assistant_text"}).encode()
+                    + b"\n"
+                    + suffix
+                )
+                self.assertEqual(agent_server.repair_event_log_tail(path), 7)
+                self.assertEqual([event["seq"] for event in self.parsed_events(path)], [7])
+
+    def test_last_event_seq_scans_across_chunks_with_only_one_line_carry(self) -> None:
+        path = self.root / "reverse-scan.jsonl"
+        path.write_bytes(
+            json.dumps({"seq": 7, "type": "assistant_text"}).encode()
+            + b"\n"
+            + (b"not-json\n" * 40_000)
+            + (b"x" * (300 * 1024))
+        )
+
+        self.assertEqual(agent_server.last_event_seq_from_file(path), 7)
+
+    async def test_prune_tail_checkpoint_survives_cache_clear(self) -> None:
+        session_id = "prune-restart"
+        path = self.root / f"{session_id}.jsonl"
+        events = [
+            {"seq": 1, "type": "turn_started", "run_id": "native", "prompt": "same"},
+            {"seq": 2, "type": "history_imported", "run_id": "import_tail", "imported": True},
+            {"seq": 3, "type": "turn_started", "run_id": "import_tail", "prompt": "same", "imported": True},
+            {"seq": 4, "type": "turn_finished", "run_id": "import_tail", "imported": True},
+        ]
+        path.write_text(
+            "".join(json.dumps(event) + "\n" for event in events),
+            encoding="utf-8",
+        )
+        summary = agent_server.prune_duplicate_imported_history_sync(
+            session_id,
+            dry_run=False,
+        )
+        self.assertEqual(summary["removed_events"], 3)
+        remaining = self.parsed_events(path)
+        self.assertEqual(remaining[-1]["type"], "_event_sequence_checkpoint")
+        self.assertEqual(remaining[-1]["seq"], 4)
+        self.assertFalse(agent_server.is_client_visible_event(remaining[-1]))
+
+        agent_server.EVENT_SEQ_CACHE.clear()  # simulate a fresh process
+        with patch.dict(
+            agent_server.STORE.sessions,
+            {session_id: {"id": session_id, "latest_event_seq": 1}},
+            clear=True,
+        ):
+            self.assertEqual(await agent_server.next_event_seq(session_id, path), 5)
+
+    async def test_cancelled_prune_cannot_overwrite_concurrent_append(self) -> None:
+        session_id = "cancelled-prune"
+        path = self.root / f"{session_id}.jsonl"
+        events = [
+            {
+                "seq": 1,
+                "type": "turn_started",
+                "run_id": "native",
+                "prompt": "same question",
+            },
+            {
+                "seq": 2,
+                "type": "assistant_text",
+                "run_id": "native",
+                "text": "same answer",
+            },
+            {
+                "seq": 3,
+                "type": "history_imported",
+                "run_id": "import_tail",
+                "imported": True,
+            },
+            {
+                "seq": 4,
+                "type": "turn_started",
+                "run_id": "import_tail",
+                "prompt": "same question",
+                "imported": True,
+            },
+            {
+                "seq": 5,
+                "type": "assistant_text",
+                "run_id": "import_tail",
+                "text": "same answer",
+                "imported": True,
+            },
+            {
+                "seq": 6,
+                "type": "turn_finished",
+                "run_id": "import_tail",
+                "imported": True,
+            },
+        ]
+        path.write_text(
+            "".join(json.dumps(event) + "\n" for event in events),
+            encoding="utf-8",
+        )
+        store = agent_server.SessionStore()
+        store.sessions = {
+            session_id: {
+                "id": session_id,
+                "latest_event_seq": 6,
+            },
+        }
+        replace_started = threading.Event()
+        release_replace = threading.Event()
+        real_replace = agent_server.os.replace
+
+        def blocked_prune_replace(source, destination):
+            if str(source).endswith(".prune-tmp"):
+                replace_started.set()
+                self.assertTrue(release_replace.wait(timeout=2))
+            return real_replace(source, destination)
+
+        with (
+            patch.object(agent_server, "STORE", store),
+            patch.object(
+                agent_server,
+                "SESSIONS_FILE",
+                self.root / "sessions.json",
+            ),
+            patch.object(agent_server, "SESSION_LIFECYCLE_LOCKS", {}),
+            patch.object(agent_server, "ACTIVE_LOCK", asyncio.Lock()),
+            patch.object(agent_server, "ACTIVE", {}),
+            patch.object(agent_server, "BUSY_SESSIONS", set()),
+            patch.object(agent_server, "SERVER_MAINTENANCE_SESSIONS", set()),
+            patch.object(agent_server, "SESSION_TURN_TASKS", {}),
+            patch.object(
+                agent_server.os,
+                "replace",
+                side_effect=blocked_prune_replace,
+            ),
+        ):
+            prune_task = asyncio.create_task(
+                agent_server.prune_imported_history(
+                    session_id,
+                    agent_server.PruneImportedHistoryRequest(dry_run=False),
+                )
+            )
+            append_task: asyncio.Task[dict] | None = None
+            try:
+                self.assertTrue(
+                    await asyncio.to_thread(replace_started.wait, 1)
+                )
+                prune_task.cancel()
+                await asyncio.sleep(0)
+                self.assertFalse(prune_task.done())
+                prune_task.cancel()
+                append_task = asyncio.create_task(agent_server.append_event(
+                    session_id,
+                    "assistant_text",
+                    {"text": "new answer"},
+                ))
+                await asyncio.sleep(0)
+                self.assertFalse(append_task.done())
+            finally:
+                release_replace.set()
+            with self.assertRaises(asyncio.CancelledError):
+                await prune_task
+            self.assertIsNotNone(append_task)
+            appended = await asyncio.wait_for(append_task, timeout=1)
+            await store.flush_pending_save()
+
+        self.assertEqual(appended["seq"], 7)
+        remaining = self.parsed_events(path)
+        self.assertEqual([event["seq"] for event in remaining], [1, 2, 6, 7])
+        self.assertEqual(remaining[-1]["text"], "new answer")
+
+    async def test_durable_session_sequence_is_a_restart_floor(self) -> None:
+        session_id = "registry-floor"
+        path = self.root / f"{session_id}.jsonl"
+        path.write_text(
+            json.dumps({"seq": 2, "type": "assistant_text"}) + "\n",
+            encoding="utf-8",
+        )
+        with patch.dict(
+            agent_server.STORE.sessions,
+            {session_id: {"id": session_id, "latest_event_seq": 9}},
+            clear=True,
+        ):
+            self.assertEqual(await agent_server.next_event_seq(session_id, path), 10)
+
+    async def test_cancelled_tail_repairs_settle_before_releasing_ownership(self) -> None:
+        for operation in ("cold-seed", "failed-write"):
+            with self.subTest(operation=operation):
+                session_id = f"cancelled-repair-{operation}"
+                path = self.root / f"{session_id}.jsonl"
+                started = threading.Event()
+                release = threading.Event()
+
+                def slow_repair(_path: Path) -> int:
+                    started.set()
+                    self.assertTrue(release.wait(timeout=2))
+                    return 7
+
+                with patch.object(
+                    agent_server,
+                    "repair_event_log_tail",
+                    side_effect=slow_repair,
+                ), patch.dict(
+                    agent_server.STORE.sessions,
+                    {session_id: {"id": session_id, "latest_event_seq": 3}},
+                    clear=True,
+                ):
+                    if operation == "cold-seed":
+                        task = asyncio.create_task(
+                            agent_server.next_event_seq(session_id, path)
+                        )
+                    else:
+                        task = asyncio.create_task(
+                            agent_server.reconcile_event_seq_after_failed_write(
+                                session_id,
+                                path,
+                                consumed_high_water=5,
+                            )
+                        )
+                    self.assertTrue(await asyncio.to_thread(started.wait, 1))
+                    task.cancel()
+                    await asyncio.sleep(0)
+                    self.assertFalse(task.done())
+                    release.set()
+                    with self.assertRaises(asyncio.CancelledError):
+                        await task
+
+                if operation == "failed-write":
+                    self.assertEqual(agent_server.EVENT_SEQ_CACHE[session_id], 7)
+
+    async def test_stalled_tail_repair_does_not_block_other_sessions(self) -> None:
+        stalled_session = "stalled-repair"
+        healthy_session = "healthy-repair"
+        stalled_path = self.root / f"{stalled_session}.jsonl"
+        healthy_path = self.root / f"{healthy_session}.jsonl"
+        repair_started = threading.Event()
+        release_repair = threading.Event()
+
+        def repair(path: Path) -> int:
+            if path == stalled_path:
+                repair_started.set()
+                self.assertTrue(release_repair.wait(timeout=2))
+                return 7
+            self.assertEqual(path, healthy_path)
+            return 4
+
+        with patch.object(
+            agent_server,
+            "repair_event_log_tail",
+            side_effect=repair,
+        ), patch.dict(
+            agent_server.STORE.sessions,
+            {
+                stalled_session: {"latest_event_seq": 0},
+                healthy_session: {"latest_event_seq": 0},
+            },
+            clear=True,
+        ):
+            stalled = asyncio.create_task(
+                agent_server.next_event_seq(stalled_session, stalled_path)
+            )
+            self.assertTrue(await asyncio.to_thread(repair_started.wait, 1))
+
+            healthy_seq = await asyncio.wait_for(
+                agent_server.next_event_seq(healthy_session, healthy_path),
+                timeout=0.2,
+            )
+            self.assertEqual(healthy_seq, 5)
+            self.assertFalse(stalled.done())
+
+            release_repair.set()
+            self.assertEqual(await asyncio.wait_for(stalled, timeout=1), 8)
+
+
+class StableServerIdentityTests(unittest.TestCase):
+    def test_first_legacy_identity_is_persisted_across_machine_name_change(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "server-identity"
+            cache: dict[str, str] = {}
+            first = "a" * 24
+            changed_machine_result = "b" * 24
+            with patch.object(agent_server, "SERVER_IDENTITY_FILE", path), \
+                 patch.object(agent_server, "SERVER_IDENTITY_CACHE", cache), \
+                 patch.object(
+                     agent_server,
+                     "legacy_server_identity",
+                     return_value=first,
+                 ) as legacy:
+                self.assertEqual(agent_server.server_identity(), first)
+                legacy.assert_called_once()
+
+            cache.clear()  # simulate a process restart after hostname change
+            with patch.object(agent_server, "SERVER_IDENTITY_FILE", path), \
+                 patch.object(agent_server, "SERVER_IDENTITY_CACHE", cache), \
+                 patch.object(
+                     agent_server,
+                     "legacy_server_identity",
+                     return_value=changed_machine_result,
+                 ) as legacy:
+                self.assertEqual(agent_server.server_identity(), first)
+                legacy.assert_not_called()
+            self.assertEqual(path.stat().st_mode & 0o777, 0o600)
+
+    def test_corrupt_persisted_identity_fails_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "server-identity"
+            path.write_text("not-a-valid-identity\n", encoding="ascii")
+            with patch.object(agent_server, "SERVER_IDENTITY_FILE", path), \
+                 patch.object(agent_server, "SERVER_IDENTITY_CACHE", {}), \
+                 patch.object(agent_server, "legacy_server_identity") as legacy:
+                with self.assertRaisesRegex(RuntimeError, "identity is invalid"):
+                    agent_server.server_identity()
+                legacy.assert_not_called()
+
+    def test_persisted_identity_rejects_symlink(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            target = root / "elsewhere"
+            target.write_text("a" * 24 + "\n", encoding="ascii")
+            path = root / "server-identity"
+            path.symlink_to(target)
+            with patch.object(agent_server, "SERVER_IDENTITY_FILE", path), \
+                 patch.object(agent_server, "SERVER_IDENTITY_CACHE", {}):
+                with self.assertRaisesRegex(RuntimeError, "not a regular file"):
+                    agent_server.server_identity()
+
+    def test_persisted_identity_rejects_non_regular_file(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "server-identity"
+            path.mkdir()
+            with patch.object(agent_server, "SERVER_IDENTITY_FILE", path), \
+                 patch.object(agent_server, "SERVER_IDENTITY_CACHE", {}):
+                with self.assertRaisesRegex(RuntimeError, "not a regular file"):
+                    agent_server.server_identity()
+
+    @unittest.skipIf(os.name == "nt", "POSIX file modes are not available")
+    def test_existing_identity_is_restricted_to_private_mode(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "server-identity"
+            path.write_text("a" * 24 + "\n", encoding="ascii")
+            path.chmod(0o400)
+
+            self.assertEqual(agent_server.read_server_identity_file(path), "a" * 24)
+            self.assertEqual(path.stat().st_mode & 0o777, 0o600)
+
+    def test_concurrent_first_writers_do_not_replace_the_winner(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "server-identity"
+            barrier = threading.Barrier(2)
+            results: list[tuple[str, bool]] = []
+
+            def write(candidate: str) -> None:
+                barrier.wait()
+                results.append((
+                    candidate,
+                    agent_server.write_server_identity_file(path, candidate),
+                ))
+
+            threads = [
+                threading.Thread(target=write, args=("a" * 24,)),
+                threading.Thread(target=write, args=("b" * 24,)),
+            ]
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join(timeout=2)
+
+            self.assertTrue(all(not thread.is_alive() for thread in threads))
+            self.assertEqual(sorted(created for _value, created in results), [False, True])
+            winner = next(value for value, created in results if created)
+            self.assertEqual(agent_server.read_server_identity_file(path), winner)
 
 
 class PollingAccessLogFilterTests(unittest.TestCase):
@@ -477,6 +997,52 @@ class ConfigureServerLoggingTests(unittest.TestCase):
         configure.assert_called_once_with(agent_server.STATE_DIR)
         self.assertIn("log_config", captured)
         self.assertIsNone(captured["log_config"])
+
+
+class EventCacheInvalidationTests(unittest.IsolatedAsyncioTestCase):
+    async def test_forget_preserves_a_currently_owned_delivery_lock(self) -> None:
+        session_id = "deleting-chat"
+        agent_server.EVENT_DELIVERY_LOCKS.pop(session_id, None)
+        lock = agent_server.event_delivery_lock(session_id)
+        try:
+            async with lock:
+                await agent_server.forget_event_seq(session_id)
+                self.assertIs(agent_server.event_delivery_lock(session_id), lock)
+        finally:
+            agent_server.EVENT_DELIVERY_LOCKS.pop(session_id, None)
+
+    async def test_forget_waits_for_timeline_scan_off_event_loop(self) -> None:
+        session_id = "timeline-scan-chat"
+        stripe = threading.Lock()
+        stripe.acquire()
+        release = threading.Event()
+
+        def release_or_timeout() -> None:
+            release.wait(0.3)
+            stripe.release()
+
+        holder = threading.Thread(target=release_or_timeout)
+        holder.start()
+        loop = asyncio.get_running_loop()
+        started = loop.time()
+        try:
+            with patch.object(
+                agent_server,
+                "timeline_index_session_lock",
+                return_value=stripe,
+            ):
+                invalidation = asyncio.create_task(
+                    agent_server.forget_event_seq(session_id)
+                )
+                await asyncio.sleep(0.02)
+                heartbeat_elapsed = loop.time() - started
+                release.set()
+                await asyncio.wait_for(invalidation, timeout=1)
+        finally:
+            release.set()
+            holder.join(timeout=1)
+
+        self.assertLess(heartbeat_elapsed, 0.1)
 
 
 def _write_events(path: Path, count: int, *, session_id: str = "chat", pad: int = 0) -> None:

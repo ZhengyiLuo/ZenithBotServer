@@ -15,6 +15,7 @@ import agent_server
 from codex_app_server import (
     CodexAppServerDisconnected,
     CodexAppServerRequestError,
+    CodexAppServerTimeout,
 )
 
 
@@ -25,8 +26,10 @@ class FakeTurn:
         *,
         turn_id: str = "turn-native",
         steer_error: BaseException | None = None,
+        transport_generation: int = 1,
     ) -> None:
         self.turn_id = turn_id
+        self.transport_generation = transport_generation
         self.steer_error = steer_error
         self.notifications: asyncio.Queue[
             tuple[int, dict[str, object] | BaseException]
@@ -158,6 +161,7 @@ class FakeManager:
         self.turns = list(turns or [])
         self.start_turn_error = start_turn_error
         self.read_thread_result = read_thread_result
+        self.generation = 1
         self.start_calls = 0
         self.read_thread_calls: list[tuple[str, bool]] = []
         self.list_turns_calls: list[tuple[str, int, str, str]] = []
@@ -165,6 +169,7 @@ class FakeManager:
             tuple[str, list[dict[str, object]], dict[str, object]]
         ] = []
         self.notification_barriers: list[tuple[object, str]] = []
+        self.retire_generation_calls: list[int] = []
 
     async def start(self) -> None:
         self.start_calls += 1
@@ -220,6 +225,10 @@ class FakeManager:
                     if isinstance(turn, dict)
                 ]
         return []
+
+    async def retire_generation(self, expected_generation: int) -> bool:
+        self.retire_generation_calls.append(expected_generation)
+        return expected_generation == self.generation
 
 
 def completed_notification(status: str = "completed") -> dict[str, object]:
@@ -604,6 +613,312 @@ class CodexAppServerRunnerTests(unittest.IsolatedAsyncioTestCase):
     async def test_unpin_cancellation_still_drains_scheduled_job_successor(self) -> None:
         await self.assert_unpin_failure_still_drains_successor(
             asyncio.CancelledError(),
+        )
+
+    async def test_runner_cancellation_joins_exact_slot_release_and_unpin(self) -> None:
+        turn = FakeTurn()
+        manager = FakeManager(turn)
+        stack, _events, _finished, _exec_fallback = self.runner_patches(manager)
+        release_slot = AsyncMock(return_value=True)
+        unpin_started = asyncio.Event()
+        finish_unpin = asyncio.Event()
+
+        async def gated_unpin(*_args: object, **_kwargs: object) -> None:
+            unpin_started.set()
+            await finish_unpin.wait()
+
+        unpin = AsyncMock(side_effect=gated_unpin)
+        with stack, patch.object(
+            agent_server,
+            "release_turn_slot",
+            release_slot,
+        ), patch.object(
+            agent_server,
+            "unpin_codex_app_server_thread",
+            unpin,
+        ):
+            runner = asyncio.create_task(agent_server.run_codex_app_server(
+                "chat-native",
+                "run-original",
+                "Current text",
+                dict(self.session),
+                Path(self.cwd) / ".runner-test-manifest.json",
+                allow_exec_fallback=False,
+            ))
+            while not manager.turn_calls:
+                await asyncio.sleep(0)
+
+            runner.cancel()
+            await asyncio.wait_for(unpin_started.wait(), timeout=0.5)
+            runner.cancel()  # repeated hard-Stop cancellation during cleanup
+            await asyncio.sleep(0)
+            self.assertFalse(runner.done())
+            finish_unpin.set()
+            with self.assertRaises(asyncio.CancelledError):
+                await runner
+
+        release_slot.assert_awaited_once_with(
+            "chat-native",
+            expected_run_id="run-original",
+        )
+        unpin.assert_awaited_once_with(manager, "thread-native")
+
+    async def test_cancellation_during_turn_start_releases_provisional(self) -> None:
+        turn = FakeTurn()
+        manager = FakeManager(turn)
+        start_entered = asyncio.Event()
+        keep_start_pending = asyncio.Event()
+
+        async def pending_start(
+            thread_id: str,
+            input_items: list[dict[str, object]],
+            *,
+            overrides: dict[str, object] | None = None,
+        ) -> FakeTurn:
+            manager.turn_calls.append(
+                (thread_id, input_items, dict(overrides or {}))
+            )
+            start_entered.set()
+            try:
+                await keep_start_pending.wait()
+            except asyncio.CancelledError as exc:
+                exc.pending_turn = turn
+                raise
+            return turn
+
+        manager.start_turn = AsyncMock(side_effect=pending_start)
+        stack, _events, _finished, _exec_fallback = self.runner_patches(manager)
+        release_slot = AsyncMock(return_value=True)
+        unpin = AsyncMock()
+        with stack, patch.object(
+            agent_server,
+            "release_turn_slot",
+            release_slot,
+        ), patch.object(
+            agent_server,
+            "unpin_codex_app_server_thread",
+            unpin,
+        ):
+            runner = asyncio.create_task(agent_server.run_codex_app_server(
+                "chat-native",
+                "run-original",
+                "Current text",
+                dict(self.session),
+                Path(self.cwd) / ".runner-test-manifest.json",
+                allow_exec_fallback=False,
+            ))
+            await asyncio.wait_for(start_entered.wait(), timeout=0.5)
+            runner.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await runner
+
+        self.assertEqual(turn.interrupt_calls, 1)
+        self.assertEqual(turn.close_calls, 1)
+        release_slot.assert_awaited_once_with(
+            "chat-native",
+            expected_run_id="run-original",
+        )
+        unpin.assert_awaited_once_with(manager, "thread-native")
+
+    async def test_repeated_cancel_before_provisional_cleanup_cannot_skip_retirement(
+        self,
+    ) -> None:
+        turn = FakeTurn(turn_id="")
+        turn.transport_generation = 3
+        manager = FakeManager(turn)
+        start_entered = asyncio.Event()
+
+        async def pending_start(
+            thread_id: str,
+            input_items: list[dict[str, object]],
+            *,
+            overrides: dict[str, object] | None = None,
+        ) -> FakeTurn:
+            manager.turn_calls.append(
+                (thread_id, input_items, dict(overrides or {}))
+            )
+            start_entered.set()
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError as exc:
+                exc.pending_turn = turn
+                raise
+
+        class FinalizerGate:
+            def __init__(self) -> None:
+                self.entered = asyncio.Event()
+                self.release = asyncio.Event()
+
+            async def __aenter__(self) -> None:
+                self.entered.set()
+                await self.release.wait()
+
+            async def __aexit__(self, *_args: object) -> None:
+                return None
+
+        manager.start_turn = AsyncMock(side_effect=pending_start)
+        stack, _events, _finished, _exec_fallback = self.runner_patches(manager)
+        gate = FinalizerGate()
+        original_active_lock = agent_server.ACTIVE_LOCK
+        with stack, patch.object(
+            agent_server,
+            "CODEX_APP_SERVER_AMBIGUOUS_ACCEPT_SECONDS",
+            0.05,
+        ):
+            runner = asyncio.create_task(agent_server.run_codex_app_server(
+                "chat-native",
+                "run-original",
+                "Current text",
+                dict(self.session),
+                Path(self.cwd) / ".runner-test-manifest.json",
+                allow_exec_fallback=False,
+            ))
+            try:
+                await asyncio.wait_for(start_entered.wait(), timeout=0.5)
+                agent_server.ACTIVE_LOCK = gate  # type: ignore[assignment]
+                runner.cancel()
+                await asyncio.wait_for(gate.entered.wait(), timeout=0.5)
+                runner.cancel()
+                gate.release.set()
+                with self.assertRaises(asyncio.CancelledError):
+                    await asyncio.wait_for(runner, timeout=0.5)
+            finally:
+                gate.release.set()
+                agent_server.ACTIVE_LOCK = original_active_lock
+                if not runner.done():
+                    runner.cancel()
+                    await asyncio.gather(runner, return_exceptions=True)
+
+        self.assertEqual(turn.close_calls, 1)
+        self.assertEqual(manager.retire_generation_calls, [3])
+
+    async def test_cancellation_after_start_write_waits_for_late_turn_id(self) -> None:
+        turn = FakeTurn(turn_id="")
+        manager = FakeManager(turn)
+        start_entered = asyncio.Event()
+
+        async def pending_start(
+            thread_id: str,
+            input_items: list[dict[str, object]],
+            *,
+            overrides: dict[str, object] | None = None,
+        ) -> FakeTurn:
+            manager.turn_calls.append(
+                (thread_id, input_items, dict(overrides or {}))
+            )
+            start_entered.set()
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError as exc:
+                exc.pending_turn = turn
+                raise
+
+        manager.start_turn = AsyncMock(side_effect=pending_start)
+        stack, _events, _finished, _exec_fallback = self.runner_patches(manager)
+        release_slot = AsyncMock(return_value=True)
+        unpin = AsyncMock()
+        with stack, patch.multiple(
+            agent_server,
+            CODEX_APP_SERVER_AMBIGUOUS_ACCEPT_SECONDS=0.2,
+            release_turn_slot=release_slot,
+            unpin_codex_app_server_thread=unpin,
+        ):
+            runner = asyncio.create_task(agent_server.run_codex_app_server(
+                "chat-native",
+                "run-original",
+                "Current text",
+                dict(self.session),
+                Path(self.cwd) / ".runner-test-manifest.json",
+                allow_exec_fallback=False,
+            ))
+            await asyncio.wait_for(start_entered.wait(), timeout=0.5)
+            runner.cancel()
+            for _ in range(100):
+                if manager.list_turns_calls:
+                    break
+                await asyncio.sleep(0)
+            else:
+                self.fail("cancelled provisional reconciliation never started")
+            turn.adopt_turn_id("turn-late-after-cancel")
+            turn.feed({
+                "method": "turn/started",
+                "params": {
+                    "threadId": "thread-native",
+                    "turnId": "turn-late-after-cancel",
+                },
+            })
+            with self.assertRaises(asyncio.CancelledError):
+                await asyncio.wait_for(runner, timeout=0.5)
+
+        self.assertEqual(turn.interrupt_calls, 1)
+        self.assertEqual(turn.close_calls, 1)
+        self.assertEqual(manager.retire_generation_calls, [])
+        release_slot.assert_awaited_once_with(
+            "chat-native",
+            expected_run_id="run-original",
+        )
+        unpin.assert_awaited_once_with(manager, "thread-native")
+
+    async def test_unresolved_cancelled_start_retires_exact_generation(self) -> None:
+        turn = FakeTurn(turn_id="")
+        manager = FakeManager(turn)
+        start_entered = asyncio.Event()
+
+        async def pending_start(
+            thread_id: str,
+            input_items: list[dict[str, object]],
+            *,
+            overrides: dict[str, object] | None = None,
+        ) -> FakeTurn:
+            manager.turn_calls.append(
+                (thread_id, input_items, dict(overrides or {}))
+            )
+            # Lazy app-server start/init advanced after the runner first
+            # acquired the manager. The provisional owns the generation that
+            # actually received the stdin write.
+            manager.generation = 2
+            turn.transport_generation = manager.generation
+            start_entered.set()
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError as exc:
+                exc.pending_turn = turn
+                raise
+
+        manager.start_turn = AsyncMock(side_effect=pending_start)
+        stack, _events, _finished, _exec_fallback = self.runner_patches(manager)
+        release_slot = AsyncMock(return_value=True)
+        unpin = AsyncMock()
+        with stack, patch.multiple(
+            agent_server,
+            CODEX_APP_SERVER_AMBIGUOUS_ACCEPT_SECONDS=0.05,
+            release_turn_slot=release_slot,
+            unpin_codex_app_server_thread=unpin,
+        ):
+            runner = asyncio.create_task(agent_server.run_codex_app_server(
+                "chat-native",
+                "run-original",
+                "Current text",
+                dict(self.session),
+                Path(self.cwd) / ".runner-test-manifest.json",
+                allow_exec_fallback=False,
+            ))
+            await asyncio.wait_for(start_entered.wait(), timeout=0.5)
+            runner.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await asyncio.wait_for(runner, timeout=0.5)
+
+        self.assertEqual(turn.interrupt_calls, 0)
+        self.assertEqual(turn.close_calls, 1)
+        self.assertEqual(manager.retire_generation_calls, [2])
+        release_slot.assert_awaited_once_with(
+            "chat-native",
+            expected_run_id="run-original",
+        )
+        unpin.assert_awaited_once_with(
+            manager,
+            "thread-native",
+            invalidate_loaded_thread=True,
         )
 
     async def test_dispatcher_uses_app_server_and_only_auto_enables_fallback(
@@ -1053,6 +1368,75 @@ class CodexAppServerRunnerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             fallback_events[0]["from"],
             agent_server.CODEX_TRANSPORT_APP_SERVER,
+        )
+
+    async def test_prewrite_turn_start_timeout_uses_exec_fallback_once(self) -> None:
+        timeout = CodexAppServerTimeout(
+            "turn/start",
+            0.01,
+            request_sent=False,
+        )
+        manager = FakeManager(start_turn_error=timeout)
+        stack, events, _finished, exec_fallback = self.runner_patches(manager)
+        with stack:
+            await agent_server.run_codex_app_server(
+                "chat-native",
+                "run-original",
+                "Replay only the request that never reached stdin",
+                dict(self.session),
+                Path(self.cwd) / ".runner-test-manifest.json",
+                allow_exec_fallback=True,
+            )
+            unpin = agent_server.unpin_codex_app_server_thread
+
+        self.assertFalse(timeout.request_sent)
+        self.assertTrue(timeout.safe_to_retry)
+        self.assertEqual(len(manager.turn_calls), 1)
+        exec_fallback.assert_awaited_once()
+        self.assertEqual(
+            exec_fallback.await_args.args[2],
+            "Replay only the request that never reached stdin",
+        )
+        unpin.assert_awaited_once_with(
+            manager,
+            "thread-native",
+            invalidate_loaded_thread=True,
+        )
+        self.assertEqual(
+            sum(
+                call.args[1] == "codex_transport_fallback"
+                for call in events.await_args_list
+            ),
+            1,
+        )
+
+    async def test_written_turn_start_failure_never_uses_exec_fallback(self) -> None:
+        ambiguous = CodexAppServerDisconnected(
+            "connection closed after write",
+            request_sent=True,
+            # Defend the delivery boundary even if a future transport path
+            # accidentally marks a post-write error as retryable.
+            safe_to_retry=True,
+        )
+        manager = FakeManager(start_turn_error=ambiguous)
+        stack, events, _finished, exec_fallback = self.runner_patches(manager)
+        with stack:
+            await agent_server.run_codex_app_server(
+                "chat-native",
+                "run-original",
+                "Never duplicate bytes already written",
+                dict(self.session),
+                Path(self.cwd) / ".runner-test-manifest.json",
+                allow_exec_fallback=True,
+                allow_resume_rollover=False,
+            )
+
+        exec_fallback.assert_not_awaited()
+        self.assertFalse(
+            any(
+                call.args[1] == "codex_transport_fallback"
+                for call in events.await_args_list
+            )
         )
 
     async def test_interactive_turn_start_rejection_invalidates_without_replay(
@@ -4790,8 +5174,19 @@ class CodexAppServerRunnerTests(unittest.IsolatedAsyncioTestCase):
                 self.events.append(event)
 
         class SlowWebSocket:
+            def __init__(self) -> None:
+                self.close_calls: list[tuple[int, str]] = []
+                self.accounted_during_close = False
+
             async def send_json(self, _event: dict[str, object]) -> None:
                 await asyncio.Event().wait()
+
+            async def close(self, code: int = 1000, reason: str = "") -> None:
+                self.accounted_during_close = self in hub._subscribers.get(
+                    "chat-native",
+                    set(),
+                )
+                self.close_calls.append((code, reason))
 
         hub = agent_server.SubscriberHub()
         fast = FastWebSocket()
@@ -4810,6 +5205,163 @@ class CodexAppServerRunnerTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(fast.events, [event])
         self.assertEqual(hub._subscribers["chat-native"], {fast})
+        self.assertTrue(slow.accounted_during_close)
+        self.assertEqual(
+            slow.close_calls,
+            [
+                (
+                    agent_server.EVENT_WEBSOCKET_DELIVERY_FAILURE_CLOSE_CODE,
+                    "event stream delivery failed; reconnect required",
+                )
+            ],
+        )
+
+    async def test_failed_delivery_close_terminates_event_endpoint(self) -> None:
+        class FailedWebSocket:
+            def __init__(self) -> None:
+                self.headers: dict[str, str] = {}
+                self.query_params: dict[str, str] = {}
+                self.receive_started = asyncio.Event()
+                self.closed = asyncio.Event()
+                self.close_calls: list[tuple[int, str]] = []
+
+            async def accept(self, *, subprotocol: str | None = None) -> None:
+                return None
+
+            async def send_json(self, _event: dict[str, object]) -> None:
+                await asyncio.Event().wait()
+
+            async def receive_text(self) -> str:
+                self.receive_started.set()
+                await self.closed.wait()
+                raise agent_server.WebSocketDisconnect()
+
+            async def close(self, code: int = 1000, reason: str = "") -> None:
+                self.close_calls.append((code, reason))
+                self.closed.set()
+
+        hub = agent_server.SubscriberHub()
+        failed = FailedWebSocket()
+        with (
+            tempfile.TemporaryDirectory() as temporary,
+            patch.object(agent_server, "HUB", hub),
+            patch.object(agent_server, "websocket_authorized", return_value=True),
+            patch.object(
+                agent_server,
+                "events_path",
+                return_value=Path(temporary) / "events.jsonl",
+            ),
+            patch.object(agent_server, "WEBSOCKET_SEND_TIMEOUT_SECONDS", 0.01),
+        ):
+            endpoint = asyncio.create_task(
+                agent_server.session_events("chat-native", failed)  # type: ignore[arg-type]
+            )
+            await asyncio.wait_for(failed.receive_started.wait(), timeout=0.2)
+
+            await asyncio.wait_for(
+                hub.broadcast("chat-native", {"type": "session_updated"}),
+                timeout=0.2,
+            )
+            await asyncio.wait_for(endpoint, timeout=0.2)
+
+        self.assertEqual(
+            failed.close_calls,
+            [
+                (
+                    agent_server.EVENT_WEBSOCKET_DELIVERY_FAILURE_CLOSE_CODE,
+                    "event stream delivery failed; reconnect required",
+                )
+            ],
+        )
+        self.assertEqual(hub._subscribers, {})
+        self.assertEqual(hub._reservations, {})
+
+    async def test_failed_websocket_eviction_is_cancellation_safe(self) -> None:
+        close_started = asyncio.Event()
+        release_close = asyncio.Event()
+
+        class FailedWebSocket:
+            def __init__(self) -> None:
+                self.close_calls: list[tuple[int, str]] = []
+
+            async def send_json(self, _event: dict[str, object]) -> None:
+                raise RuntimeError("send failed")
+
+            async def close(self, code: int = 1000, reason: str = "") -> None:
+                self.close_calls.append((code, reason))
+                close_started.set()
+                await release_close.wait()
+
+        hub = agent_server.SubscriberHub()
+        failed = FailedWebSocket()
+        replacement = object()
+        hub._subscribers["chat-native"] = {failed}  # type: ignore[assignment]
+        event = {"type": "assistant_text", "text": "ready"}
+        with (
+            patch.object(agent_server, "EVENT_WEBSOCKET_MAX_ACTIVE_GLOBAL", 1),
+            patch.object(agent_server, "EVENT_WEBSOCKET_MAX_ACTIVE_PER_SESSION", 1),
+            patch.object(agent_server, "WEBSOCKET_SEND_TIMEOUT_SECONDS", 1.0),
+        ):
+            broadcast = asyncio.create_task(hub.broadcast("chat-native", event))
+            await asyncio.wait_for(close_started.wait(), timeout=0.2)
+
+            # The failed transport still consumes its lease while close is in
+            # flight, so reconnects cannot evade either capacity ceiling.
+            self.assertFalse(
+                await hub.reserve("replacement-chat", replacement)  # type: ignore[arg-type]
+            )
+            self.assertIn(failed, hub._subscribers["chat-native"])
+
+            broadcast.cancel()
+            await asyncio.sleep(0)
+            await asyncio.sleep(0)
+            self.assertFalse(broadcast.done())
+            self.assertIn(failed, hub._subscribers["chat-native"])
+
+            release_close.set()
+            with self.assertRaises(asyncio.CancelledError):
+                await broadcast
+
+            self.assertNotIn("chat-native", hub._subscribers)
+            self.assertEqual(
+                failed.close_calls,
+                [
+                    (
+                        agent_server.EVENT_WEBSOCKET_DELIVERY_FAILURE_CLOSE_CODE,
+                        "event stream delivery failed; reconnect required",
+                    )
+                ],
+            )
+            self.assertTrue(
+                await hub.reserve("replacement-chat", replacement)  # type: ignore[arg-type]
+            )
+
+        await hub.unsubscribe("replacement-chat", replacement)  # type: ignore[arg-type]
+
+    async def test_failed_websocket_close_keeps_capacity_lease(self) -> None:
+        class UnclosableWebSocket:
+            async def send_json(self, _event: dict[str, object]) -> None:
+                raise RuntimeError("send failed")
+
+            async def close(self, code: int = 1000, reason: str = "") -> None:
+                raise RuntimeError(f"close failed: {code} {reason}")
+
+        hub = agent_server.SubscriberHub()
+        failed = UnclosableWebSocket()
+        replacement = object()
+        hub._subscribers["chat-native"] = {failed}  # type: ignore[assignment]
+        with (
+            patch.object(agent_server, "EVENT_WEBSOCKET_MAX_ACTIVE_GLOBAL", 1),
+            patch.object(agent_server, "EVENT_WEBSOCKET_MAX_ACTIVE_PER_SESSION", 1),
+        ):
+            await hub.broadcast("chat-native", {"type": "session_updated"})
+
+            self.assertIn(failed, hub._subscribers["chat-native"])
+            self.assertFalse(
+                await hub.reserve("replacement-chat", replacement)  # type: ignore[arg-type]
+            )
+
+        await hub.unsubscribe("chat-native", failed)  # type: ignore[arg-type]
 
     async def test_silent_resumed_thread_rolls_over_once_with_app_server(self) -> None:
         first_turn = FakeTurn([completed_notification()])

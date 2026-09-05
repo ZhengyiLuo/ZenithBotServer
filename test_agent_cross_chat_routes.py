@@ -2,6 +2,7 @@ import asyncio
 import json
 import sqlite3
 import tempfile
+import threading
 import time
 import unittest
 from collections import OrderedDict, deque
@@ -1298,6 +1299,95 @@ class AgentCrossChatRouteTests(unittest.IsolatedAsyncioTestCase):
                 ]
             ],
             ["created"],
+        )
+
+    async def test_cancelled_admin_route_expansion_rolls_back_durably(self) -> None:
+        store = agent_server.SessionStore()
+        store.sessions = {
+            "source": {
+                "id": "source",
+                "title": "Source",
+                "backend": agent_server.BACKEND_CODEX,
+                "provider_cross_chat_routes": [],
+            },
+            "target": {
+                "id": "target",
+                "title": "Target",
+                "backend": agent_server.BACKEND_CODEX,
+                "provider_cross_chat_routes": [],
+            },
+        }
+        sessions_path = self.root / "cancelled-route-sessions.json"
+        first_write_started = threading.Event()
+        release_first_write = threading.Event()
+        written_route_counts: list[int] = []
+        real_write = agent_server.write_sessions_json_text
+
+        def blocked_write(
+            path: Path,
+            text: str,
+            *,
+            durable: bool,
+        ) -> None:
+            route_count = len(
+                json.loads(text)["source"].get(
+                    "provider_cross_chat_routes", []
+                )
+            )
+            written_route_counts.append(route_count)
+            if len(written_route_counts) == 1:
+                first_write_started.set()
+                self.assertTrue(release_first_write.wait(timeout=2))
+            real_write(path, text, durable=durable)
+
+        with (
+            self.native_transports(),
+            patch.object(agent_server, "STORE", store),
+            patch.object(agent_server, "SESSIONS_FILE", sessions_path),
+            patch.object(agent_server, "ensure_dirs"),
+            patch.object(
+                agent_server,
+                "write_sessions_json_text",
+                side_effect=blocked_write,
+            ),
+            patch.object(
+                agent_server,
+                "append_agent_handoff_route_audit",
+                new_callable=AsyncMock,
+            ),
+        ):
+            create_task = asyncio.create_task(
+                agent_server.create_agent_handoff_route(
+                    "source",
+                    agent_server.AgentHandoffRouteCreateRequest(
+                        alias="mobile",
+                        target_session_id="target",
+                        actions=["instruction", "request_reply"],
+                    ),
+                )
+            )
+            try:
+                self.assertTrue(
+                    await asyncio.to_thread(first_write_started.wait, 1)
+                )
+                create_task.cancel()
+                await asyncio.sleep(0)
+                self.assertFalse(create_task.done())
+            finally:
+                release_first_write.set()
+            with self.assertRaises(asyncio.CancelledError):
+                await create_task
+            await store.flush_pending_save()
+
+        self.assertEqual(written_route_counts, [1, 0])
+        self.assertEqual(
+            store.sessions["source"]["provider_cross_chat_routes"],
+            [],
+        )
+        persisted = json.loads(sessions_path.read_text(encoding="utf-8"))
+        self.assertEqual(
+            persisted["source"]["provider_cross_chat_routes"],
+            [],
         )
 
     async def test_admin_create_rejects_self_duplicate_alias_target_and_limit(self) -> None:
