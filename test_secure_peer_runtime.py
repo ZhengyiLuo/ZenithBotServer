@@ -3778,6 +3778,38 @@ class SecurePeerRuntimeTests(unittest.TestCase):
             self.assertEqual(forgetting.exception.code, "connection_delivery_pending")
             runtime.shutdown()
 
+    def test_maintenance_expires_outgoing_pairings_without_operator_action(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            runtime = SecurePeerRuntime(
+                Path(temporary) / "secure-peers",
+                server_identity="server_identity_test",
+                server_instance_id="server_instance_test",
+                display_name="Test server",
+            )
+            with (
+                mock.patch.object(
+                    runtime.client,
+                    "expire_pending_pairings",
+                    return_value=1,
+                ) as expire,
+                mock.patch.object(
+                    runtime.client,
+                    "recover_pairing_attempts",
+                    return_value={"remaining": 0},
+                ),
+                mock.patch.object(
+                    runtime.client,
+                    "list_connections",
+                    return_value=[],
+                ),
+            ):
+                result = runtime.maintenance_once()
+            expire.assert_called_once_with()
+            self.assertFalse(result["active"])
+            runtime.shutdown()
+
     def test_expired_prepared_delivery_is_terminalized_without_receipt(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             runtime = SecurePeerRuntime(

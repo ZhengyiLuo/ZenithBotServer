@@ -1958,6 +1958,17 @@ class SecurePeerRuntime:
                         type(exc).__name__,
                     )
         try:
+            # Persist outgoing pending deadlines even when no operator is
+            # viewing or polling Team Network. This is also the periodic
+            # crash-retry boundary for local key retirement.
+            self.client.expire_pending_pairings()
+        except Exception as exc:
+            if self.logger is not None:
+                self.logger.warning(
+                    "secure peer outgoing pairing expiry deferred error_type=%s",
+                    type(exc).__name__,
+                )
+        try:
             pairing_recovery = self.client.recover_pairing_attempts(limit=2)
         except Exception as exc:
             pairing_recovery = {

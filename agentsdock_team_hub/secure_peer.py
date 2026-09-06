@@ -47,6 +47,7 @@ from .security import canonical_json, create_secret_file, ensure_private_directo
 
 PROTOCOL_VERSION = 1
 PAIRING_TTL_SECONDS = 10 * 60
+PAIRING_CLOCK_SKEW_SECONDS = 5 * 60
 PAIRING_ATTEMPT_RETENTION_SECONDS = 7 * 24 * 60 * 60
 CLIENT_CERT_TTL_SECONDS = 30 * 24 * 60 * 60
 CLIENT_CERT_RENEW_WINDOW_SECONDS = 7 * 24 * 60 * 60
@@ -1532,8 +1533,10 @@ class SecurePeerStore:
                 connection.execute("COMMIT")
                 return self._pairing_public(existing, include_poll=True)
             if (
-                int(normalized["created_at"]) < timestamp - 300
-                or int(normalized["created_at"]) > timestamp + 300
+                int(normalized["created_at"])
+                < timestamp - PAIRING_CLOCK_SKEW_SECONDS
+                or int(normalized["created_at"])
+                > timestamp + PAIRING_CLOCK_SKEW_SECONDS
             ):
                 raise SecurePeerError(
                     "pairing_expired",
@@ -6010,6 +6013,7 @@ class SecurePeerClient:
         "port",
         "status",
         "pairing_id",
+        "pairing_expires_at",
         "peer_id",
         "team_id",
         "scopes_json",
@@ -6120,11 +6124,98 @@ class SecurePeerClient:
         return connections + attempts
 
     def actionable_pairing_count(self) -> int:
+        self.expire_pending_pairings()
         connection = self._connect()
         try:
             return self._actionable_pairing_count(connection)
         finally:
             connection.close()
+
+    def expire_pending_pairings(self, *, limit: int = PAIRING_STATUS_LIMIT) -> int:
+        """Persist due outgoing expiry and retire only each CAS-winning key."""
+
+        bounded_limit = max(1, min(int(limit), PAIRING_STATUS_LIMIT))
+        return self._expire_pending_pairings_locked(limit=bounded_limit)
+
+    def _expire_pending_pairings_locked(self, *, limit: int) -> int:
+        timestamp = self._timestamp()
+        expired: list[str] = []
+        # The shared capacity lock is deliberately sufficient here. This
+        # method can be called by the host's capacity callback while that same
+        # reentrant lock is held; taking the per-client request lock would
+        # invert begin_pairing's order. BEGIN IMMEDIATE plus the exact CAS also
+        # serializes pollers in separate client objects/processes.
+        with self._pairing_capacity_lock:
+            connection = self._connect()
+            try:
+                connection.execute("BEGIN IMMEDIATE")
+                rows = connection.execute(
+                    """SELECT connection_id,pairing_id,pairing_expires_at
+                    FROM client_connections
+                    WHERE status='pending' AND pairing_expires_at IS NOT NULL
+                    AND pairing_expires_at<=?
+                    ORDER BY pairing_expires_at,connection_id LIMIT ?""",
+                    (timestamp, limit),
+                ).fetchall()
+                for row in rows:
+                    changed = connection.execute(
+                        """UPDATE client_connections
+                        SET status='expired',updated_at=?
+                        WHERE connection_id=? AND pairing_id=?
+                        AND status='pending' AND pairing_expires_at=?""",
+                        (
+                            timestamp,
+                            row["connection_id"],
+                            row["pairing_id"],
+                            row["pairing_expires_at"],
+                        ),
+                    ).rowcount
+                    if changed == 1:
+                        expired.append(str(row["connection_id"]))
+                connection.execute("COMMIT")
+            except BaseException:
+                if connection.in_transaction:
+                    connection.execute("ROLLBACK")
+                raise
+            finally:
+                connection.close()
+        cleanup = set(expired)
+        cleanup.update(self._expired_pairings_with_live_material())
+        for connection_id in sorted(cleanup):
+            self._retire_client_key_material(connection_id)
+        return len(expired)
+
+    def _expired_pairings_with_live_material(self) -> set[str]:
+        """Find committed expiry rows left live by a pre-cleanup process exit."""
+
+        material_ids = {
+            path.name[:36]
+            for path in self.keys_dir.iterdir()
+            if _UUID4_RE.fullmatch(path.name[:36]) is not None
+            and (
+                path.name.startswith(path.name[:36] + ".")
+                or path.name.startswith(path.name[:36] + "-")
+            )
+        }
+        if not material_ids:
+            return set()
+        expired: set[str] = set()
+        connection = self._connect()
+        try:
+            ordered = sorted(material_ids)
+            for offset in range(0, len(ordered), 400):
+                chunk = ordered[offset : offset + 400]
+                placeholders = ",".join("?" for _item in chunk)
+                rows = connection.execute(
+                    f"""SELECT connection_id FROM client_connections
+                    WHERE status='expired' AND pairing_expires_at IS NOT NULL
+                    AND connection_id IN ({placeholders})""",
+                    chunk,
+                ).fetchall()
+                expired.update(str(row["connection_id"]) for row in rows)
+        finally:
+            connection.close()
+        return expired
 
     def _external_pairing_count(self) -> int:
         if self._external_actionable_pairing_count is None:
@@ -6165,6 +6256,7 @@ class SecurePeerClient:
                     connection_id TEXT PRIMARY KEY, host_ip TEXT NOT NULL, port INTEGER NOT NULL,
                     status TEXT NOT NULL, pairing_id TEXT NOT NULL UNIQUE,
                     pairing_request_id TEXT NOT NULL UNIQUE, poll_token TEXT NOT NULL,
+                    pairing_expires_at INTEGER,
                     pairing_request_json TEXT, pairing_request_digest BLOB,
                     peer_id TEXT, team_id TEXT, scopes_json TEXT,
                     host_server_identity TEXT NOT NULL, hub_id TEXT NOT NULL,
@@ -6236,6 +6328,13 @@ class SecurePeerClient:
             if "pairing_request_digest" not in columns:
                 connection.execute(
                     "ALTER TABLE client_connections ADD COLUMN pairing_request_digest BLOB"
+                )
+            if "pairing_expires_at" not in columns:
+                # Legacy rows deliberately remain NULL: the host derives its
+                # final deadline using host time, so no exact value can be
+                # reconstructed safely from the original client request.
+                connection.execute(
+                    "ALTER TABLE client_connections ADD COLUMN pairing_expires_at INTEGER"
                 )
             route_columns = {
                 row["name"]
@@ -6583,6 +6682,7 @@ class SecurePeerClient:
         resume_matching: bool = False,
     ) -> dict[str, Any]:
         with self._pairing_request_guard:
+            self._expire_pending_pairings_locked(limit=PAIRING_STATUS_LIMIT)
             host = canonical_peer_ipv4(host_ip)
             canonical_port = canonical_peer_port(port)
             requested_values = SecurePeerStore._canonical_scopes(requested_scopes)
@@ -6899,6 +6999,20 @@ class SecurePeerClient:
         ):
             self._retire_pairing_attempt(attempt)
             raise SecurePeerError("transcript_mismatch", "Pairing transcript confirmation failed", 409)
+        response_received_at = self._timestamp()
+        if response["status"] == "pending" and (
+            response["expires_at"] <= response_received_at
+            or response["expires_at"]
+            > int(request["created_at"]) + PAIRING_TTL_SECONDS
+            or response["expires_at"]
+            > response_received_at
+            + PAIRING_TTL_SECONDS
+            + PAIRING_CLOCK_SKEW_SECONDS
+        ):
+            self._retire_pairing_attempt(attempt)
+            raise SecurePeerError(
+                "remote_invalid", "Pairing response expiry is invalid", 502
+            )
         if response["status"] in {"rejected", "cancelled", "expired"}:
             self._retire_pairing_attempt(attempt)
             terminal_status = str(response["status"])
@@ -6918,11 +7032,12 @@ class SecurePeerClient:
             connection.execute(
                 """INSERT INTO client_connections(
                     connection_id,host_ip,port,status,pairing_id,pairing_request_id,poll_token,
+                    pairing_expires_at,
                     pairing_request_json,pairing_request_digest,
                     host_server_identity,hub_id,host_ca_certificate_pem,host_ca_fingerprint,
                     transcript_hash,sas_json,key_path,created_at,updated_at
                     ,requested_scopes_json,peer_public_key_fingerprint
-                ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                 (
                     connection_id,
                     host,
@@ -6931,6 +7046,11 @@ class SecurePeerClient:
                     response["pairing_id"],
                     canonical_request_id,
                     response["poll_token"],
+                    (
+                        response["expires_at"]
+                        if response["status"] == "pending"
+                        else None
+                    ),
                     canonical_json(request).decode("utf-8"),
                     hashlib.sha256(canonical_json(request)).digest(),
                     health["host_server_identity"],
@@ -6999,6 +7119,7 @@ class SecurePeerClient:
 
         bounded_limit = max(1, min(int(limit), 8))
         with self._pairing_request_guard:
+            self._expire_pending_pairings_locked(limit=PAIRING_STATUS_LIMIT)
             connection = self._connect()
             try:
                 rows = connection.execute(
@@ -7106,6 +7227,7 @@ class SecurePeerClient:
         return row["value"] if row is not None else None
 
     def list_connections(self) -> list[dict[str, Any]]:
+        self.expire_pending_pairings()
         connection = self._connect()
         try:
             active = self._active_id(connection)
@@ -7116,6 +7238,7 @@ class SecurePeerClient:
 
     def get_connection(self, connection_id: str) -> dict[str, Any]:
         canonical = _uuid(connection_id, "connection_id")
+        self.expire_pending_pairings()
         connection = self._connect()
         try:
             row = connection.execute("SELECT * FROM client_connections WHERE connection_id=?", (canonical,)).fetchone()
@@ -7238,6 +7361,7 @@ class SecurePeerClient:
 
     def poll_pairing(self, connection_id: str) -> dict[str, Any]:
         with self._pairing_request_guard:
+            self._expire_pending_pairings_locked(limit=PAIRING_STATUS_LIMIT)
             return self._poll_pairing_locked(connection_id)
 
     def _poll_pairing_locked(self, connection_id: str) -> dict[str, Any]:
@@ -7549,6 +7673,7 @@ class SecurePeerClient:
         self, connection_id: str, idempotency_key: str
     ) -> dict[str, Any]:
         with self._pairing_request_guard:
+            self._expire_pending_pairings_locked(limit=PAIRING_STATUS_LIMIT)
             return self._cancel_pairing_locked(connection_id, idempotency_key)
 
     def _cancel_pairing_locked(

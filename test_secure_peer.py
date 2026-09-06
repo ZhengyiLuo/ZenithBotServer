@@ -21,6 +21,7 @@ from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 from agentsdock_team_hub.secure_peer import (
     ACTIVATED_RENEWAL_HISTORY_LIMIT,
     MAX_RELAY_LEGS,
+    PAIRING_CLOCK_SKEW_SECONDS,
     PAIRING_ATTEMPT_RETENTION_SECONDS,
     PAIRING_STATUS_LIMIT,
     PAIRING_TTL_SECONDS,
@@ -2602,6 +2603,180 @@ class SecurePeerLiveTLSTests(unittest.TestCase):
             idempotency_key=_uuid(),
         )
         return self.client.poll_pairing(connection["connection_id"])
+
+    def test_outgoing_pending_pairing_expires_offline_and_retires_authority(
+        self,
+    ) -> None:
+        clock = _Clock()
+        client = SecurePeerClient(
+            self.client.data_dir.parent / "expiring-client",
+            "expiring-peer-live",
+            "Expiring peer",
+            clock=clock,
+            timeout_seconds=5,
+        )
+        pending = client.begin_pairing(
+            self.host_ip,
+            self.port,
+            expected_ca_fingerprint=self.store.ca_fingerprint,
+            requested_scopes=["teamspace.read"],
+        )
+        self.assertIsInstance(pending["pairing_expires_at"], int)
+        self.assertGreater(pending["pairing_expires_at"], clock.value)
+        clock.value = pending["pairing_expires_at"] + 1
+
+        with mock.patch.object(client, "_request") as remote_request:
+            expired = client.poll_pairing(pending["connection_id"])
+        remote_request.assert_not_called()
+        self.assertEqual(expired["status"], "expired")
+        self.assertEqual(expired["pairing_expires_at"], pending["pairing_expires_at"])
+        self.assertEqual(client.actionable_pairing_count(), 0)
+        self.assertEqual(list(client.keys_dir.iterdir()), [])
+        self.assertTrue(any((client.data_dir / "retired").iterdir()))
+
+    def test_pending_pairing_rejects_past_and_far_future_remote_deadlines(
+        self,
+    ) -> None:
+        deadlines = {
+            "past": lambda: int(time.time()) - 1,
+            "far-future": lambda: (
+                int(time.time())
+                + PAIRING_TTL_SECONDS
+                + PAIRING_CLOCK_SKEW_SECONDS
+                + 10
+            ),
+        }
+        for label, deadline in deadlines.items():
+            with self.subTest(deadline=label):
+                original_decode = self.client._decode_json_response
+                calls = 0
+
+                def replace_deadline(*args, **kwargs):
+                    nonlocal calls
+                    response = original_decode(*args, **kwargs)
+                    calls += 1
+                    if calls == 2:
+                        self.assertEqual(response.get("status"), "pending")
+                        response["expires_at"] = deadline()
+                    return response
+
+                with mock.patch.object(
+                    self.client,
+                    "_decode_json_response",
+                    side_effect=replace_deadline,
+                ):
+                    with self.assertRaises(SecurePeerError) as invalid:
+                        self.client.begin_pairing(
+                            self.host_ip,
+                            self.port,
+                            expected_ca_fingerprint=self.store.ca_fingerprint,
+                            requested_scopes=["teamspace.read"],
+                        )
+                self.assertEqual(invalid.exception.code, "remote_invalid")
+                self.assertEqual(list(self.client.keys_dir.iterdir()), [])
+
+    def test_outgoing_expiry_cas_wins_over_concurrent_approved_poll(self) -> None:
+        pending = self.client.begin_pairing(
+            self.host_ip,
+            self.port,
+            expected_ca_fingerprint=self.store.ca_fingerprint,
+            requested_scopes=["teamspace.read"],
+        )
+        incoming = self.store.list_pairings(status="pending")[0]
+        self.store.approve_pairing(
+            incoming["pairing_id"],
+            "team-alpha",
+            incoming["requested_scopes"],
+            "owner-admin",
+            expected_peer_server_identity=incoming["peer_server_identity"],
+            expected_transcript_hash=incoming["transcript_hash"],
+            idempotency_key=_uuid(),
+        )
+        competing = SecurePeerClient(
+            self.client.data_dir,
+            self.client.server_identity,
+            self.client.display_name,
+            clock=lambda: pending["pairing_expires_at"] + 1,
+            timeout_seconds=5,
+        )
+        validated = threading.Event()
+        release = threading.Event()
+        results: list[dict] = []
+        errors: list[BaseException] = []
+        original_validate = self.client._validate_issued_client_certificate
+
+        def pause_after_validation(*args, **kwargs):
+            result = original_validate(*args, **kwargs)
+            validated.set()
+            if not release.wait(5):
+                raise TimeoutError("test did not release pairing poll")
+            return result
+
+        def poll() -> None:
+            try:
+                results.append(self.client.poll_pairing(pending["connection_id"]))
+            except BaseException as exc:
+                errors.append(exc)
+
+        with mock.patch.object(
+            self.client,
+            "_validate_issued_client_certificate",
+            side_effect=pause_after_validation,
+        ):
+            worker = threading.Thread(target=poll)
+            worker.start()
+            self.assertTrue(validated.wait(5))
+            self.assertEqual(competing.expire_pending_pairings(), 1)
+            release.set()
+            worker.join(5)
+
+        self.assertFalse(worker.is_alive())
+        self.assertEqual(errors, [])
+        self.assertEqual([item["status"] for item in results], ["expired"])
+        self.assertEqual(
+            self.client.get_connection(pending["connection_id"])["status"],
+            "expired",
+        )
+        self.assertEqual(list(self.client.keys_dir.iterdir()), [])
+
+    def test_client_schema_migration_preserves_legacy_unknown_pairing_deadline(
+        self,
+    ) -> None:
+        pending = self.client.begin_pairing(
+            self.host_ip,
+            self.port,
+            expected_ca_fingerprint=self.store.ca_fingerprint,
+            requested_scopes=["teamspace.read"],
+        )
+        database = self.client._connect()
+        try:
+            database.execute(
+                "ALTER TABLE client_connections DROP COLUMN pairing_expires_at"
+            )
+        finally:
+            database.close()
+
+        restarted = SecurePeerClient(
+            self.client.data_dir,
+            self.client.server_identity,
+            self.client.display_name,
+            clock=lambda: pending["pairing_expires_at"] + 10_000,
+            timeout_seconds=5,
+        )
+        database = restarted._connect()
+        try:
+            columns = {
+                row["name"]
+                for row in database.execute(
+                    "PRAGMA table_info(client_connections)"
+                ).fetchall()
+            }
+        finally:
+            database.close()
+        migrated = restarted.get_connection(pending["connection_id"])
+        self.assertIn("pairing_expires_at", columns)
+        self.assertIsNone(migrated["pairing_expires_at"])
+        self.assertEqual(migrated["status"], "pending")
 
     def test_cancel_pairing_is_locally_terminal_and_response_loss_idempotent(self) -> None:
         pending = self.client.begin_pairing(
