@@ -320,11 +320,13 @@ class InstallerContractTests(unittest.TestCase):
             self.skipTest("Linux /proc cgroup fixture is unavailable")
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary).resolve()
-            _home, fake_bin, _install_root, environment = (
+            home, fake_bin, _install_root, environment = (
                 self.fake_linux_preinstall_environment(root)
             )
+            self.write_running_systemd_service(home)
             events = root / "systemctl.log"
             stopped = root / "stopped"
+            count = root / "show-count"
             self.write_exact_health_uv(fake_bin)
             self.write_json_health_curl(fake_bin)
             self.write_executable(fake_bin / "sleep", "#!/bin/sh\nexit 0\n")
@@ -334,8 +336,19 @@ class InstallerContractTests(unittest.TestCase):
 printf '%s\n' "$*" >> "$FAKE_SYSTEMCTL_LOG"
 case "$*" in
   "--user show-environment") exit 0 ;;
+  "--user show agents-server.service --property=LoadState --value") echo loaded; exit 0 ;;
+  "--user is-enabled agents-server.service") echo enabled; exit 0 ;;
+  "--user show zenithbot-agent.service --property=LoadState --value") echo not-found; exit 0 ;;
+  "--user show zenithbot-agent.service --property=ActiveState --value") echo inactive; exit 0 ;;
+  "--user is-enabled zenithbot-agent.service") echo not-found; exit 1 ;;
   "--user show agents-server.service --property=ActiveState --value")
-    if [ -e "$FAKE_STOPPED_SENTINEL" ]; then echo inactive; else echo deactivating; fi
+    current="$(cat "$FAKE_SHOW_COUNT" 2>/dev/null || echo 0)"
+    current=$((current + 1))
+    printf '%s\n' "$current" > "$FAKE_SHOW_COUNT"
+    if [ -e "$FAKE_STOPPED_SENTINEL" ]; then echo inactive
+    elif [ "$current" -eq 1 ]; then echo active
+    else echo deactivating
+    fi
     exit 0
     ;;
   "--user kill --kill-who=all --signal=SIGKILL agents-server.service")
@@ -348,8 +361,10 @@ exit 0
             )
             server_identity = "server_test_identity_12345678"
             environment.update({
+                "FAKE_AUTHORITATIVE_SYSTEMCTL": "false",
                 "FAKE_SYSTEMCTL_LOG": str(events),
                 "FAKE_STOPPED_SENTINEL": str(stopped),
+                "FAKE_SHOW_COUNT": str(count),
                 "FAKE_HEALTH_VERSION": self.release_version(),
                 "FAKE_SERVER_IDENTITY": server_identity,
                 "FAKE_TEAM_HUB_ID": "",
@@ -359,6 +374,8 @@ exit 0
                 [
                     "/bin/bash",
                     str(INSTALLER),
+                    "--port",
+                    "47850",
                     "--non-interactive",
                     "--expected-server-identity",
                     server_identity,
@@ -387,9 +404,10 @@ exit 0
             self.skipTest("Linux /proc cgroup fixture is unavailable")
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary).resolve()
-            _home, fake_bin, _install_root, environment = (
+            home, fake_bin, _install_root, environment = (
                 self.fake_linux_preinstall_environment(root)
             )
+            self.write_running_systemd_service(home)
             events = root / "systemctl.log"
             count = root / "show-count"
             self.write_exact_health_uv(fake_bin)
@@ -401,11 +419,19 @@ exit 0
 printf '%s\n' "$*" >> "$FAKE_SYSTEMCTL_LOG"
 case "$*" in
   "--user show-environment") exit 0 ;;
+  "--user show agents-server.service --property=LoadState --value") echo loaded; exit 0 ;;
+  "--user is-enabled agents-server.service") echo enabled; exit 0 ;;
+  "--user show zenithbot-agent.service --property=LoadState --value") echo not-found; exit 0 ;;
+  "--user show zenithbot-agent.service --property=ActiveState --value") echo inactive; exit 0 ;;
+  "--user is-enabled zenithbot-agent.service") echo not-found; exit 1 ;;
   "--user show agents-server.service --property=ActiveState --value")
     current="$(cat "$FAKE_SHOW_COUNT" 2>/dev/null || echo 0)"
     current=$((current + 1))
     printf '%s\n' "$current" > "$FAKE_SHOW_COUNT"
-    if [ "$current" -gt 50 ]; then echo inactive; else echo deactivating; fi
+    if [ "$current" -eq 1 ]; then echo active
+    elif [ "$current" -gt 50 ]; then echo inactive
+    else echo deactivating
+    fi
     exit 0
     ;;
   "--user kill --kill-who=all --signal=SIGKILL agents-server.service")
@@ -417,6 +443,7 @@ exit 0
             )
             server_identity = "server_test_identity_12345678"
             environment.update({
+                "FAKE_AUTHORITATIVE_SYSTEMCTL": "false",
                 "FAKE_SYSTEMCTL_LOG": str(events),
                 "FAKE_SHOW_COUNT": str(count),
                 "FAKE_HEALTH_VERSION": self.release_version(),
@@ -428,6 +455,8 @@ exit 0
                 [
                     "/bin/bash",
                     str(INSTALLER),
+                    "--port",
+                    "47850",
                     "--non-interactive",
                     "--expected-server-identity",
                     server_identity,
