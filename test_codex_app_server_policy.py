@@ -114,14 +114,14 @@ class CodexThreadPolicyTests(unittest.IsolatedAsyncioTestCase):
                 "chat-1",
                 session,
             )
-            with patch.object(agent_server, "CODEX_THREAD_POLICY_VERSION", "7"):
+            with patch.object(agent_server, "CODEX_THREAD_POLICY_VERSION", "8"):
                 previous_hash = agent_server.codex_thread_instruction_hash(
                     "chat-1",
                     session,
                 )
 
-        # v8 migrates resumed threads onto the context-diet instructions.
-        self.assertEqual(agent_server.CODEX_THREAD_POLICY_VERSION, "8")
+        # v9 also migrates resumed threads onto resumable live-wait policy.
+        self.assertEqual(agent_server.CODEX_THREAD_POLICY_VERSION, "9")
         self.assertNotEqual(current_hash, previous_hash)
 
     def test_claude_policy_has_the_same_retry_and_context_hygiene_rules(self) -> None:

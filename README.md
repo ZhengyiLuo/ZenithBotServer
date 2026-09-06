@@ -924,10 +924,14 @@ automatically relays the target's ordinary final answer, cannot request a
 follow-up, and grants no durable reverse route. Ask explicitly requests one
 terminal answer over the same exchange-scoped return mechanism. It commits
 immediately as a durable two-leg agent message and keeps the source provider
-call attached until that answer arrives or the exchange is explicitly stopped.
+turn attached until that answer arrives or the exchange is explicitly stopped.
 The target delivery remains a normal durable turn and waits in its FIFO when
-that chat is busy. Bounded HTTP heartbeat responses reconnect the helper to the
-same lease; they do not convert the request into a later source-chat turn.
+that chat is busy. Each helper invocation observes one bounded HTTP heartbeat
+slice and returns either the answer or a resumable `pending=true` receipt. The
+provider immediately runs a new foreground `wait` call with the same exact
+lease after every pending receipt. Those slices stay below provider shell-tool
+caps; they never convert the exchange into a later source-chat turn or impose a
+semantic response deadline.
 
 Active agent messaging is strictly same-server: Studio chats can address only
 Studio chats, and Sonic chats can address only Sonic chats. Communication
@@ -980,6 +984,8 @@ warranted):
   send --route route_opaque --message "Verify the API contract."
 "$AGENTSDOCK_CHATS_CLI" --authority-file /path/from/turn.json \
   ask --route route_opaque --message "Which rollout is blocked?"
+"$AGENTSDOCK_CHATS_CLI" --authority-file /path/from/turn.json \
+  wait --exchange exchange_exact --inbound-leg leg_exact --lease lease_exact
 ```
 
 The helper never exposes or accepts an inferred chat ID. It accepts only the
@@ -989,9 +995,12 @@ message. Send creates a correlated two-leg exchange with one optional terminal
 reply capability available only to its exact delivery run. If the target does
 not deliberately use that capability, its ordinary final stays local and the
 exchange closes without sending anything back. Ask creates the same bounded
-two-leg exchange and, by default, keeps the helper attached to its exact live
-lease until the answer or a terminal failure. A live-request exchange does not
-expire merely because its original 24-hour authorization window elapsed.
+two-leg exchange and, by default, keeps the provider turn attached to its
+exact live lease through bounded foreground `wait` slices until the answer or
+a terminal failure. A pending receipt requires another exact `wait` call; it
+is not a timeout or permission to finish the turn. A live-request exchange
+does not expire merely because its original 24-hour authorization window
+elapsed.
 Explicit `--async-response` and restart recovery deliver the eventual result
 in a later source-chat turn.
 
@@ -1092,8 +1101,9 @@ The turn-scoped helper surface accepts only opaque issued route IDs:
 
 `list` is capability-scoped; there is no provider chat search or arbitrary
 target parameter. `Ask` is not transcript access: it creates a normal target
-turn containing only the bounded relayed message, then keeps the source helper
-on the exact live lease until one terminal answer arrives. `--async-response`
+turn containing only the bounded relayed message, then keeps the source
+provider turn on the exact live lease through separate foreground `wait`
+slices until one terminal answer arrives. `--async-response`
 is the explicit compatibility mode that returns immediately and later queues
 the answer in the source chat. Configured-route Send and Ask are limited to two
 legs; non-live exchanges expire after 24 hours, while an attached live Ask is

@@ -2096,7 +2096,7 @@ class ClaudeSDKRunnerTests(unittest.IsolatedAsyncioTestCase):
             )
 
         self.assertEqual(captured_options["permission_mode"], "plan")
-        self.assertEqual(agent_server.CLAUDE_SDK_CONFIGURATION_VERSION, 7)
+        self.assertEqual(agent_server.CLAUDE_SDK_CONFIGURATION_VERSION, 8)
         self.assertEqual(
             captured_options["disallowed_tools"],
             ["CronCreate", "Monitor", "ScheduleWakeup"],
@@ -2141,7 +2141,7 @@ class ClaudeSDKRunnerTests(unittest.IsolatedAsyncioTestCase):
             session,
             Path(self.cwd) / ".manifest.json",
         )
-        with patch.object(agent_server, "CLAUDE_SDK_CONFIGURATION_VERSION", 6):
+        with patch.object(agent_server, "CLAUDE_SDK_CONFIGURATION_VERSION", 7):
             previous_version_key = agent_server.claude_sdk_configuration_key(
                 session,
                 self.cwd,

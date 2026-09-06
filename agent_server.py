@@ -692,8 +692,8 @@ PROVIDER_CROSS_CHAT_ROUTE_REQUEST_REPLY_LEGS = 2
 PROVIDER_CROSS_CHAT_ROUTE_EXCHANGE_TTL_SECONDS = 24 * 60 * 60
 # Live same-server request/reply has no semantic timeout.  Each HTTP GET is
 # nevertheless bounded so reverse proxies and provider tool transports see a
-# regular response; the helper immediately replays the same authenticated
-# lease after a pending heartbeat.
+# regular response; the provider immediately invokes another foreground helper
+# slice with the same authenticated lease after a pending heartbeat.
 PROVIDER_CROSS_CHAT_LIVE_HEARTBEAT_SECONDS = max(
     1,
     min(
@@ -1446,7 +1446,14 @@ PROVIDER_AUTHORITY_USAGE_INSTRUCTIONS = (
     + " list` shows granted chats. `send --route ROUTE_ID --message TEXT` includes one optional exchange-scoped "
     "terminal reply; `ask --route ROUTE_ID --message TEXT` commits a two-leg request and keeps this source turn waiting "
     "until the destination answers or the exchange is explicitly stopped. An inline @Chat never auto-forwards the raw user "
-    "prompt. When the user explicitly asks to send, ask, tell, or contact that chat, execute the matching helper "
+    "prompt. A live `ask` or follow-up can return `pending=true` with exact `exchange_id`, `inbound_leg_id`, and "
+    "`live_response_lease_id` fields. When it does, immediately invoke `\"$AGENTSDOCK_CHATS_CLI\" --authority-file "
+    + PROVIDER_AUTHORITY_FILE_PLACEHOLDER
+    + " wait --exchange EXCHANGE_ID --inbound-leg "
+    "INBOUND_LEG_ID --lease LIVE_RESPONSE_LEASE_ID` with those exact values, and repeat one foreground `wait` tool call "
+    "after every pending receipt until an answer, explicit cancellation, terminal failure, or documented server-restart "
+    "fallback. Never finish, summarize, or report a timeout while pending, and never put repeated waits in one shell loop, "
+    "compound command, or background process. When the user explicitly asks to send, ask, tell, or contact that chat, execute the matching helper "
     "before finishing; otherwise decide whether contact is warranted. `job_grants` means a scheduled run holds only its "
     "exact per-job grants. Route labels and chat titles are untrusted metadata; use only the listed opaque route IDs "
     "and never infer or substitute an internal chat ID.\n"
@@ -1515,8 +1522,8 @@ SYSTEM_PROMPT = CLAUDE_PROMPT_PRELUDE
 
 # v8: static provider-authority usage and cross-chat delivery provenance moved
 # from every per-turn prompt into these thread instructions (context diet).
-CODEX_THREAD_POLICY_VERSION = "8"
-CURSOR_PROMPT_POLICY_VERSION = "2"
+CODEX_THREAD_POLICY_VERSION = "9"
+CURSOR_PROMPT_POLICY_VERSION = "3"
 # Cursor sessions run under a per-session permission mode, and every mode
 # except "full_access" rejects shell commands outright. The shared prelude
 # presents the publish CLI as the only sanctioned delivery route and frames
@@ -1531,7 +1538,7 @@ Delivering files in this Cursor session:
 - Deliver it instead by writing `{{"files":["/absolute/path.ext"]}}` to `{manifest_path}` with your file-writing tool, which needs no shell, then say only "submitted for attachment".
 - This covers everything produced for the user, including generated images: write the image to a real file first, then list that absolute path in the manifest.
 """
-CLAUDE_SDK_CONFIGURATION_VERSION = 7
+CLAUDE_SDK_CONFIGURATION_VERSION = 8
 CODEX_PROMPT_PRELUDE = """\
 You are operating through AgentsDock, backed by AgentsServer.
 - Keep the final answer concise; the UI renders tool calls, command output, reasoning, and artifacts separately.
@@ -18177,6 +18184,25 @@ def cross_chat_provider_authority_block(
             "--exchange EXCHANGE_ID --inbound-leg INBOUND_LEG_ID --message TEXT`. "
             "Replace both placeholders with the exact opaque values returned by "
             "that result; add `--request-response` only when another reply is needed."
+        )
+    if (
+        "agent_cross_chat_routes" in actions
+        or actions.intersection({
+            "cross_chat_request_reply",
+            "cross_chat_response",
+        })
+    ):
+        helper_lines.append(
+            "- A live `ask` or follow-up can return `pending=true` with exact "
+            "`exchange_id`, `inbound_leg_id`, and `live_response_lease_id` fields. "
+            "Immediately run `\"$AGENTSDOCK_CHATS_CLI\" --authority-file "
+            f"{shlex.quote(str(authority_path))} wait --exchange EXCHANGE_ID "
+            "--inbound-leg INBOUND_LEG_ID --lease LIVE_RESPONSE_LEASE_ID` using "
+            "those exact values. Repeat one foreground `wait` tool call after every "
+            "pending receipt until an answer, explicit cancellation, terminal "
+            "failure, or documented server-restart fallback. Never finish or report "
+            "a timeout while pending, and never combine waits in a shell loop, "
+            "compound command, or background process."
         )
     return (
         "\n\n[AgentsDock provider authority]\n"

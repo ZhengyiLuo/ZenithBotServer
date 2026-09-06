@@ -1853,6 +1853,17 @@ class CursorFileDeliveryInstructionTests(unittest.TestCase):
         current = agent_server.cursor_instruction_hash("chat-x", {}, manifest)
         self.assertNotEqual(previous, current)
 
+    def test_policy_version_changes_so_resumed_sessions_reinject(self) -> None:
+        manifest = Path("/tmp/agentsdock-state/sessions/chat-x/manifest.json")
+        with patch.object(agent_server, "CURSOR_PROMPT_POLICY_VERSION", "2"):
+            previous = agent_server.cursor_instruction_hash(
+                "chat-x", {}, manifest
+            )
+        current = agent_server.cursor_instruction_hash("chat-x", {}, manifest)
+
+        self.assertEqual(agent_server.CURSOR_PROMPT_POLICY_VERSION, "3")
+        self.assertNotEqual(previous, current)
+
 
 if __name__ == "__main__":
     unittest.main()
