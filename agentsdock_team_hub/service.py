@@ -773,7 +773,13 @@ def create_app(
             )
         if request.method == "OPTIONS":
             requested_method = request.headers.get("access-control-request-method")
-            if origin is None or requested_method not in {"GET", "POST", "PUT", "PATCH"}:
+            if origin is None or requested_method not in {
+                "GET",
+                "POST",
+                "PUT",
+                "PATCH",
+                "DELETE",
+            }:
                 return _error("origin_forbidden", "Origin is not permitted", 403)
             requested_headers = request.headers.get("access-control-request-headers", "")
             allowed_request_headers = {
@@ -795,7 +801,7 @@ def create_app(
                 status_code=204,
                 headers={
                     "Access-Control-Allow-Origin": origin,
-                    "Access-Control-Allow-Methods": "GET, POST, PUT, PATCH",
+                    "Access-Control-Allow-Methods": "GET, POST, PUT, PATCH, DELETE",
                     "Access-Control-Allow-Headers": requested_headers,
                     "Vary": "Origin",
                 },
@@ -901,7 +907,7 @@ def create_app(
                 return with_allowed_origin(
                     _error("invalid_request", "Exactly one Content-Range is required", 400)
                 )
-        elif request.method in {"POST", "PUT", "PATCH"}:
+        elif request.method in {"POST", "PUT", "PATCH", "DELETE"}:
             if len(lengths) != 1:
                 return with_allowed_origin(
                     _error("invalid_request", "Exactly one Content-Length is required", 400)
