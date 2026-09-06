@@ -722,13 +722,33 @@ class ServerOpsSecurityTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(agent_server.server_update_has_blockers(update_counts))
         self.assertEqual(update_counts["provider_background_tasks"], 1)
 
-    def test_update_runner_liveness_rejects_dead_pane_and_reused_pid(self):
+    def test_update_runner_liveness_accepts_only_exact_live_tmux_probe(self):
         update_id = "a" * 32
         status = {"phase": "checking", "update_id": update_id}
-        dead_pane = SimpleNamespace(returncode=0, stdout="1\n")
-        with patch.object(agent_server, "working_tmux_bin", return_value="/usr/bin/tmux"), \
-             patch.object(agent_server, "run_tmux", return_value=dead_pane):
-            self.assertFalse(agent_server.server_update_is_active(status))
+        cases = (
+            ("live", "0\n", True),
+            ("dead", "1\n", False),
+            ("missing_target_blank", "", False),
+            ("unexpected", "unknown\n", False),
+        )
+        for label, stdout, expected in cases:
+            with self.subTest(case=label), patch.object(
+                agent_server,
+                "working_tmux_bin",
+                return_value="/usr/bin/tmux",
+            ), patch.object(
+                agent_server,
+                "run_tmux",
+                return_value=SimpleNamespace(returncode=0, stdout=stdout),
+            ):
+                self.assertEqual(
+                    agent_server.server_update_is_active(status),
+                    expected,
+                )
+
+    def test_update_runner_liveness_rejects_reused_pid(self):
+        update_id = "a" * 32
+        status = {"phase": "checking", "update_id": update_id}
 
         pid_status = {**status, "runner_pid": 4242}
         with patch.object(
