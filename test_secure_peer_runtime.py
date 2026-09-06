@@ -22,6 +22,245 @@ from secure_peer_runtime import SecurePeerRuntime
 
 
 class SecurePeerRuntimeTests(unittest.TestCase):
+    def test_team_deletion_wrappers_cover_host_remote_and_read_only_realms(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            runtime = SecurePeerRuntime(
+                Path(temporary) / "secure-peers",
+                server_identity="source_server",
+                server_instance_id="source_instance",
+                display_name="Source",
+            )
+            host_calls: list[tuple] = []
+
+            class HostStore:
+                hub_id = "hub_host_delete"
+
+                @staticmethod
+                def local_agent_mail_claims(team_id):
+                    host_calls.append(("claims", team_id))
+                    return "host-claims"
+
+                @staticmethod
+                def delete_team_message(claims, team_id, message_id, body):
+                    host_calls.append(
+                        ("message", claims, team_id, message_id, dict(body))
+                    )
+                    return {"deleted": True, "message_id": message_id}
+
+                @staticmethod
+                def delete_network_bulletin_post(claims, team_id, post_id, body):
+                    host_calls.append(
+                        ("bulletin", claims, team_id, post_id, dict(body))
+                    )
+                    return {"deleted": True, "post_id": post_id}
+
+                @staticmethod
+                def list_network_content_deletions(
+                    claims,
+                    team_id,
+                    *,
+                    after_sequence,
+                    limit,
+                ):
+                    host_calls.append(
+                        ("journal", claims, team_id, after_sequence, limit)
+                    )
+                    return {
+                        "deletions": [
+                            {
+                                "sequence": 8,
+                                "kind": "message",
+                                "id": "tmsg_host_delete_001",
+                                "deleted_at": "2026-09-05T12:00:00Z",
+                            }
+                        ],
+                        "next_after_sequence": 8,
+                        "has_more": False,
+                    }
+
+            host_realm = {
+                "realm": "host",
+                "team_id": "team_host_delete",
+                "hub_id": HostStore.hub_id,
+                "can_write": True,
+            }
+            runtime._hub_store = HostStore()
+            try:
+                with mock.patch.object(
+                    runtime,
+                    "team_realm",
+                    return_value=host_realm,
+                ):
+                    self.assertEqual(
+                        runtime.team_delete_message(
+                            "tmsg_host_delete_001",
+                            "host-message-delete-key",
+                            team_id="team_host_delete",
+                        ),
+                        {
+                            "deleted": True,
+                            "message_id": "tmsg_host_delete_001",
+                        },
+                    )
+                    self.assertEqual(
+                        runtime.team_delete_bulletin_post(
+                            "message_host_delete_001",
+                            "host-bulletin-delete-key",
+                            team_id="team_host_delete",
+                        ),
+                        {
+                            "deleted": True,
+                            "post_id": "message_host_delete_001",
+                        },
+                    )
+                    host_journal = runtime.team_list_deletions(
+                        team_id="team_host_delete",
+                        after_sequence=7,
+                        limit=2,
+                    )
+                self.assertEqual(host_journal["team_id"], "team_host_delete")
+                self.assertEqual(
+                    host_calls,
+                    [
+                        ("claims", "team_host_delete"),
+                        (
+                            "message",
+                            "host-claims",
+                            "team_host_delete",
+                            "tmsg_host_delete_001",
+                            {"idempotency_key": "host-message-delete-key"},
+                        ),
+                        ("claims", "team_host_delete"),
+                        (
+                            "bulletin",
+                            "host-claims",
+                            "team_host_delete",
+                            "message_host_delete_001",
+                            {"idempotency_key": "host-bulletin-delete-key"},
+                        ),
+                        ("claims", "team_host_delete"),
+                        ("journal", "host-claims", "team_host_delete", 7, 2),
+                    ],
+                )
+
+                remote_realm = {
+                    "realm": "secure_peer",
+                    "team_id": "team_remote_delete",
+                    "hub_id": "hub_remote_delete",
+                    "connection_id": "connection_remote_delete",
+                    "can_write": True,
+                }
+                responses = (
+                    ProxyResponse(
+                        200,
+                        (("content-type", "application/json"),),
+                        b'{"deleted":true,"message_id":"tmsg_remote_delete_001"}',
+                    ),
+                    ProxyResponse(
+                        200,
+                        (("content-type", "application/json"),),
+                        b'{"deleted":true,"post_id":"message_remote_delete_001"}',
+                    ),
+                    ProxyResponse(
+                        200,
+                        (("content-type", "application/json"),),
+                        b'{"deletions":[],"next_after_sequence":9,"has_more":false}',
+                    ),
+                )
+                with mock.patch.object(
+                    runtime,
+                    "team_realm",
+                    return_value=remote_realm,
+                ), mock.patch.object(
+                    runtime,
+                    "proxy",
+                    side_effect=responses,
+                ) as proxy:
+                    self.assertEqual(
+                        runtime.team_delete_message(
+                            "tmsg_remote_delete_001",
+                            "remote-message-delete-key",
+                            team_id="team_remote_delete",
+                        )["message_id"],
+                        "tmsg_remote_delete_001",
+                    )
+                    self.assertEqual(
+                        runtime.team_delete_bulletin_post(
+                            "message_remote_delete_001",
+                            "remote-bulletin-delete-key",
+                            team_id="team_remote_delete",
+                        )["post_id"],
+                        "message_remote_delete_001",
+                    )
+                    remote_journal = runtime.team_list_deletions(
+                        team_id="team_remote_delete",
+                        after_sequence=9,
+                        limit=3,
+                    )
+                self.assertEqual(remote_journal["team_id"], "team_remote_delete")
+                self.assertEqual(
+                    proxy.call_args_list,
+                    [
+                        mock.call(
+                            "connection_remote_delete",
+                            "DELETE",
+                            "/v1/teams/team_remote_delete/network/messages/"
+                            "tmsg_remote_delete_001",
+                            query="",
+                            headers={
+                                "accept": "application/json",
+                                "content-type": "application/json",
+                            },
+                            body=b'{"idempotency_key":"remote-message-delete-key"}',
+                        ),
+                        mock.call(
+                            "connection_remote_delete",
+                            "DELETE",
+                            "/v1/teams/team_remote_delete/network/bulletin/"
+                            "message_remote_delete_001",
+                            query="",
+                            headers={
+                                "accept": "application/json",
+                                "content-type": "application/json",
+                            },
+                            body=b'{"idempotency_key":"remote-bulletin-delete-key"}',
+                        ),
+                        mock.call(
+                            "connection_remote_delete",
+                            "GET",
+                            "/v1/teams/team_remote_delete/network/deletions",
+                            query="after_sequence=9&limit=3",
+                            headers={"accept": "application/json"},
+                            body=None,
+                        ),
+                    ],
+                )
+
+                read_only = {**remote_realm, "can_write": False}
+                with mock.patch.object(
+                    runtime,
+                    "team_realm",
+                    return_value=read_only,
+                ), mock.patch.object(runtime, "proxy") as proxy:
+                    for operation in (
+                        lambda: runtime.team_delete_message(
+                            "tmsg_remote_delete_001",
+                            "read-only-message-key",
+                            team_id="team_remote_delete",
+                        ),
+                        lambda: runtime.team_delete_bulletin_post(
+                            "message_remote_delete_001",
+                            "read-only-bulletin-key",
+                            team_id="team_remote_delete",
+                        ),
+                    ):
+                        with self.assertRaises(SecurePeerError) as denied:
+                            operation()
+                        self.assertEqual(denied.exception.code, "forbidden")
+                    proxy.assert_not_called()
+            finally:
+                runtime.shutdown()
+
     def test_human_mention_uses_exact_lookup_beyond_inventory_scale_locally_and_remotely(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             runtime = SecurePeerRuntime(
@@ -1130,6 +1369,45 @@ class SecurePeerRuntimeTests(unittest.TestCase):
             self.assertNotIn(connection_id, runtime._remote_routes_refreshed_at)
             self.assertIsNone(runtime._client_error)
             runtime.shutdown()
+
+    def test_maintenance_refreshes_listener_identity_without_blocking_client_work(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            runtime = SecurePeerRuntime(
+                Path(temporary) / "secure-peers",
+                server_identity="server_identity_test",
+                server_instance_id="server_instance_test",
+                display_name="Test server",
+            )
+            gateway = mock.Mock()
+            gateway.refresh_listener_identity.side_effect = RuntimeError(
+                "injected certificate write failure"
+            )
+            runtime._gateway = gateway
+            logger = mock.Mock()
+            runtime.logger = logger
+            try:
+                with (
+                    mock.patch.object(
+                        runtime.client,
+                        "recover_pairing_attempts",
+                        return_value={"remaining": 0},
+                    ) as recover,
+                    mock.patch.object(
+                        runtime.client,
+                        "list_connections",
+                        return_value=[],
+                    ),
+                ):
+                    result = runtime.maintenance_once()
+                gateway.refresh_listener_identity.assert_called_once_with()
+                recover.assert_called_once_with(limit=2)
+                self.assertFalse(result["active"])
+                logger.warning.assert_called_once()
+            finally:
+                runtime._gateway = None
+                runtime.shutdown()
 
     def test_maintenance_never_retires_transient_or_unpinned_errors(self) -> None:
         failures = (
@@ -3537,6 +3815,38 @@ class SecurePeerRuntimeTests(unittest.TestCase):
                     expected_certificate_fingerprint="sha256:" + "f" * 64,
                 )
             self.assertEqual(forgetting.exception.code, "connection_delivery_pending")
+            runtime.shutdown()
+
+    def test_maintenance_expires_outgoing_pairings_without_operator_action(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            runtime = SecurePeerRuntime(
+                Path(temporary) / "secure-peers",
+                server_identity="server_identity_test",
+                server_instance_id="server_instance_test",
+                display_name="Test server",
+            )
+            with (
+                mock.patch.object(
+                    runtime.client,
+                    "expire_pending_pairings",
+                    return_value=1,
+                ) as expire,
+                mock.patch.object(
+                    runtime.client,
+                    "recover_pairing_attempts",
+                    return_value={"remaining": 0},
+                ),
+                mock.patch.object(
+                    runtime.client,
+                    "list_connections",
+                    return_value=[],
+                ),
+            ):
+                result = runtime.maintenance_once()
+            expire.assert_called_once_with()
+            self.assertFalse(result["active"])
             runtime.shutdown()
 
     def test_expired_prepared_delivery_is_terminalized_without_receipt(self) -> None:

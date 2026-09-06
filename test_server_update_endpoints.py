@@ -1,5 +1,7 @@
 import asyncio
+import hashlib
 import os
+import sqlite3
 import tempfile
 import threading
 import unittest
@@ -959,7 +961,7 @@ class ServerUpdateEndpointTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(response["managed_updates"])
         self.assertEqual(
             response["capabilities"]["server_updates"]["version"],
-            9,
+            10,
         )
         self.assertEqual(response["update_service_cgroup"], {
             "safe": True,
@@ -2530,7 +2532,7 @@ class ServerUpdateEndpointTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(raised.exception.detail["code"], "server_update_not_cancelable")
         self.assertEqual(raised.exception.detail["schedule_id"], pending["schedule_id"])
 
-    async def test_pending_fences_new_work_but_preserves_drain_controls(self):
+    async def test_pending_defers_automation_but_preserves_manual_controls(self):
         with tempfile.TemporaryDirectory() as temporary:
             status_path = Path(temporary) / "status.json"
             stop_turn = AsyncMock(return_value={"stopped": True})
@@ -2561,6 +2563,10 @@ class ServerUpdateEndpointTests(unittest.IsolatedAsyncioTestCase):
                 admission = agent_server.managed_server_update_admission_blocker()
                 interactive = await agent_server.turn_start_blocker()
                 scheduled = await agent_server.scheduled_job_blocker("other-chat")
+                manual_job = await agent_server.scheduled_job_blocker(
+                    "other-chat",
+                    manual=True,
+                )
                 stopped = await agent_server.stop_turn_endpoint("active-chat")
                 codex = await agent_server.post_codex_interaction_response(
                     "active-chat",
@@ -2577,11 +2583,16 @@ class ServerUpdateEndpointTests(unittest.IsolatedAsyncioTestCase):
                     ),
                 )
 
-        # A pending when-idle reservation is passive: it must never fence new
-        # turns, scheduled jobs, or any other operation.
+        # A pending when-idle reservation remains passive for user/provider
+        # controls, but unattended jobs must yield so recurring automation
+        # cannot continuously refill the active-work set ahead of the updater.
         self.assertIsNone(admission)
         self.assertIsNone(interactive)
-        self.assertIsNone(scheduled)
+        self.assertEqual(
+            scheduled,
+            agent_server.MANAGED_SERVER_UPDATE_PENDING_DETAIL,
+        )
+        self.assertIsNone(manual_job)
         self.assertEqual(stopped, {"stopped": True})
         self.assertEqual(codex["interaction"]["status"], "resolved")
         self.assertEqual(claude["interaction"]["status"], "resolved")
@@ -2591,6 +2602,116 @@ class ServerUpdateEndpointTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsInstance(stop_kwargs.get("_admission_ready"), asyncio.Event)
         resolve_codex.assert_awaited_once()
         resolve_claude.assert_awaited_once()
+
+    async def test_scheduled_job_admission_rechecks_pending_after_blocker_probe(self):
+        """The turn reservation is the final fence for a scheduler race."""
+
+        store = agent_server.JobStore()
+        job_revision = "job_rev_pending_race"
+        store.jobs["job_pending_race"] = {
+            "id": "job_pending_race",
+            "session_id": "job-chat",
+            "title": "Yield to update",
+            "prompt": "Do not replenish active work.",
+            "enabled": True,
+            "_revision": job_revision,
+        }
+        sessions = {
+            "job-chat": {
+                "id": "job-chat",
+                "backend": agent_server.BACKEND_CODEX,
+            },
+        }
+
+        class RuntimeProbeReached(RuntimeError):
+            pass
+
+        escaped_to_runtime = AsyncMock(side_effect=RuntimeProbeReached())
+
+        with tempfile.TemporaryDirectory() as temporary, \
+             patch.object(
+                 agent_server,
+                 "SERVER_UPDATE_STATUS_FILE",
+                 Path(temporary) / "status.json",
+             ), \
+             patch.object(agent_server, "JOBS", store), \
+             patch.object(agent_server.STORE, "sessions", sessions), \
+             patch.object(agent_server, "BUSY_SESSIONS", set()) as busy, \
+             patch.object(agent_server, "ACTIVE", {}), \
+             patch.object(agent_server, "CURRENT_TURNS", {}), \
+             patch.object(agent_server, "QUEUED_TURNS", {}), \
+             patch.object(agent_server, "RUN_NOW_TURNS", {}), \
+             patch.object(agent_server, "SERVER_MAINTENANCE_SESSIONS", set()), \
+             patch.object(
+                 agent_server,
+                 "ensure_runtime_available",
+                 escaped_to_runtime,
+             ):
+            # Model the real TOCTOU: the scheduler's early blocker probe wins
+            # just before a user reserves an idle update.
+            self.assertIsNone(await agent_server.scheduled_job_blocker("job-chat"))
+            agent_server.write_fresh_server_update_status(
+                phase="pending",
+                schedule_id="a" * 32,
+                target_version="1.1.0",
+                track="stable",
+                when_idle=True,
+                cancelable=True,
+            )
+
+            with self.assertRaises(agent_server.ManagedServerUpdatePendingError):
+                await agent_server._start_turn_locked(
+                    "job-chat",
+                    agent_server.TurnRequest(
+                        prompt="Do not replenish active work.",
+                        purpose="scheduled_job",
+                        job_id="job_pending_race",
+                    ),
+                    queue_if_busy=False,
+                    scheduled_job_chat_references=True,
+                    scheduled_job_revision=job_revision,
+                    scheduled_job_manual_run=False,
+                )
+            escaped_to_runtime.assert_not_awaited()
+
+            # Manual Run Now carries the same durable job revision, but it is
+            # operator work and therefore must pass the pending-only fence.
+            with self.assertRaises(RuntimeProbeReached):
+                await agent_server._start_turn_locked(
+                    "job-chat",
+                    agent_server.TurnRequest(
+                        prompt="Run this job now.",
+                        purpose="scheduled_job",
+                        job_id="job_pending_race",
+                    ),
+                    queue_if_busy=False,
+                    scheduled_job_chat_references=True,
+                    scheduled_job_revision=job_revision,
+                    scheduled_job_manual_run=True,
+                )
+
+            # Merely claiming the scheduled-job purpose is not sufficient to
+            # enter the autonomous lane. Only a revision-backed automatic
+            # dispatch may be selectively fenced by a pending update.
+            with self.assertRaises(RuntimeProbeReached):
+                await agent_server._start_turn_locked(
+                    "job-chat",
+                    agent_server.TurnRequest(
+                        prompt="Unowned scheduled-purpose turn.",
+                        purpose="scheduled_job",
+                    ),
+                    queue_if_busy=False,
+                )
+
+            with self.assertRaises(RuntimeProbeReached):
+                await agent_server._start_turn_locked(
+                    "job-chat",
+                    agent_server.TurnRequest(prompt="Ordinary user turn."),
+                    queue_if_busy=False,
+                )
+
+        self.assertEqual(busy, set())
+        self.assertEqual(escaped_to_runtime.await_count, 3)
 
     async def test_user_message_is_parked_durably_while_update_is_pending(self):
         queued = {"status": "queued", "queued_id": "queued-after-update"}
@@ -2764,6 +2885,7 @@ class ServerUpdateEndpointTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_cancel_pending_update_wakes_durable_queues_immediately(self):
         wake_queues = MagicMock(return_value=1)
+        resume_jobs = AsyncMock(return_value=2)
         with tempfile.TemporaryDirectory() as temporary, \
              patch.object(
                  agent_server,
@@ -2779,6 +2901,11 @@ class ServerUpdateEndpointTests(unittest.IsolatedAsyncioTestCase):
                  agent_server,
                  "schedule_rebuilt_queued_turns",
                  wake_queues,
+             ), \
+             patch.object(
+                 agent_server.JOBS,
+                 "resume_update_parked",
+                 resume_jobs,
              ):
             pending = agent_server.write_fresh_server_update_status(
                 phase="pending",
@@ -2799,6 +2926,7 @@ class ServerUpdateEndpointTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(cancelled["phase"], "available")
         self.assertEqual(cancelled["server_identity"], agent_server.server_identity())
         self.assertEqual(cancelled["server_instance_id"], agent_server.SERVER_INSTANCE_ID)
+        resume_jobs.assert_awaited_once_with(pending["schedule_id"])
         wake_queues.assert_called_once_with()
 
     async def test_pending_allows_drain_safe_http_mutations(self):
@@ -2865,6 +2993,334 @@ class ServerUpdateEndpointTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(agent_server.unsafe_http_mutation_count_locked(), 0)
         self.assertEqual(pending["phase"], "pending")
         self.assertEqual(pending["schedule_id"], "f" * 32)
+
+    async def test_pending_allows_real_team_message_with_attachment_before_start(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            runner = root / "update_runner.py"
+            public_key = root / "release-public-key.pem"
+            runner.write_text("# runner\n")
+            public_key.write_text("public key\n")
+            host_identity = "server-pending-team-message"
+            runtime = agent_server.ManagedTeamHubHost(
+                mode=agent_server.TEAM_HUB_MODE_HOST,
+                data_dir=root / "hub",
+                server_identity=host_identity,
+                server_instance_id=agent_server.SERVER_INSTANCE_ID,
+                allowed_hosts={"localhost", "127.0.0.1"},
+            )
+            runtime.initialize()
+            self.assertIsNotNone(runtime.store)
+            hub_mount = next(
+                route
+                for route in agent_server.app.routes
+                if getattr(route, "name", None) == "team-hub"
+            )
+            server_mount = next(
+                route
+                for route in agent_server.app.routes
+                if getattr(route, "name", None) == "team-hub-server-session"
+            )
+            original_hub_mount = hub_mount.app
+            original_server_mount = server_mount.app
+            hub_mount.app = runtime
+            server_mount.app = runtime
+            client = TestClient(
+                agent_server.app,
+                base_url="http://localhost",
+                client=("127.0.0.1", 41000),
+            )
+            release_message = threading.Event()
+            message_outbox_entered = threading.Event()
+            message_task: asyncio.Task | None = None
+            try:
+                with ExitStack() as stack:
+                    stack.enter_context(
+                        patch.object(agent_server, "TEAM_HUB_RUNTIME", runtime)
+                    )
+                    stack.enter_context(
+                        patch.object(
+                            agent_server,
+                            "TEAM_HUB_DATA_DIR",
+                            runtime.data_dir,
+                        )
+                    )
+                    stack.enter_context(
+                        patch.object(agent_server, "SERVER_VERSION", "1.0.0")
+                    )
+                    stack.enter_context(
+                        patch.object(
+                            agent_server,
+                            "SERVER_UPDATE_STATUS_FILE",
+                            root / "status.json",
+                        )
+                    )
+                    stack.enter_context(
+                        patch.object(agent_server, "SERVER_UPDATE_RUNNER", runner)
+                    )
+                    stack.enter_context(
+                        patch.object(
+                            agent_server,
+                            "SERVER_UPDATE_PUBLIC_KEY",
+                            public_key,
+                        )
+                    )
+                    stack.enter_context(
+                        patch.object(agent_server, "AGENT_TOKEN", "test-secret")
+                    )
+                    stack.enter_context(
+                        patch.object(
+                            agent_server,
+                            "server_identity",
+                            return_value=host_identity,
+                        )
+                    )
+                    for name, value in (
+                        ("BUSY_SESSIONS", set()),
+                        ("SERVER_MAINTENANCE_SESSIONS", set()),
+                        ("ACTIVE", {}),
+                        ("CURRENT_TURNS", {}),
+                        ("QUEUED_TURNS", {}),
+                        ("RUN_NOW_TURNS", {}),
+                        ("UNSAFE_HTTP_MUTATION_TASKS", {}),
+                    ):
+                        stack.enter_context(patch.object(agent_server, name, value))
+                    stack.enter_context(
+                        patch.object(
+                            agent_server,
+                            "prepare_provider_background_work_snapshot",
+                            new=AsyncMock(return_value={}),
+                        )
+                    )
+                    stack.enter_context(
+                        patch.object(
+                            agent_server,
+                            "provider_background_work_labels_from_snapshot",
+                            return_value=[],
+                        )
+                    )
+                    stack.enter_context(
+                        patch.object(
+                            agent_server,
+                            "server_update_is_active",
+                            return_value=False,
+                        )
+                    )
+                    stack.enter_context(
+                        patch.object(
+                            agent_server,
+                            "working_tmux_bin",
+                            return_value="/usr/bin/tmux",
+                        )
+                    )
+                    stack.enter_context(
+                        patch.object(
+                            agent_server,
+                            "ensure_managed_update_tmux_isolated",
+                            return_value=None,
+                        )
+                    )
+                    stack.enter_context(
+                        patch.object(
+                            agent_server,
+                            "quiesce_managed_update_service_cgroup",
+                            new=AsyncMock(return_value=None),
+                        )
+                    )
+                    run_tmux = stack.enter_context(
+                        patch.object(agent_server, "run_tmux", return_value=None)
+                    )
+                    proof = (
+                        runtime.data_dir / "bootstrap-owner.proof"
+                    ).read_text().strip()
+                    bootstrap = client.post(
+                        "/api/team-hub/v1/bootstrap/redeem",
+                        headers={"X-Team-Hub-Bootstrap-Proof": proof},
+                        json={
+                            "email": "owner@example.com",
+                            "display_name": "Owner",
+                            "device_label": "Owner Mac",
+                        },
+                    )
+                    self.assertEqual(bootstrap.status_code, 200, bootstrap.text)
+                    headers = {"X-AgentsDock-Token": "test-secret"}
+                    session = client.get(
+                        "/api/team-hub-server/v1/server-session",
+                        headers=headers,
+                    )
+                    self.assertEqual(session.status_code, 200, session.text)
+                    team_id = session.json()["teams"][0]["id"]
+                    pending = agent_server.write_fresh_server_update_status(
+                        phase=agent_server.SERVER_UPDATE_PENDING_PHASE,
+                        schedule_id="7" * 32,
+                        target_version="1.1.0",
+                        latest_version="1.1.0",
+                        track="stable",
+                        when_idle=True,
+                        cancelable=True,
+                        blocker_counts={"active_runs": 1},
+                    )
+
+                    attachment_bytes = b"real pending update attachment"
+                    attachment = client.post(
+                        f"/api/team-hub-server/v1/teams/{team_id}/network/attachments",
+                        headers=headers,
+                        json={
+                            "file_name": "pending.txt",
+                            "media_type": "text/plain",
+                            "byte_size": len(attachment_bytes),
+                            "sha256": hashlib.sha256(attachment_bytes).hexdigest(),
+                            "idempotency_key": "pending-attachment-declare-1",
+                        },
+                    )
+                    self.assertEqual(attachment.status_code, 200, attachment.text)
+                    attachment_id = attachment.json()["attachment"]["id"]
+                    uploaded = client.put(
+                        f"/api/team-hub-server/v1/teams/{team_id}/network/"
+                        f"attachments/{attachment_id}/content",
+                        headers={
+                            **headers,
+                            "Content-Type": "application/octet-stream",
+                            "Content-Range": (
+                                f"bytes 0-{len(attachment_bytes) - 1}/"
+                                f"{len(attachment_bytes)}"
+                            ),
+                        },
+                        content=attachment_bytes,
+                    )
+                    self.assertEqual(uploaded.status_code, 200, uploaded.text)
+                    self.assertEqual(
+                        agent_server.read_server_update_status()["phase"],
+                        "pending",
+                    )
+
+                    store = runtime.store
+                    assert store is not None
+                    original_outbox = store._outbox
+
+                    def hold_message_transaction(*args):
+                        if len(args) >= 5 and args[4] == "team.message.created":
+                            message_outbox_entered.set()
+                            if not release_message.wait(30):
+                                raise RuntimeError("message transaction was not released")
+                        return original_outbox(*args)
+
+                    with patch.object(store, "_outbox", side_effect=hold_message_transaction):
+                        message_task = asyncio.create_task(
+                            asyncio.to_thread(
+                                client.post,
+                                f"/api/team-hub-server/v1/teams/{team_id}/network/messages",
+                                headers=headers,
+                                json={
+                                    "kind": "message",
+                                    "body": "commit before pending update starts",
+                                    "body_format": "plain",
+                                    "recipients": [{"kind": "all"}],
+                                    "attachment_ids": [attachment_id],
+                                    "idempotency_key": "pending-message-create-1",
+                                },
+                            )
+                        )
+                        entered = await asyncio.wait_for(
+                            asyncio.to_thread(message_outbox_entered.wait, 2),
+                            timeout=3,
+                        )
+                        self.assertTrue(entered)
+                        self.assertEqual(
+                            agent_server.unsafe_http_mutation_count_locked(),
+                            1,
+                        )
+                        still_pending = (
+                            await agent_server.advance_pending_server_update_once()
+                        )
+                        self.assertEqual(still_pending["phase"], "pending")
+                        self.assertEqual(
+                            still_pending["schedule_id"],
+                            pending["schedule_id"],
+                        )
+                        self.assertEqual(
+                            still_pending["blocker_counts"][
+                                "in_flight_server_changes"
+                            ],
+                            1,
+                        )
+                        run_tmux.assert_not_called()
+                        release_message.set()
+                        message_response = await message_task
+                    self.assertEqual(
+                        message_response.status_code,
+                        200,
+                        message_response.text,
+                    )
+                    message = message_response.json()["message"]
+                    self.assertEqual(
+                        [item["id"] for item in message["attachments"]],
+                        [attachment_id],
+                    )
+                    connection = store.connect()
+                    try:
+                        committed = connection.execute(
+                            "SELECT id FROM team_messages WHERE id=? AND body=?",
+                            (
+                                message["id"],
+                                "commit before pending update starts",
+                            ),
+                        ).fetchone()
+                        bound = connection.execute(
+                            "SELECT message_id FROM team_attachments WHERE id=?",
+                            (attachment_id,),
+                        ).fetchone()
+                        self.assertIsNotNone(committed)
+                        self.assertEqual(bound["message_id"], message["id"])
+                    finally:
+                        connection.close()
+                    self.assertEqual(
+                        agent_server.unsafe_http_mutation_count_locked(),
+                        0,
+                    )
+
+                    started = await agent_server.advance_pending_server_update_once()
+                    self.assertEqual(started["phase"], "starting")
+                    self.assertEqual(started["schedule_id"], pending["schedule_id"])
+                    run_tmux.assert_called_once()
+                    snapshot = (
+                        runtime.data_dir
+                        / "maintenance-backups"
+                        / started["team_hub_snapshot_generation"]
+                        / "team-hub.sqlite3"
+                    )
+                    copied = sqlite3.connect(snapshot)
+                    try:
+                        self.assertEqual(
+                            copied.execute(
+                                "SELECT COUNT(*) FROM team_messages WHERE id=?",
+                                (message["id"],),
+                            ).fetchone()[0],
+                            1,
+                        )
+                        self.assertEqual(
+                            copied.execute(
+                                "SELECT message_id FROM team_attachments WHERE id=?",
+                                (attachment_id,),
+                            ).fetchone()[0],
+                            message["id"],
+                        )
+                    finally:
+                        copied.close()
+            finally:
+                release_message.set()
+                if message_task is not None and not message_task.done():
+                    try:
+                        await asyncio.wait_for(
+                            asyncio.shield(message_task),
+                            timeout=10,
+                        )
+                    except BaseException:
+                        pass
+                client.close()
+                hub_mount.app = original_hub_mount
+                server_mount.app = original_server_mount
+                await runtime.shutdown()
 
     async def test_pending_allows_terminal_reconnect(self):
         class Socket:

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import base64
 import json
 from pathlib import Path
@@ -16,6 +17,68 @@ from fastapi.testclient import TestClient
 
 from agentsdock_team_hub.service import _RateLimiter, create_app
 from agentsdock_team_hub.store import HubError
+
+
+def raw_http_request(
+    app,
+    method: str,
+    path: str,
+    *,
+    headers: list[tuple[bytes, bytes]],
+    body: bytes,
+) -> tuple[int, dict[str, str], bytes]:
+    async def dispatch() -> tuple[int, dict[str, str], bytes]:
+        messages: list[dict] = []
+        request_sent = False
+
+        async def receive() -> dict:
+            nonlocal request_sent
+            if not request_sent:
+                request_sent = True
+                return {
+                    "type": "http.request",
+                    "body": body,
+                    "more_body": False,
+                }
+            await asyncio.Event().wait()
+            raise AssertionError("unreachable")
+
+        async def send(message: dict) -> None:
+            messages.append(message)
+
+        await app(
+            {
+                "type": "http",
+                "asgi": {"version": "3.0", "spec_version": "2.3"},
+                "http_version": "1.1",
+                "method": method,
+                "scheme": "http",
+                "path": path,
+                "raw_path": path.encode("ascii"),
+                "query_string": b"",
+                "headers": headers,
+                "client": ("127.0.0.1", 41003),
+                "server": ("localhost", 80),
+                "root_path": "",
+            },
+            receive,
+            send,
+        )
+        started = next(
+            message for message in messages if message["type"] == "http.response.start"
+        )
+        response_headers = {
+            bytes(name).decode("latin-1").lower(): bytes(value).decode("latin-1")
+            for name, value in started.get("headers", [])
+        }
+        response_body = b"".join(
+            bytes(message.get("body", b""))
+            for message in messages
+            if message["type"] == "http.response.body"
+        )
+        return int(started["status"]), response_headers, response_body
+
+    return asyncio.run(dispatch())
 
 
 class TeamHubServiceTests(unittest.TestCase):
@@ -278,7 +341,25 @@ class TeamHubServiceTests(unittest.TestCase):
             self.assertEqual(preflight.status_code, 204, preflight.text)
             self.assertEqual(
                 preflight.headers["access-control-allow-methods"],
-                "GET, POST, PUT, PATCH",
+                "GET, POST, PUT, PATCH, DELETE",
+            )
+
+            delete_preflight = client.options(
+                "/v1/teams/team_valid_12345678/network/messages/message_valid_12345678",
+                headers={
+                    "Origin": origin,
+                    "Access-Control-Request-Method": "DELETE",
+                    "Access-Control-Request-Headers": "authorization, content-type",
+                },
+            )
+            self.assertEqual(delete_preflight.status_code, 204, delete_preflight.text)
+            self.assertEqual(
+                delete_preflight.headers["access-control-allow-methods"],
+                "GET, POST, PUT, PATCH, DELETE",
+            )
+            self.assertEqual(
+                delete_preflight.headers["access-control-allow-origin"],
+                origin,
             )
 
             attachment_preflight = client.options(
@@ -298,7 +379,7 @@ class TeamHubServiceTests(unittest.TestCase):
             )
             self.assertEqual(
                 attachment_preflight.headers["access-control-allow-methods"],
-                "GET, POST, PUT, PATCH",
+                "GET, POST, PUT, PATCH, DELETE",
             )
             self.assertEqual(
                 attachment_preflight.headers["access-control-allow-headers"],
@@ -359,6 +440,115 @@ class TeamHubServiceTests(unittest.TestCase):
                 malformed.headers["access-control-allow-origin"], origin
             )
             self.assertEqual(malformed.headers["vary"], "Origin")
+
+    def test_delete_requires_bounded_exact_json_framing(self) -> None:
+        owner = self.bootstrap()
+        team_id = owner["teams"][0]["id"]
+        created = self.client.post(
+            f"/v1/teams/{team_id}/network/bulletin",
+            headers=self.auth(owner),
+            json={
+                "body": "delete transport source",
+                "idempotency_key": "create-delete-transport-source",
+            },
+        )
+        self.assertEqual(created.status_code, 200, created.text)
+        post_id = created.json()["post"]["id"]
+        path = f"/v1/teams/{team_id}/network/bulletin/{post_id}"
+        body = json.dumps(
+            {"idempotency_key": "delete-transport-source"},
+            separators=(",", ":"),
+        ).encode("utf-8")
+        authorization = f"Bearer {owner['access_token']}".encode("ascii")
+        status, _headers, response_body = raw_http_request(
+            self.app,
+            "DELETE",
+            path,
+            headers=[
+                (b"host", b"localhost"),
+                (b"authorization", authorization),
+                (b"content-type", b"application/json"),
+                (b"content-length", str(len(body)).encode("ascii")),
+            ],
+            body=body,
+        )
+        self.assertEqual(status, 200, response_body)
+        self.assertEqual(
+            json.loads(response_body),
+            {"deleted": True, "post_id": post_id},
+        )
+
+        common = [
+            (b"host", b"localhost"),
+            (b"authorization", authorization),
+        ]
+        cases = (
+            (
+                "missing_length",
+                [*common, (b"content-type", b"application/json")],
+                b"{}",
+                400,
+                "Exactly one Content-Length is required",
+            ),
+            (
+                "duplicate_length",
+                [
+                    *common,
+                    (b"content-type", b"application/json"),
+                    (b"content-length", b"2"),
+                    (b"content-length", b"2"),
+                ],
+                b"{}",
+                400,
+                "Duplicate Content-Length is not accepted",
+            ),
+            (
+                "oversized",
+                [
+                    *common,
+                    (b"content-type", b"application/json"),
+                    (b"content-length", b"65537"),
+                ],
+                b"{}",
+                413,
+                "JSON body size is invalid",
+            ),
+            (
+                "wrong_content_type",
+                [
+                    *common,
+                    (b"content-type", b"text/plain"),
+                    (b"content-length", b"2"),
+                ],
+                b"{}",
+                415,
+                "Content-Type must be application/json",
+            ),
+            (
+                "truncated",
+                [
+                    *common,
+                    (b"content-type", b"application/json"),
+                    (b"content-length", b"3"),
+                ],
+                b"{}",
+                400,
+                "Content-Length does not match body",
+            ),
+        )
+        for label, headers, malformed_body, expected_status, expected_message in cases:
+            with self.subTest(case=label):
+                actual_status, _actual_headers, actual_body = raw_http_request(
+                    self.app,
+                    "DELETE",
+                    path,
+                    headers=headers,
+                    body=malformed_body,
+                )
+                self.assertEqual(actual_status, expected_status, actual_body)
+                error = json.loads(actual_body)["error"]
+                self.assertEqual(error["code"], "invalid_request")
+                self.assertEqual(error["message"], expected_message)
 
     def test_refresh_rotation_replay_revokes_entire_session(self) -> None:
         owner = self.bootstrap()

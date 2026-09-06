@@ -238,6 +238,10 @@ class NetworkBulletinRequest(StrictModel):
     idempotency_key: str = Field(min_length=8, max_length=240)
 
 
+class NetworkDeleteRequest(StrictModel):
+    idempotency_key: str = Field(min_length=8, max_length=240)
+
+
 class NetworkMailboxRequest(StrictModel):
     to: NetworkAddress
     from_agent_id: None = None
@@ -769,7 +773,13 @@ def create_app(
             )
         if request.method == "OPTIONS":
             requested_method = request.headers.get("access-control-request-method")
-            if origin is None or requested_method not in {"GET", "POST", "PUT", "PATCH"}:
+            if origin is None or requested_method not in {
+                "GET",
+                "POST",
+                "PUT",
+                "PATCH",
+                "DELETE",
+            }:
                 return _error("origin_forbidden", "Origin is not permitted", 403)
             requested_headers = request.headers.get("access-control-request-headers", "")
             allowed_request_headers = {
@@ -791,7 +801,7 @@ def create_app(
                 status_code=204,
                 headers={
                     "Access-Control-Allow-Origin": origin,
-                    "Access-Control-Allow-Methods": "GET, POST, PUT, PATCH",
+                    "Access-Control-Allow-Methods": "GET, POST, PUT, PATCH, DELETE",
                     "Access-Control-Allow-Headers": requested_headers,
                     "Vary": "Origin",
                 },
@@ -897,7 +907,7 @@ def create_app(
                 return with_allowed_origin(
                     _error("invalid_request", "Exactly one Content-Range is required", 400)
                 )
-        elif request.method in {"POST", "PUT", "PATCH"}:
+        elif request.method in {"POST", "PUT", "PATCH", "DELETE"}:
             if len(lengths) != 1:
                 return with_allowed_origin(
                     _error("invalid_request", "Exactly one Content-Length is required", 400)
@@ -1324,6 +1334,20 @@ def create_app(
             claims, team_id, body.model_dump()
         )
 
+    @app.delete("/v1/teams/{team_id}/network/bulletin/{post_id}")
+    def delete_network_bulletin_post(
+        team_id: str,
+        post_id: str,
+        body: NetworkDeleteRequest,
+        claims: Auth,
+    ) -> dict[str, Any]:
+        return store.delete_network_bulletin_post(
+            claims,
+            team_id,
+            post_id,
+            body.model_dump(),
+        )
+
     @app.get("/v1/teams/{team_id}/network/mailbox")
     def network_mailbox(
         team_id: str,
@@ -1430,6 +1454,22 @@ def create_app(
             limit=limit,
         )
 
+    @app.get("/v1/teams/{team_id}/network/deletions")
+    def network_content_deletions(
+        team_id: str,
+        claims: Auth,
+        after_sequence: Annotated[
+            int, Query(ge=0, le=9_223_372_036_854_775_807)
+        ] = 0,
+        limit: Annotated[int, Query(ge=1, le=MAX_NETWORK_PAGE_ITEMS)] = 50,
+    ) -> dict[str, Any]:
+        return store.list_network_content_deletions(
+            claims,
+            team_id,
+            after_sequence=after_sequence,
+            limit=limit,
+        )
+
     @app.post("/v1/teams/{team_id}/network/messages")
     def create_team_message(
         team_id: str,
@@ -1441,6 +1481,20 @@ def create_app(
     @app.get("/v1/teams/{team_id}/network/messages/{message_id}")
     def team_message(team_id: str, message_id: str, claims: Auth) -> dict[str, Any]:
         return store.get_team_message(claims, team_id, message_id)
+
+    @app.delete("/v1/teams/{team_id}/network/messages/{message_id}")
+    def delete_team_message(
+        team_id: str,
+        message_id: str,
+        body: NetworkDeleteRequest,
+        claims: Auth,
+    ) -> dict[str, Any]:
+        return store.delete_team_message(
+            claims,
+            team_id,
+            message_id,
+            body.model_dump(),
+        )
 
     @app.post("/v1/teams/{team_id}/network/messages/{message_id}/receipts")
     def team_message_receipt(

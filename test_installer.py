@@ -1537,6 +1537,10 @@ exit 0
                 f"agents-server-{version}/agentsdock_team_hub/migrations/0011_human_admin_paging.sql",
                 members,
             )
+            self.assertIn(
+                f"agents-server-{version}/agentsdock_team_hub/migrations/0012_network_content_deletions.sql",
+                members,
+            )
             self.assertFalse(
                 any("__pycache__" in name or name.endswith((".pyc", ".pyo")) for name in members)
             )
@@ -3091,7 +3095,7 @@ chmod 755 "$project/.venv/bin/python"
             try:
                 self.assertEqual(
                     connection.execute("PRAGMA user_version").fetchone()[0],
-                    11,
+                    12,
                 )
                 self.assertIsNone(
                     connection.execute(
@@ -4162,7 +4166,7 @@ exit 0
             self.assertFalse(store.maintenance_fence_path.exists())
             connection = sqlite3.connect(store.database_path)
             try:
-                self.assertEqual(connection.execute("PRAGMA user_version").fetchone()[0], 11)
+                self.assertEqual(connection.execute("PRAGMA user_version").fetchone()[0], 12)
                 self.assertEqual(
                     connection.execute(
                         "SELECT hub_id, server_identity FROM managed_host_bindings"
@@ -7040,6 +7044,8 @@ exit 0
             ):
                 connection.execute(f"DROP INDEX {index}")
             for table in (
+                # Migration 0012 (immutable network content deletion journal).
+                "network_content_deletions",
                 # Migration 0011 (bounded human-administration paging).
                 "human_admin_page_entries",
                 # Migration 0010 (attachment orphan reclamation).

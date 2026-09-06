@@ -467,6 +467,20 @@ class SecurePeerHubAdapter:
         }
 
     @classmethod
+    def _network_delete_body(cls, request: ProxyRequest) -> dict[str, Any]:
+        value = cls._object_body(
+            request,
+            allowed={"idempotency_key"},
+            required={"idempotency_key"},
+        )
+        return {
+            "idempotency_key": cls._identifier(
+                value["idempotency_key"],
+                minimum=8,
+            ),
+        }
+
+    @classmethod
     def _team_attachment_body(cls, request: ProxyRequest) -> dict[str, Any]:
         value = cls._object_body(
             request,
@@ -822,6 +836,17 @@ class SecurePeerHubAdapter:
                         after_sequence=int(values.get("after_sequence", "0")),
                         limit=int(values.get("limit", "50")),
                     )
+                elif len(pieces) == 3 and pieces[1:] == [_NETWORK_CHILD, "deletions"]:
+                    values = self._team_query(
+                        request,
+                        allowed={"after_sequence", "limit"},
+                    )
+                    result = self.store.list_network_content_deletions(
+                        claims,
+                        team_id,
+                        after_sequence=int(values.get("after_sequence", "0")),
+                        limit=int(values.get("limit", "50")),
+                    )
                 elif len(pieces) == 3 and pieces[1:] == [_NETWORK_CHILD, "mailbox"]:
                     values = self._query(
                         request,
@@ -1035,6 +1060,32 @@ class SecurePeerHubAdapter:
                         team_id,
                         self._resource_id(pieces[3]),
                         self._team_skill_flag_body(request, flag),
+                    )
+                else:
+                    raise HubError("not_found", "Resource not found", 404)
+            elif request.method == "DELETE" and path.startswith(_TEAM_PREFIX):
+                remainder = path[len(_TEAM_PREFIX) :]
+                pieces = remainder.split("/")
+                team_id = pieces[0]
+                if (
+                    len(pieces) == 4
+                    and pieces[1:3] == [_NETWORK_CHILD, "messages"]
+                ):
+                    result = self.store.delete_team_message(
+                        claims,
+                        team_id,
+                        self._resource_id(pieces[3]),
+                        self._network_delete_body(request),
+                    )
+                elif (
+                    len(pieces) == 4
+                    and pieces[1:3] == [_NETWORK_CHILD, "bulletin"]
+                ):
+                    result = self.store.delete_network_bulletin_post(
+                        claims,
+                        team_id,
+                        self._resource_id(pieces[3]),
+                        self._network_delete_body(request),
                     )
                 else:
                     raise HubError("not_found", "Resource not found", 404)

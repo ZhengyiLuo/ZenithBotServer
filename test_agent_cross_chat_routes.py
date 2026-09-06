@@ -2680,10 +2680,11 @@ class AgentCrossChatRouteTests(unittest.IsolatedAsyncioTestCase):
             provider_route_snapshot=[route],
         )
         self.assertIn("exchange-scoped terminal reply", source_copy)
-        self.assertIn("returns immediately", source_copy)
-        self.assertIn("arrives asynchronously", source_copy)
+        self.assertIn("keeps this turn waiting", source_copy)
+        self.assertIn("until the destination answers", source_copy)
+        self.assertIn("explicitly stopped", source_copy)
         self.assertIn("Neither action grants durable access", source_copy)
-        self.assertNotIn("--exchange EXCHANGE_ID", source_copy)
+        self.assertNotIn("respond --exchange EXCHANGE_ID", source_copy)
         await agent_server.CROSS_CHAT.update_exchange_leg(
             legs[0]["id"],
             expected={"registered"},

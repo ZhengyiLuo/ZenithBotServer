@@ -618,16 +618,17 @@ terminate its own installer. Progress is written to
 sessions remain under the persistent state/configuration roots and are never
 placed inside a release directory.
 
-`capabilities.server_updates` v7 defines install-when-idle as a passive,
-durable reservation. Chats, messages, terminal connections, settings changes,
-and manual restart remain available while the reservation is pending. The
-server begins maintenance only when one shared-lock snapshot proves it is
-actually idle; that same atomic transition closes new-work admission. A
-pending reservation survives a manual restart and is re-armed after startup.
-While it is pending it fences nothing: new turns, Force Send, scheduled jobs,
-and provider controls are all admitted, and the update simply waits for the
-next moment nothing is running. (Releases before 0.1.26-beta.31 parked new
-turns behind the reservation; that behavior is gone.)
+`capabilities.server_updates` v10 defines install-when-idle as a passive,
+durable reservation for human work. Chats, ordinary turns, durable message
+intake, Force Send, provider controls, terminal connections, settings changes,
+and manual restart remain available while the reservation is pending.
+Autonomous scheduled and loop job admissions are deferred losslessly so they
+cannot replenish the active set forever; they resume after the update or an
+explicit cancellation. The server begins maintenance only when one shared-lock
+snapshot proves existing work is actually idle; that same atomic transition
+closes new-work admission. A pending reservation survives a manual restart and
+is re-armed after startup. (Releases before 0.1.26-beta.31 parked every new
+turn behind the reservation; that global operator lockout remains gone.)
 
 ## Uninstalling AgentsServer
 
@@ -908,7 +909,7 @@ represent second 60.
 
 ## Cross-chat handoffs
 
-### Current route-hint contract (API contract 27, capability v11)
+### Current route-hint contract (API contract 27, capability v13)
 
 An inline structured `@Chat` is an optional target hint. It never forwards the
 raw user prompt. On successful ordinary-turn admission, an exact local
@@ -922,9 +923,15 @@ reply path back to its immutable source; it creates no reply obligation, never
 automatically relays the target's ordinary final answer, cannot request a
 follow-up, and grants no durable reverse route. Ask explicitly requests one
 terminal answer over the same exchange-scoped return mechanism. It commits
-immediately as a durable two-leg agent message; the answer returns later as a
-normal queued delivery in the source chat, without holding either provider
-call open.
+immediately as a durable two-leg agent message and keeps the source provider
+turn attached until that answer arrives or the exchange is explicitly stopped.
+The target delivery remains a normal durable turn and waits in its FIFO when
+that chat is busy. Each helper invocation observes one bounded HTTP heartbeat
+slice and returns either the answer or a resumable `pending=true` receipt. The
+provider immediately runs a new foreground `wait` call with the same exact
+lease after every pending receipt. Those slices stay below provider shell-tool
+caps; they never convert the exchange into a later source-chat turn or impose a
+semantic response deadline.
 
 Active agent messaging is strictly same-server: Studio chats can address only
 Studio chats, and Sonic chats can address only Sonic chats. Communication
@@ -939,11 +946,16 @@ exact route selection, authorized by route ID in the job editor/helper flow,
 and revalidates its target, revision, and action on every firing. Its prompt
 contains the corresponding exact single `@Chat` marker for display and
 binding; no `@@` authoring syntax is required. The health surface advertises
-cross-chat version 11, `durable_route_grants`, configured-route
-`instruction_reply_once`, `live_wait_async_fallback`,
-`agent_ambient_local_handoffs: false`, scheduled Jobs version 5, and global
-API contract 27. Capability v11 additionally advertises
-`configured_route_async_request_reply`.
+cross-chat version 13, `durable_route_grants`, configured-route
+`instruction_reply_once`, `configured_route_live_request_reply`,
+`configured_route_request_reply_default: live`,
+`live_wait_timeout_async_fallback: false`,
+`live_wait_restart_async_fallback: true`,
+`agent_ambient_local_handoffs: false`,
+scheduled Jobs version 5, and global API contract 27. Capability v13 also
+advertises the bounded transport heartbeat, no semantic live-wait deadline,
+and the explicit asynchronous source-chat recovery used only when a server
+restart loses the process-local provider call.
 
 Capability v10 retains this reply-once behavior for existing
 configured `instruction` grants as well as newly created ones. The return path
@@ -972,6 +984,8 @@ warranted):
   send --route route_opaque --message "Verify the API contract."
 "$AGENTSDOCK_CHATS_CLI" --authority-file /path/from/turn.json \
   ask --route route_opaque --message "Which rollout is blocked?"
+"$AGENTSDOCK_CHATS_CLI" --authority-file /path/from/turn.json \
+  wait --exchange exchange_exact --inbound-leg leg_exact --lease lease_exact
 ```
 
 The helper never exposes or accepts an inferred chat ID. It accepts only the
@@ -981,8 +995,14 @@ message. Send creates a correlated two-leg exchange with one optional terminal
 reply capability available only to its exact delivery run. If the target does
 not deliberately use that capability, its ordinary final stays local and the
 exchange closes without sending anything back. Ask creates the same bounded
-two-leg exchange, returns an accepted receipt immediately, and delivers the
-answer or failure status asynchronously to the source chat.
+two-leg exchange and, by default, keeps the provider turn attached to its
+exact live lease through bounded foreground `wait` slices until the answer or
+a terminal failure. A pending receipt requires another exact `wait` call; it
+is not a timeout or permission to finish the turn. A live-request exchange
+does not expire merely because its original 24-hour authorization window
+elapsed.
+Explicit `--async-response` and restart recovery deliver the eventual result
+in a later source-chat turn.
 
 ### Historical action-specific grants (v1-v2)
 
@@ -1022,8 +1042,11 @@ turn's provider-authority block:
   --message "Do you mean the desktop or server rollout?" --request-response
 ```
 
-An exchange is limited to six directed conversational legs (three rounds) and
-expires after 72 hours. A successful non-empty recipient final automatically
+An exchange is limited to six directed conversational legs (three rounds).
+Asynchronous exchanges expire after 72 hours. An attached same-server live
+request does not time-expire while its exact source provider run remains its
+owner; explicit cancellation, Stop, participant deletion/archive, or a server
+restart closes or recovers it. A successful non-empty recipient final automatically
 returns one terminal answer when the inbound leg expects a reply and no
 explicit response won the one-use CAS.
 Failures, stops, expiry, participant deletion/archive, and queue-owner loss are
@@ -1078,10 +1101,15 @@ The turn-scoped helper surface accepts only opaque issued route IDs:
 
 `list` is capability-scoped; there is no provider chat search or arbitrary
 target parameter. `Ask` is not transcript access: it creates a normal target
-turn containing only the bounded relayed message, then returns one asynchronous
-terminal answer to the source chat. Configured-route Send and Ask are limited
-to two legs and 24 hours. A Send reply is always terminal; Ask also has no
-follow-up under the configured-route contract. Route bodies and answers are
+turn containing only the bounded relayed message, then keeps the source
+provider turn on the exact live lease through separate foreground `wait`
+slices until one terminal answer arrives. `--async-response`
+is the explicit compatibility mode that returns immediately and later queues
+the answer in the source chat. Configured-route Send and Ask are limited to two
+legs; non-live exchanges expire after 24 hours, while an attached live Ask is
+owned by its exact source run instead of a wall-clock deadline. A Send reply is
+always terminal; Ask also has no follow-up under the configured-route contract.
+Route bodies and answers are
 limited to 16,000 characters and 64 KiB UTF-8. A live run can accept at most
 one effect per route and four route handoffs total; durable source and target
 limits are 12 accepted route effects per rolling hour.

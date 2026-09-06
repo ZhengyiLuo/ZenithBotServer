@@ -6,8 +6,10 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import sqlite3
 import tempfile
 import threading
+import time
 import unittest
 import uuid
 from unittest import mock
@@ -91,6 +93,16 @@ class TeamMessagesServiceTests(unittest.TestCase):
 
     def get(self, bundle: dict, path: str, expected: int = 200) -> dict:
         response = self.client.get(path, headers=self.auth(bundle))
+        self.assertEqual(response.status_code, expected, response.text)
+        return response.json()
+
+    def delete(self, bundle: dict, path: str, body: dict, expected: int = 200) -> dict:
+        response = self.client.request(
+            "DELETE",
+            path,
+            headers=self.auth(bundle),
+            json=body,
+        )
         self.assertEqual(response.status_code, expected, response.text)
         return response.json()
 
@@ -587,6 +599,741 @@ class TeamMessagesServiceTests(unittest.TestCase):
             },
             expected=422,
         )
+
+        private = self.send(
+            self.owner,
+            [{"kind": "human", "id": self.member["principal"]["id"]}],
+            body="private reply parent",
+        )
+        unrelated = self.invite_and_redeem(
+            self.owner,
+            "reply-oracle@example.com",
+            "member",
+        )
+        guessed = self.post(
+            unrelated,
+            f"{self.base}/messages",
+            {
+                "kind": "message",
+                "body": "guessed a real but private parent",
+                "recipients": [{"kind": "all"}],
+                "in_reply_to_message_id": private["id"],
+                "idempotency_key": _key(),
+            },
+            expected=422,
+        )
+        self.assertEqual(guessed["error"]["code"], "invalid_request")
+        self.assertIn("unavailable", guessed["error"]["message"].lower())
+        recipient_reply = self.send(
+            self.member,
+            [{"kind": "all"}],
+            body="recipient may reply",
+            in_reply_to_message_id=private["id"],
+        )
+        sender_reply = self.send(
+            self.owner,
+            [{"kind": "all"}],
+            body="sender may reply",
+            in_reply_to_message_id=private["id"],
+        )
+        self.assertEqual(recipient_reply["in_reply_to_message_id"], private["id"])
+        self.assertEqual(sender_reply["in_reply_to_message_id"], private["id"])
+
+    # -- deletion journal -------------------------------------------------
+
+    def test_message_delete_is_strict_authorized_idempotent_and_additive(self) -> None:
+        other = self.invite_and_redeem(
+            self.owner,
+            "other-member@example.com",
+            "member",
+        )
+        admin = self.invite_and_redeem(
+            self.owner,
+            "message-admin@example.com",
+            "admin",
+        )
+        message = self.send(
+            self.member,
+            [{"kind": "human", "id": self.owner["principal"]["id"]}],
+            body="immutable delete source",
+        )
+        path = f"{self.base}/messages/{message['id']}"
+        store = self.app.state.store
+        connection = store.connect()
+        try:
+            source_before = dict(
+                connection.execute(
+                    "SELECT * FROM team_messages WHERE team_id=? AND id=?",
+                    (self.team_id, message["id"]),
+                ).fetchone()
+            )
+            recipients_before = [
+                dict(row)
+                for row in connection.execute(
+                    "SELECT * FROM team_message_recipients "
+                    "WHERE team_id=? AND message_id=? ORDER BY id",
+                    (self.team_id, message["id"]),
+                )
+            ]
+        finally:
+            connection.close()
+
+        for invalid in (
+            {},
+            {"idempotency_key": "1234567"},
+            {"idempotency_key": "x" * 241},
+            {"idempotency_key": _key(), "message_id": message["id"]},
+        ):
+            with self.subTest(invalid=invalid):
+                rejected = self.delete(self.member, path, invalid, expected=422)
+                self.assertEqual(rejected["error"]["code"], "invalid_request")
+
+        forbidden = self.delete(other, path, {"idempotency_key": _key()}, expected=403)
+        self.assertEqual(forbidden["error"]["code"], "forbidden")
+
+        first_key = _key()
+        expected = {"deleted": True, "message_id": message["id"]}
+        self.assertEqual(
+            self.delete(self.member, path, {"idempotency_key": first_key}),
+            expected,
+        )
+        self.assertEqual(
+            self.delete(self.member, path, {"idempotency_key": first_key}),
+            expected,
+        )
+        self.assertEqual(
+            self.delete(self.member, path, {"idempotency_key": _key()}),
+            expected,
+        )
+
+        connection = store.connect()
+        try:
+            self.assertEqual(
+                dict(
+                    connection.execute(
+                        "SELECT * FROM team_messages WHERE team_id=? AND id=?",
+                        (self.team_id, message["id"]),
+                    ).fetchone()
+                ),
+                source_before,
+            )
+            self.assertEqual(
+                [
+                    dict(row)
+                    for row in connection.execute(
+                        "SELECT * FROM team_message_recipients "
+                        "WHERE team_id=? AND message_id=? ORDER BY id",
+                        (self.team_id, message["id"]),
+                    )
+                ],
+                recipients_before,
+            )
+            deletion = connection.execute(
+                "SELECT * FROM network_content_deletions "
+                "WHERE team_id=? AND resource_kind='message' AND resource_id=?",
+                (self.team_id, message["id"]),
+            ).fetchone()
+            self.assertIsNotNone(deletion)
+            self.assertEqual(
+                connection.execute(
+                    "SELECT COUNT(*) FROM network_content_deletions "
+                    "WHERE team_id=? AND resource_kind='message' AND resource_id=?",
+                    (self.team_id, message["id"]),
+                ).fetchone()[0],
+                1,
+            )
+            self.assertEqual(
+                connection.execute(
+                    "SELECT COUNT(*) FROM audit_events "
+                    "WHERE action='team.message.delete' AND resource_id=?",
+                    (message["id"],),
+                ).fetchone()[0],
+                1,
+            )
+            self.assertEqual(
+                connection.execute(
+                    "SELECT COUNT(*) FROM outbox_events "
+                    "WHERE aggregate_type='team_message' AND aggregate_id=? "
+                    "AND event_type='team.message.deleted'",
+                    (message["id"],),
+                ).fetchone()[0],
+                1,
+            )
+            with self.assertRaises(sqlite3.IntegrityError):
+                connection.execute(
+                    "UPDATE network_content_deletions SET deleted_at=deleted_at+1 "
+                    "WHERE id=?",
+                    (deletion["id"],),
+                )
+            connection.rollback()
+            with self.assertRaises(sqlite3.IntegrityError):
+                connection.execute(
+                    "DELETE FROM network_content_deletions WHERE id=?",
+                    (deletion["id"],),
+                )
+            connection.rollback()
+        finally:
+            connection.close()
+
+        owner_target = self.send(
+            self.member,
+            [{"kind": "human", "id": other["principal"]["id"]}],
+            body="owner may remove",
+        )
+        self.assertEqual(
+            self.delete(
+                self.owner,
+                f"{self.base}/messages/{owner_target['id']}",
+                {"idempotency_key": _key()},
+            ),
+            {"deleted": True, "message_id": owner_target["id"]},
+        )
+        admin_target = self.send(
+            self.member,
+            [{"kind": "human", "id": other["principal"]["id"]}],
+            body="admin may remove",
+        )
+        self.assertEqual(
+            self.delete(
+                admin,
+                f"{self.base}/messages/{admin_target['id']}",
+                {"idempotency_key": _key()},
+            ),
+            {"deleted": True, "message_id": admin_target["id"]},
+        )
+
+    def test_deleted_message_is_absent_from_every_content_surface(self) -> None:
+        payload = b"deletion must retain these immutable bytes"
+        attachment = self.upload(self.owner, payload, name="retained.bin")
+        member_id = self.member["principal"]["id"]
+        message = self.send(
+            self.owner,
+            [{"kind": "all"}, {"kind": "human", "id": member_id}],
+            body="delete all projections",
+            attachment_ids=[attachment["id"]],
+        )
+        self.post(
+            self.member,
+            f"{self.base}/messages/{message['id']}/receipts",
+            {"state": "delivered", "idempotency_key": _key()},
+        )
+        store = self.app.state.store
+        blob = (
+            self.data_dir
+            / "attachments"
+            / attachment["sha256"][:2]
+            / attachment["sha256"]
+        )
+        connection = store.connect()
+        try:
+            source_before = dict(
+                connection.execute(
+                    "SELECT * FROM team_messages WHERE id=?",
+                    (message["id"],),
+                ).fetchone()
+            )
+            recipient_rows_before = [
+                dict(row)
+                for row in connection.execute(
+                    "SELECT * FROM team_message_recipients "
+                    "WHERE message_id=? ORDER BY id",
+                    (message["id"],),
+                )
+            ]
+            attachment_before = dict(
+                connection.execute(
+                    "SELECT * FROM team_attachments WHERE id=?",
+                    (attachment["id"],),
+                ).fetchone()
+            )
+        finally:
+            connection.close()
+
+        self.delete(
+            self.owner,
+            f"{self.base}/messages/{message['id']}",
+            {"idempotency_key": _key()},
+        )
+        surfaces = (
+            (self.owner, f"{self.base}/messages?box=sent"),
+            (self.member, f"{self.base}/messages?box=feed"),
+            (
+                self.member,
+                f"{self.base}/messages?box=inbox&address_kind=human&address_id={member_id}",
+            ),
+        )
+        for bundle, path in surfaces:
+            with self.subTest(path=path):
+                listed = self.get(bundle, path)
+                self.assertNotIn(
+                    message["id"],
+                    [item["id"] for item in listed["messages"]],
+                )
+        for bundle in (self.owner, self.member):
+            self.get(bundle, f"{self.base}/messages/{message['id']}", expected=404)
+        receipt = self.post(
+            self.member,
+            f"{self.base}/messages/{message['id']}/receipts",
+            {"state": "read", "idempotency_key": _key()},
+            expected=404,
+        )
+        self.assertEqual(receipt["error"]["code"], "not_found")
+        reply = self.post(
+            self.member,
+            f"{self.base}/messages",
+            {
+                "kind": "message",
+                "body": "must not reply to a tombstone",
+                "recipients": [{"kind": "all"}],
+                "in_reply_to_message_id": message["id"],
+                "idempotency_key": _key(),
+            },
+            expected=422,
+        )
+        self.assertEqual(reply["error"]["code"], "invalid_request")
+
+        metadata_path = f"{self.base}/attachments/{attachment['id']}"
+        content_path = metadata_path + "/content"
+        self.get(self.member, metadata_path, expected=404)
+        for method, headers in (
+            ("GET", self.auth(self.member)),
+            ("HEAD", self.auth(self.member)),
+            ("GET", {**self.auth(self.member), "Range": "bytes=0-3"}),
+        ):
+            with self.subTest(method=method, range=headers.get("Range")):
+                denied = self.client.request(method, content_path, headers=headers)
+                self.assertEqual(denied.status_code, 404, denied.text)
+
+        member_claims = store.verify_access(self.member["access_token"])
+        for operation in (
+            lambda: store.get_team_attachment(
+                member_claims,
+                self.team_id,
+                attachment["id"],
+            ),
+            lambda: store.open_team_attachment(
+                member_claims,
+                self.team_id,
+                attachment["id"],
+            ),
+            lambda: store.bound_team_attachment_local_path(
+                member_claims,
+                self.team_id,
+                attachment["id"],
+            ),
+        ):
+            with self.assertRaises(HubError) as unavailable:
+                operation()
+            self.assertEqual(unavailable.exception.code, "not_found")
+
+        connection = store.connect()
+        try:
+            self.assertEqual(
+                dict(connection.execute("SELECT * FROM team_messages WHERE id=?", (message["id"],)).fetchone()),
+                source_before,
+            )
+            self.assertEqual(
+                [
+                    dict(row)
+                    for row in connection.execute(
+                        "SELECT * FROM team_message_recipients "
+                        "WHERE message_id=? ORDER BY id",
+                        (message["id"],),
+                    )
+                ],
+                recipient_rows_before,
+            )
+            self.assertEqual(
+                dict(connection.execute("SELECT * FROM team_attachments WHERE id=?", (attachment["id"],)).fetchone()),
+                attachment_before,
+            )
+        finally:
+            connection.close()
+        self.assertEqual(blob.read_bytes(), payload)
+
+    def test_skill_message_delete_requires_library_archive(self) -> None:
+        skill_message = self.skill_post(
+            self.owner,
+            "delete-via-archive",
+            "Delete via archive",
+            "# Keep immutable versions",
+        )["message"]
+        rejected = self.delete(
+            self.owner,
+            f"{self.base}/messages/{skill_message['id']}",
+            {"idempotency_key": _key()},
+            expected=409,
+        )
+        self.assertEqual(rejected["error"]["code"], "skill_archive_required")
+        self.assertIn("Archive", rejected["error"]["message"])
+        self.assertIn("Skills library", rejected["error"]["message"])
+        connection = self.app.state.store.connect()
+        try:
+            self.assertEqual(
+                connection.execute(
+                    "SELECT COUNT(*) FROM network_content_deletions WHERE resource_id=?",
+                    (skill_message["id"],),
+                ).fetchone()[0],
+                0,
+            )
+            with self.assertRaisesRegex(
+                sqlite3.IntegrityError,
+                "team message deletion source is unavailable",
+            ):
+                connection.execute(
+                    "INSERT INTO network_content_deletions("
+                    "id,team_id,resource_kind,resource_id,"
+                    "deleted_by_principal_id,deleted_at"
+                    ") VALUES (?,?,?,?,?,?)",
+                    (
+                        "deletion_skill_insert_must_fail",
+                        self.team_id,
+                        "message",
+                        skill_message["id"],
+                        self.owner["principal"]["id"],
+                        int(time.time()),
+                    ),
+                )
+            connection.rollback()
+        finally:
+            connection.close()
+        self.assertEqual(
+            self.get(
+                self.owner,
+                f"{self.base}/messages/{skill_message['id']}",
+            )["message"]["id"],
+            skill_message["id"],
+        )
+
+    def test_bulletin_delete_is_global_additive_and_blocks_new_replies(self) -> None:
+        root = self.post(
+            self.member,
+            f"{self.base}/bulletin",
+            {
+                "body": "legacy bulletin root",
+                "body_format": "plain",
+                "idempotency_key": _key(),
+            },
+        )["post"]
+        child = self.post(
+            self.owner,
+            f"{self.base}/bulletin",
+            {
+                "body": "existing child remains an independent immutable row",
+                "body_format": "plain",
+                "reply_to_post_id": root["id"],
+                "idempotency_key": _key(),
+            },
+        )["post"]
+        store = self.app.state.store
+        connection = store.connect()
+        try:
+            source_before = dict(
+                connection.execute(
+                    "SELECT * FROM messages WHERE team_id=? AND id=?",
+                    (self.team_id, root["id"]),
+                ).fetchone()
+            )
+            channel_id = connection.execute(
+                "SELECT channel_id FROM network_boards WHERE team_id=?",
+                (self.team_id,),
+            ).fetchone()["channel_id"]
+        finally:
+            connection.close()
+
+        key = _key()
+        path = f"{self.base}/bulletin/{root['id']}"
+        expected = {"deleted": True, "post_id": root["id"]}
+        self.assertEqual(self.delete(self.owner, path, {"idempotency_key": key}), expected)
+        self.assertEqual(self.delete(self.owner, path, {"idempotency_key": key}), expected)
+        self.assertEqual(self.delete(self.owner, path, {"idempotency_key": _key()}), expected)
+
+        bulletin = self.get(self.member, f"{self.base}/bulletin")
+        self.assertNotIn(root["id"], [post["id"] for post in bulletin["posts"]])
+        self.assertIn(child["id"], [post["id"] for post in bulletin["posts"]])
+        generic = self.get(self.member, f"/v1/channels/{channel_id}/messages")
+        self.assertNotIn(root["id"], [item["id"] for item in generic["messages"]])
+        self.assertIn(child["id"], [item["id"] for item in generic["messages"]])
+        reply = self.post(
+            self.member,
+            f"{self.base}/bulletin",
+            {
+                "body": "cannot extend a deleted parent",
+                "body_format": "plain",
+                "reply_to_post_id": root["id"],
+                "idempotency_key": _key(),
+            },
+            expected=422,
+        )
+        self.assertEqual(reply["error"]["code"], "invalid_request")
+
+        connection = store.connect()
+        try:
+            self.assertEqual(
+                dict(
+                    connection.execute(
+                        "SELECT * FROM messages WHERE team_id=? AND id=?",
+                        (self.team_id, root["id"]),
+                    ).fetchone()
+                ),
+                source_before,
+            )
+            self.assertEqual(
+                connection.execute(
+                    "SELECT COUNT(*) FROM network_content_deletions "
+                    "WHERE team_id=? AND resource_kind='bulletin' AND resource_id=?",
+                    (self.team_id, root["id"]),
+                ).fetchone()[0],
+                1,
+            )
+            self.assertEqual(
+                connection.execute(
+                    "SELECT COUNT(*) FROM audit_events "
+                    "WHERE action='network.bulletin.delete' AND resource_id=?",
+                    (root["id"],),
+                ).fetchone()[0],
+                1,
+            )
+            self.assertEqual(
+                connection.execute(
+                    "SELECT COUNT(*) FROM outbox_events "
+                    "WHERE aggregate_type='network_bulletin_post' AND aggregate_id=? "
+                    "AND event_type='network.bulletin.deleted'",
+                    (root["id"],),
+                ).fetchone()[0],
+                1,
+            )
+        finally:
+            connection.close()
+
+    def test_deletion_journal_is_bounded_paginated_and_visibility_filtered(self) -> None:
+        member_id = self.member["principal"]["id"]
+        guest_id = self.guest["principal"]["id"]
+        other = self.invite_and_redeem(
+            self.owner,
+            "journal-author@example.com",
+            "member",
+        )
+        admin = self.invite_and_redeem(
+            self.owner,
+            "journal-admin@example.com",
+            "admin",
+        )
+        hidden_before = self.send(
+            other,
+            [{"kind": "human", "id": guest_id}],
+            body="private before visible deletion",
+        )
+        visible_first = self.send(
+            other,
+            [{"kind": "human", "id": member_id}],
+            body="first private deletion visible to member",
+        )
+        hidden_between = self.send(
+            other,
+            [{"kind": "human", "id": guest_id}],
+            body="private between visible deletions",
+        )
+        public = self.send(other, [{"kind": "all"}], body="public deletion")
+        bulletin = self.post(
+            other,
+            f"{self.base}/bulletin",
+            {
+                "body": "public bulletin deletion",
+                "body_format": "plain",
+                "idempotency_key": _key(),
+            },
+        )["post"]
+        hidden_after = self.send(
+            other,
+            [{"kind": "human", "id": guest_id}],
+            body="private after visible deletions",
+        )
+        base_time = int(time.time())
+        first_deletions = (
+            (1, "messages", hidden_before["id"]),
+            (2, "messages", visible_first["id"]),
+            (3, "messages", hidden_between["id"]),
+        )
+        for offset, kind, resource_id in first_deletions:
+            with mock.patch(
+                "agentsdock_team_hub.store._now",
+                return_value=base_time + offset,
+            ):
+                self.delete(
+                    other,
+                    f"{self.base}/{kind}/{resource_id}",
+                    {"idempotency_key": _key()},
+                )
+
+        # Invisible rows on either side of the sole visible row are excluded
+        # by the journal query itself: they neither consume the page nor leak
+        # through its cursor/has-more metadata.
+        member_midpoint = self.client.get(
+            f"{self.base}/deletions?after_sequence=0&limit=1",
+            headers=self.auth(self.member),
+        )
+        self.assertEqual(member_midpoint.status_code, 200, member_midpoint.text)
+        member_midpoint_value = member_midpoint.json()
+        self.assertEqual(
+            [item["id"] for item in member_midpoint_value["deletions"]],
+            [visible_first["id"]],
+        )
+        self.assertEqual(
+            member_midpoint_value["next_after_sequence"],
+            member_midpoint_value["deletions"][0]["sequence"],
+        )
+        self.assertFalse(member_midpoint_value["has_more"])
+        for hidden in (hidden_before, hidden_between):
+            self.assertNotIn(hidden["id"], member_midpoint.text)
+
+        for bundle in (self.owner, admin):
+            with self.subTest(privileged=bundle["principal"]["id"]):
+                private_page = self.get(
+                    bundle,
+                    f"{self.base}/deletions?after_sequence=0&limit=1",
+                )
+                self.assertEqual(
+                    private_page,
+                    {
+                        "deletions": [],
+                        "next_after_sequence": 0,
+                        "has_more": False,
+                    },
+                )
+
+        for offset, kind, resource_id in (
+            (4, "messages", public["id"]),
+            (5, "bulletin", bulletin["id"]),
+            (6, "messages", hidden_after["id"]),
+        ):
+            with mock.patch(
+                "agentsdock_team_hub.store._now",
+                return_value=base_time + offset,
+            ):
+                self.delete(
+                    other,
+                    f"{self.base}/{kind}/{resource_id}",
+                    {"idempotency_key": _key()},
+                )
+
+        author_page = self.client.get(
+            f"{self.base}/deletions?after_sequence=0&limit=100",
+            headers=self.auth(other),
+        )
+        self.assertEqual(author_page.status_code, 200, author_page.text)
+        author_value = author_page.json()
+        self.assertEqual(
+            set(author_value),
+            {"deletions", "next_after_sequence", "has_more"},
+        )
+        self.assertEqual(
+            [(item["kind"], item["id"]) for item in author_value["deletions"]],
+            [
+                ("message", hidden_before["id"]),
+                ("message", visible_first["id"]),
+                ("message", hidden_between["id"]),
+                ("message", public["id"]),
+                ("bulletin", bulletin["id"]),
+                ("message", hidden_after["id"]),
+            ],
+        )
+        for item in author_value["deletions"]:
+            self.assertEqual(
+                set(item),
+                {"sequence", "kind", "id", "deleted_at"},
+            )
+        deleted_at_by_id = {
+            item["id"]: item["deleted_at"] for item in author_value["deletions"]
+        }
+
+        def collect(bundle: dict) -> tuple[list[dict], str, dict]:
+            cursor = 0
+            found: list[dict] = []
+            raw_pages: list[str] = []
+            for _ in range(10):
+                response = self.client.get(
+                    f"{self.base}/deletions?after_sequence={cursor}&limit=1",
+                    headers=self.auth(bundle),
+                )
+                self.assertEqual(response.status_code, 200, response.text)
+                value = response.json()
+                self.assertEqual(
+                    set(value),
+                    {"deletions", "next_after_sequence", "has_more"},
+                )
+                for item in value["deletions"]:
+                    self.assertEqual(
+                        set(item),
+                        {"sequence", "kind", "id", "deleted_at"},
+                    )
+                found.extend(value["deletions"])
+                raw_pages.append(response.text)
+                next_cursor = value["next_after_sequence"]
+                self.assertGreaterEqual(next_cursor, cursor)
+                if not value["has_more"]:
+                    break
+                self.assertGreater(next_cursor, cursor)
+                cursor = next_cursor
+            else:
+                self.fail("deletion pagination did not terminate")
+            return found, "\n".join(raw_pages), value
+
+        member_rows, member_raw, member_last_page = collect(self.member)
+        self.assertEqual(
+            [item["id"] for item in member_rows],
+            [visible_first["id"], public["id"], bulletin["id"]],
+        )
+        self.assertEqual(
+            member_last_page["next_after_sequence"],
+            member_rows[-1]["sequence"],
+        )
+        self.assertFalse(member_last_page["has_more"])
+        for hidden in (hidden_before, hidden_between, hidden_after):
+            self.assertNotIn(hidden["id"], member_raw)
+            self.assertNotIn(deleted_at_by_id[hidden["id"]], member_raw)
+
+        for bundle in (self.owner, admin):
+            privileged_rows, privileged_raw, privileged_last_page = collect(bundle)
+            self.assertEqual(
+                [item["id"] for item in privileged_rows],
+                [public["id"], bulletin["id"]],
+            )
+            self.assertEqual(
+                privileged_last_page["next_after_sequence"],
+                privileged_rows[-1]["sequence"],
+            )
+            self.assertFalse(privileged_last_page["has_more"])
+            for private in (
+                hidden_before,
+                visible_first,
+                hidden_between,
+                hidden_after,
+            ):
+                self.assertNotIn(private["id"], privileged_raw)
+                self.assertNotIn(deleted_at_by_id[private["id"]], privileged_raw)
+
+        guest_rows, guest_raw, _guest_last_page = collect(self.guest)
+        self.assertEqual(
+            [item["id"] for item in guest_rows],
+            [
+                hidden_before["id"],
+                hidden_between["id"],
+                public["id"],
+                bulletin["id"],
+                hidden_after["id"],
+            ],
+        )
+        self.assertNotIn(visible_first["id"], guest_raw)
+        self.assertNotIn(deleted_at_by_id[visible_first["id"]], guest_raw)
+
+        for query in ("limit=0", "limit=101", "after_sequence=-1"):
+            with self.subTest(query=query):
+                response = self.client.get(
+                    f"{self.base}/deletions?{query}",
+                    headers=self.auth(self.member),
+                )
+                self.assertEqual(response.status_code, 422, response.text)
 
     # -- skills -------------------------------------------------------------
 

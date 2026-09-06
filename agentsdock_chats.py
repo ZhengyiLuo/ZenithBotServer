@@ -9,6 +9,7 @@ import http.client
 import ipaddress
 import json
 import os
+import re
 import sys
 import time
 import urllib.error
@@ -17,16 +18,28 @@ import urllib.request
 from pathlib import Path
 from typing import Any
 
-# Keep the default below provider shell-tool deadlines (Claude's default is
-# commonly 120 seconds). The server still enforces its own configurable cap.
-LIVE_RESPONSE_TIMEOUT_SECONDS = 75
-LIVE_RESPONSE_SOCKET_GRACE_SECONDS = 15
+# The legacy ``response_timeout_seconds`` wire field is now only a requested
+# heartbeat interval.  There is deliberately no client response-deadline
+# constant.  A provider tool call observes at most one bounded slice, then
+# returns a resumable pending receipt.  The provider immediately invokes
+# ``wait`` with that exact receipt until the server lease reaches terminal
+# state.  Keeping every network observation at 30 seconds or less bounds the
+# whole idempotent command safely below provider shell caps, instead of turning
+# any provider-specific Bash limit into a cross-chat response deadline.
+LIVE_RESPONSE_HEARTBEAT_SECONDS = 20
+LIVE_RESPONSE_MAX_HEARTBEAT_SECONDS = 20
+LIVE_RESPONSE_SOCKET_GRACE_SECONDS = 10
+LIVE_RESPONSE_POST_SOCKET_SECONDS = 10
 IDEMPOTENT_POST_RETRY_DELAYS_SECONDS = (0.1, 0.5)
 IDEMPOTENT_GET_RETRY_DELAYS_SECONDS = (0.1, 0.5)
 
 
 class ChatsCLIError(RuntimeError):
     pass
+
+
+class LiveWaitRetryable(ChatsCLIError):
+    """One bounded live-wait slice lost transport, but its lease is intact."""
 
 
 class NoRedirectHandler(urllib.request.HTTPRedirectHandler):
@@ -108,12 +121,9 @@ def post_json(
     transport_retry = 0
     while True:
         try:
-            socket_timeout = (
-                float(payload.get("response_timeout_seconds") or 0)
-                + LIVE_RESPONSE_SOCKET_GRACE_SECONDS
-                if payload.get("wait_for_response") is True
-                else 30
-            )
+            # The POST commits and returns a lease; response waiting happens
+            # through bounded GET heartbeats below.
+            socket_timeout = LIVE_RESPONSE_POST_SOCKET_SECONDS
             with opener.open(request, timeout=socket_timeout) as response:
                 result = json.loads(response.read().decode("utf-8"))
             break
@@ -193,6 +203,7 @@ def get_json(
     capability: str,
     *,
     timeout: float = 30,
+    live_slice: bool = False,
 ) -> dict[str, Any]:
     server_url = environment()
     request = urllib.request.Request(
@@ -205,6 +216,10 @@ def get_json(
         NoRedirectHandler(),
     )
     transport_retry = 0
+
+    def retry_delay() -> float:
+        return IDEMPOTENT_GET_RETRY_DELAYS_SECONDS[transport_retry]
+
     while True:
         try:
             with opener.open(request, timeout=timeout) as response:
@@ -214,10 +229,14 @@ def get_json(
             try:
                 raw = exc.read().decode("utf-8", errors="replace")
             except (OSError, http.client.IncompleteRead) as read_exc:
-                if transport_retry < len(IDEMPOTENT_GET_RETRY_DELAYS_SECONDS):
-                    delay = IDEMPOTENT_GET_RETRY_DELAYS_SECONDS[
-                        transport_retry
-                    ]
+                if live_slice:
+                    raise LiveWaitRetryable(
+                        "the live-response transport was interrupted"
+                    ) from read_exc
+                if (
+                    transport_retry < len(IDEMPOTENT_GET_RETRY_DELAYS_SECONDS)
+                ):
+                    delay = retry_delay()
                     transport_retry += 1
                     time.sleep(delay)
                     continue
@@ -229,6 +248,13 @@ def get_json(
                 detail = json.loads(raw).get("detail") or raw
             except json.JSONDecodeError:
                 detail = raw
+            if live_slice and (
+                exc.code in {408, 425, 429, 499}
+                or 500 <= exc.code <= 599
+            ):
+                raise LiveWaitRetryable(
+                    "the live-response transport is temporarily unavailable"
+                ) from exc
             raise ChatsCLIError(
                 f"server rejected request ({exc.code}): {detail or exc.reason}"
             ) from exc
@@ -237,23 +263,51 @@ def get_json(
             TimeoutError,
             OSError,
             http.client.IncompleteRead,
-            UnicodeDecodeError,
-            json.JSONDecodeError,
         ) as exc:
-            if transport_retry < len(IDEMPOTENT_GET_RETRY_DELAYS_SECONDS):
-                delay = IDEMPOTENT_GET_RETRY_DELAYS_SECONDS[transport_retry]
+            if live_slice:
+                raise LiveWaitRetryable(
+                    "the live-response transport is temporarily unavailable"
+                ) from exc
+            if (
+                transport_retry < len(IDEMPOTENT_GET_RETRY_DELAYS_SECONDS)
+            ):
+                delay = retry_delay()
                 transport_retry += 1
                 # GET is side-effect free and the live-response URL contains
-                # the same exact lease on every attempt. The server retains a
-                # completed result briefly for this replay window.
+                # the same exact lease on every attempt. The server retains
+                # the result for this exact live provider-run owner.
                 time.sleep(delay)
                 continue
             raise ChatsCLIError(
                 f"could not reach AgentsServer: {getattr(exc, 'reason', exc)}"
             ) from exc
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            # A malformed HTTP success body is a protocol error, not evidence
+            # that a busy peer still has work queued. A live slice must also
+            # remain one bounded provider-tool observation, so fail it
+            # immediately instead of multiplying its socket-timeout budget.
+            if live_slice:
+                raise ChatsCLIError(
+                    "AgentsServer returned an invalid live-response body"
+                ) from exc
+            # Other side-effect-free GETs retain the small ambiguity retry
+            # window, then fail instead of spinning forever on a corrupt or
+            # incompatible server.
+            if transport_retry < len(IDEMPOTENT_GET_RETRY_DELAYS_SECONDS):
+                delay = retry_delay()
+                transport_retry += 1
+                time.sleep(delay)
+                continue
+            raise ChatsCLIError(
+                "AgentsServer returned an invalid live-response body"
+            ) from exc
     if not isinstance(result, dict):
         raise ChatsCLIError("AgentsServer returned an invalid response")
     return result
+
+
+def live_response_heartbeat_seconds(value: int) -> int:
+    return max(1, min(int(value), LIVE_RESPONSE_MAX_HEARTBEAT_SECONDS))
 
 
 def await_live_response(
@@ -264,16 +318,23 @@ def await_live_response(
     exchange_id = str(receipt.get("exchange_id") or "")
     inbound_leg_id = str(receipt.get("inbound_leg_id") or "")
     lease_id = str(receipt.get("live_response_lease_id") or "")
+    if not re.fullmatch(r"exchange_[0-9a-f]{32}", exchange_id):
+        raise ChatsCLIError("live response exchange id is invalid")
+    if not re.fullmatch(r"leg_[0-9a-f]{32}", inbound_leg_id):
+        raise ChatsCLIError("live response inbound leg id is invalid")
+    if not re.fullmatch(r"lease_[0-9a-f]{32}", lease_id):
+        raise ChatsCLIError("live response lease id is invalid")
+    heartbeat_seconds = live_response_heartbeat_seconds(timeout_seconds)
     query = urllib.parse.urlencode({
         "lease_id": lease_id,
-        "timeout_seconds": timeout_seconds,
+        # Compatibility query name: the server treats it as a bounded
+        # transport heartbeat, never a total response deadline.
+        "timeout_seconds": heartbeat_seconds,
     })
-    result = get_json(
+    path = (
         "/api/agent/cross-chat/exchanges/"
         f"{urllib.parse.quote(exchange_id, safe='')}/legs/"
-        f"{urllib.parse.quote(inbound_leg_id, safe='')}/live-response?{query}",
-        capability,
-        timeout=timeout_seconds + LIVE_RESPONSE_SOCKET_GRACE_SECONDS,
+        f"{urllib.parse.quote(inbound_leg_id, safe='')}/live-response?{query}"
     )
     answer_keys = {
         "ok", "exchange_id", "inbound_leg_id", "body", "request_response",
@@ -282,6 +343,28 @@ def await_live_response(
         "ok", "exchange_id", "inbound_leg_id", "deferred", "delivery",
         "message",
     }
+    pending_keys = {"ok", "exchange_id", "inbound_leg_id", "pending"}
+    try:
+        result = get_json(
+            path,
+            capability,
+            timeout=(
+                heartbeat_seconds
+                + LIVE_RESPONSE_SOCKET_GRACE_SECONDS
+            ),
+            live_slice=True,
+        )
+    except LiveWaitRetryable:
+        # A provider command must end promptly even if a proxy or local server
+        # is between restarts.  The exact lease is side-effect-free to replay,
+        # so surface the same pending contract and let the next foreground
+        # ``wait`` invocation reconnect it.
+        result = {
+            "ok": True,
+            "exchange_id": exchange_id,
+            "inbound_leg_id": inbound_leg_id,
+            "pending": True,
+        }
     valid_answer = (
         set(result) == answer_keys
         and isinstance(result.get("body"), str)
@@ -293,14 +376,36 @@ def await_live_response(
         and result.get("delivery") == "asynchronous"
         and isinstance(result.get("message"), str)
     )
+    valid_pending = (
+        set(result) == pending_keys
+        and result.get("pending") is True
+        and result.get("inbound_leg_id") == inbound_leg_id
+    )
     if (
-        not (valid_answer or valid_deferred)
+        not (valid_answer or valid_deferred or valid_pending)
         or result.get("ok") is not True
         or result.get("exchange_id") != exchange_id
         or not isinstance(result.get("inbound_leg_id"), str)
     ):
         raise ChatsCLIError("AgentsServer returned an invalid live response")
+    if valid_pending:
+        return {**result, "live_response_lease_id": lease_id}
     return result
+
+
+def wait(args: argparse.Namespace) -> dict[str, Any]:
+    """Observe one bounded slice of an already-committed live exchange."""
+
+    capability = authority(args.authority_file)
+    return await_live_response(
+        {
+            "exchange_id": args.exchange,
+            "inbound_leg_id": args.inbound_leg,
+            "live_response_lease_id": args.lease,
+        },
+        capability,
+        int(getattr(args, "timeout_seconds", LIVE_RESPONSE_HEARTBEAT_SECONDS)),
+    )
 
 
 def list_routes(args: argparse.Namespace) -> dict[str, Any]:
@@ -324,13 +429,8 @@ def send_action(args: argparse.Namespace, action: str) -> dict[str, Any]:
     if bool(route) == bool(target):
         raise ChatsCLIError("provide exactly one of --route or --target")
     destination = route if route else target
-    # Current durable --route asks are agent messages, not an interactive
-    # provider-to-provider RPC. Commit them immediately and let the correlated
-    # answer return through the source chat's normal FIFO. Historical one-use
-    # --target request/reply handles retain their live-call compatibility.
     live_wait = (
         action == "request_reply"
-        and not route
         and not bool(getattr(args, "async_response", False))
     )
     stable_key = "cli_" + hashlib.sha256(
@@ -347,10 +447,15 @@ def send_action(args: argparse.Namespace, action: str) -> dict[str, Any]:
         "artifact_grants": [],
     }
     if live_wait:
-        payload["wait_for_response"] = True
-        payload["response_timeout_seconds"] = int(
-            getattr(args, "timeout_seconds", LIVE_RESPONSE_TIMEOUT_SECONDS)
+        heartbeat_seconds = live_response_heartbeat_seconds(
+            int(getattr(
+                args,
+                "timeout_seconds",
+                LIVE_RESPONSE_HEARTBEAT_SECONDS,
+            ))
         )
+        payload["wait_for_response"] = True
+        payload["response_timeout_seconds"] = heartbeat_seconds
     if route:
         path = (
             "/api/agent/cross-chat/routes/"
@@ -366,6 +471,7 @@ def send_action(args: argparse.Namespace, action: str) -> dict[str, Any]:
     expected = set(minimal_expected)
     deferred_expected = set(minimal_expected)
     wait_expected = set(minimal_expected)
+    pending_expected = set(minimal_expected)
     if live_wait:
         expected.update({
             "exchange_id",
@@ -378,6 +484,12 @@ def send_action(args: argparse.Namespace, action: str) -> dict[str, Any]:
             "inbound_leg_id",
             "live_response_lease_id",
         })
+        pending_expected.update({
+            "exchange_id",
+            "inbound_leg_id",
+            "live_response_lease_id",
+            "pending",
+        })
         deferred_expected.update({
             "exchange_id",
             "inbound_leg_id",
@@ -386,14 +498,12 @@ def send_action(args: argparse.Namespace, action: str) -> dict[str, Any]:
             "message",
         })
         if frozenset(result) == frozenset(wait_expected):
-            live_result = await_live_response(
-                result,
-                capability,
-                int(payload["response_timeout_seconds"]),
-            )
             result = {
                 **{key: result[key] for key in minimal_expected},
-                **live_result,
+                "exchange_id": result["exchange_id"],
+                "inbound_leg_id": result["inbound_leg_id"],
+                "live_response_lease_id": result["live_response_lease_id"],
+                "pending": True,
             }
         elif frozenset(result) == frozenset(minimal_expected):
             raise ChatsCLIError(
@@ -403,18 +513,29 @@ def send_action(args: argparse.Namespace, action: str) -> dict[str, Any]:
     has_deferred_response = (
         live_wait and frozenset(result) == frozenset(deferred_expected)
     )
+    has_pending_response = (
+        live_wait and frozenset(result) == frozenset(pending_expected)
+    )
     if route:
         if (
             frozenset(result) not in {
                 frozenset(minimal_expected),
                 frozenset(expected),
                 frozenset(deferred_expected),
+                frozenset(pending_expected),
             }
             or result.get("ok") is not True
             or result.get("route_id") != route
             or result.get("action") != action
             or result.get("accepted") is not True
             or (has_live_response and not isinstance(result.get("body"), str))
+            or (
+                has_pending_response
+                and (
+                    result.get("pending") is not True
+                    or not isinstance(result.get("live_response_lease_id"), str)
+                )
+            )
             or (
                 has_deferred_response
                 and (
@@ -430,11 +551,19 @@ def send_action(args: argparse.Namespace, action: str) -> dict[str, Any]:
                 frozenset(minimal_expected),
                 frozenset(expected),
                 frozenset(deferred_expected),
+                frozenset(pending_expected),
             }
             or result.get("ok") is not True
             or result.get("action") != action
             or result.get("accepted") is not True
             or (has_live_response and not isinstance(result.get("body"), str))
+            or (
+                has_pending_response
+                and (
+                    result.get("pending") is not True
+                    or not isinstance(result.get("live_response_lease_id"), str)
+                )
+            )
             or (
                 has_deferred_response
                 and (
@@ -479,10 +608,15 @@ def respond(args: argparse.Namespace) -> dict[str, Any]:
         "artifact_grants": [],
     }
     if live_wait:
-        payload["wait_for_response"] = True
-        payload["response_timeout_seconds"] = int(
-            getattr(args, "timeout_seconds", LIVE_RESPONSE_TIMEOUT_SECONDS)
+        heartbeat_seconds = live_response_heartbeat_seconds(
+            int(getattr(
+                args,
+                "timeout_seconds",
+                LIVE_RESPONSE_HEARTBEAT_SECONDS,
+            ))
         )
+        payload["wait_for_response"] = True
+        payload["response_timeout_seconds"] = heartbeat_seconds
     result = post_json(
         f"/api/agent/cross-chat/exchanges/{urllib.parse.quote(args.exchange, safe='')}/responses",
         payload,
@@ -492,6 +626,7 @@ def respond(args: argparse.Namespace) -> dict[str, Any]:
     expected = set(minimal_expected)
     deferred_expected = set(minimal_expected)
     wait_expected = set(minimal_expected)
+    pending_expected = set(minimal_expected)
     if live_wait:
         expected.update({
             "exchange_id",
@@ -504,6 +639,12 @@ def respond(args: argparse.Namespace) -> dict[str, Any]:
             "inbound_leg_id",
             "live_response_lease_id",
         })
+        pending_expected.update({
+            "exchange_id",
+            "inbound_leg_id",
+            "live_response_lease_id",
+            "pending",
+        })
         deferred_expected.update({
             "exchange_id",
             "inbound_leg_id",
@@ -512,13 +653,13 @@ def respond(args: argparse.Namespace) -> dict[str, Any]:
             "message",
         })
         if frozenset(result) == frozenset(wait_expected):
-            live_result = await_live_response(
-                result,
-                capability,
-                int(payload["response_timeout_seconds"]),
-            )
-            result = {**result, **live_result}
-            result.pop("live_response_lease_id", None)
+            result = {
+                **{key: result[key] for key in minimal_expected},
+                "exchange_id": result["exchange_id"],
+                "inbound_leg_id": result["inbound_leg_id"],
+                "live_response_lease_id": result["live_response_lease_id"],
+                "pending": True,
+            }
         elif frozenset(result) == frozenset(minimal_expected):
             raise ChatsCLIError(
                 "AgentsServer does not support a live follow-up response"
@@ -527,16 +668,27 @@ def respond(args: argparse.Namespace) -> dict[str, Any]:
     has_deferred_response = (
         live_wait and frozenset(result) == frozenset(deferred_expected)
     )
+    has_pending_response = (
+        live_wait and frozenset(result) == frozenset(pending_expected)
+    )
     if (
         frozenset(result) not in {
             frozenset(minimal_expected),
             frozenset(expected),
             frozenset(deferred_expected),
+            frozenset(pending_expected),
         }
         or result.get("ok") is not True
         or result.get("action") != "response"
         or result.get("accepted") is not True
         or (has_live_response and not isinstance(result.get("body"), str))
+        or (
+            has_pending_response
+            and (
+                result.get("pending") is not True
+                or not isinstance(result.get("live_response_lease_id"), str)
+            )
+        )
         or (
             has_deferred_response
             and (
@@ -569,7 +721,10 @@ def parser() -> argparse.ArgumentParser:
     command.add_argument("--message", required=True)
     command.add_argument("--idempotency-key")
     command.set_defaults(handler=send)
-    ask_command = commands.add_parser("ask", help="start one bounded request/reply exchange")
+    ask_command = commands.add_parser(
+        "ask",
+        help="ask a same-server agent and wait until it answers or is stopped",
+    )
     ask_destination = ask_command.add_mutually_exclusive_group(required=True)
     ask_destination.add_argument("--route")
     ask_destination.add_argument("--target")
@@ -587,7 +742,11 @@ def parser() -> argparse.ArgumentParser:
         "--timeout-seconds",
         type=int,
         choices=range(1, 3601),
-        default=LIVE_RESPONSE_TIMEOUT_SECONDS,
+        default=LIVE_RESPONSE_HEARTBEAT_SECONDS,
+        help=(
+            "deprecated compatibility value; live same-server waits have no "
+            "response deadline"
+        ),
     )
     ask_command.set_defaults(handler=ask)
     response_command = commands.add_parser("respond", help="respond to the exact inbound exchange leg")
@@ -608,9 +767,34 @@ def parser() -> argparse.ArgumentParser:
         "--timeout-seconds",
         type=int,
         choices=range(1, 3601),
-        default=LIVE_RESPONSE_TIMEOUT_SECONDS,
+        default=LIVE_RESPONSE_HEARTBEAT_SECONDS,
+        help=(
+            "deprecated compatibility value; live same-server waits have no "
+            "response deadline"
+        ),
     )
     response_command.set_defaults(handler=respond)
+    wait_command = commands.add_parser(
+        "wait",
+        help=(
+            "observe one bounded foreground slice of a pending same-server "
+            "request"
+        ),
+    )
+    wait_command.add_argument("--exchange", required=True)
+    wait_command.add_argument("--inbound-leg", required=True)
+    wait_command.add_argument("--lease", required=True)
+    wait_command.add_argument(
+        "--timeout-seconds",
+        type=int,
+        choices=range(1, 3601),
+        default=LIVE_RESPONSE_HEARTBEAT_SECONDS,
+        help=(
+            "bounded transport slice only; repeat wait after every pending "
+            "receipt"
+        ),
+    )
+    wait_command.set_defaults(handler=wait)
     return root
 
 

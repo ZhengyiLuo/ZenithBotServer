@@ -3,7 +3,9 @@ storms, health-poll reconcile spam, and update-when-idle lockout."""
 
 import asyncio
 import json
+import os
 import tempfile
+import tracemalloc
 import unittest
 import uuid
 from datetime import datetime, timedelta, timezone
@@ -327,8 +329,8 @@ class ExplicitStopDeadlineTests(unittest.IsolatedAsyncioTestCase):
         schedule.assert_called_once_with("chat")
 
 
-class PendingUpdateNeverFencesTests(unittest.IsolatedAsyncioTestCase):
-    async def test_pending_reservation_blocks_nothing(self):
+class PendingUpdateSelectiveDrainTests(unittest.IsolatedAsyncioTestCase):
+    async def test_pending_reservation_defers_only_automatic_jobs(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             with patch.object(
@@ -354,7 +356,16 @@ class PendingUpdateNeverFencesTests(unittest.IsolatedAsyncioTestCase):
                 self.assertTrue(agent_server.managed_server_update_is_pending())
                 self.assertIsNone(agent_server.managed_server_update_admission_blocker())
                 self.assertIsNone(await agent_server.turn_start_blocker())
-                self.assertIsNone(await agent_server.scheduled_job_blocker("other-chat"))
+                self.assertEqual(
+                    await agent_server.scheduled_job_blocker("other-chat"),
+                    agent_server.MANAGED_SERVER_UPDATE_PENDING_DETAIL,
+                )
+                self.assertIsNone(
+                    await agent_server.scheduled_job_blocker(
+                        "other-chat",
+                        manual=True,
+                    )
+                )
 
     async def test_active_update_still_fences(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -372,6 +383,37 @@ class PendingUpdateNeverFencesTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(
                     agent_server.managed_server_update_admission_blocker(),
                     agent_server.MANAGED_SERVER_UPDATE_ACTIVE_DETAIL,
+                )
+                self.assertEqual(
+                    await agent_server.scheduled_job_blocker(
+                        "other-chat",
+                        manual=True,
+                    ),
+                    agent_server.MANAGED_SERVER_UPDATE_ACTIVE_DETAIL,
+                )
+
+    async def test_active_restart_still_fences_manual_jobs(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            with patch.object(
+                agent_server,
+                "SERVER_RESTART_STATUS_FILE",
+                root / "restart.json",
+            ), patch.object(
+                agent_server,
+                "SERVER_UPDATE_STATUS_FILE",
+                root / "update.json",
+            ):
+                agent_server.write_server_restart_status(
+                    phase="signaling",
+                    request_id="restart-1",
+                )
+                self.assertEqual(
+                    await agent_server.scheduled_job_blocker(
+                        "other-chat",
+                        manual=True,
+                    ),
+                    agent_server.MANAGED_SERVER_RESTART_ACTIVE_DETAIL,
                 )
 
 
@@ -1024,6 +1066,288 @@ class PruneImportedHistoryTests(unittest.TestCase):
                 summary = agent_server.prune_duplicate_imported_history_sync("chat", dry_run=False)
             self.assertEqual(summary["removed_events"], 0)
             self.assertEqual(log.read_bytes(), before)
+
+    def test_prune_preserves_malformed_bytes_and_unframed_tail(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            log = Path(temporary) / "events.jsonl"
+            native = json.dumps({
+                "seq": 1,
+                "type": "turn_started",
+                "run_id": "native",
+                "prompt": "same",
+            }, separators=(",", ":")).encode() + b"\n"
+            marker = json.dumps({
+                "seq": 2,
+                "type": "history_imported",
+                "run_id": "import_tail",
+                "imported": True,
+            }, separators=(",", ":")).encode() + b"\n"
+            duplicate = json.dumps({
+                "seq": 3,
+                "type": "turn_started",
+                "run_id": "import_tail",
+                "imported": True,
+                "prompt": "same",
+            }, separators=(",", ":")).encode() + b"\n"
+            terminal = json.dumps({
+                "seq": 4,
+                "type": "turn_finished",
+                "run_id": "import_tail",
+                "imported": True,
+            }, separators=(",", ":")).encode() + b"\n"
+            malformed = b"not-json-\xff-without-final-newline"
+            original = native + marker + duplicate + terminal + malformed
+            log.write_bytes(original)
+            with patch.object(agent_server, "events_path", return_value=log), patch.object(
+                agent_server,
+                "fsync_parent_directory",
+                wraps=agent_server.fsync_parent_directory,
+            ) as directory_fsync:
+                dry = agent_server.prune_duplicate_imported_history_sync(
+                    "chat",
+                    dry_run=True,
+                )
+                real = agent_server.prune_duplicate_imported_history_sync(
+                    "chat",
+                    dry_run=False,
+                )
+
+            expected_without_checkpoint = native + malformed
+            self.assertEqual(dry["bytes_after"], len(expected_without_checkpoint))
+            self.assertEqual(real["removed_events"], 3)
+            self.assertEqual(real["removed_runs"], 1)
+            rewritten = log.read_bytes()
+            self.assertTrue(rewritten.startswith(expected_without_checkpoint + b"\n"))
+            self.assertIn(b'"type":"_event_sequence_checkpoint"', rewritten)
+            self.assertEqual(real["bytes_after"], len(rewritten))
+            directory_fsync.assert_called_once_with(log)
+            self.assertEqual(
+                list(log.parent.glob(".*prune*")),
+                [],
+            )
+
+    def test_prune_uses_bounded_python_memory_for_large_history(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            log = Path(temporary) / "events.jsonl"
+            with log.open("wb") as output:
+                seq = 0
+                # Roughly eight MiB and tens of thousands of unique keys. The
+                # old read/split/parse/list/set implementation peaked around
+                # one hundred MiB for this shape.
+                while output.tell() < 8 * 1024 * 1024:
+                    seq += 1
+                    output.write(json.dumps({
+                        "seq": seq,
+                        "type": "assistant_text",
+                        "run_id": f"native_{seq}",
+                        "text": f"unique history message {seq:08d} " + ("x" * 96),
+                    }, separators=(",", ":")).encode() + b"\n")
+            with patch.object(agent_server, "events_path", return_value=log):
+                tracemalloc.start()
+                tracemalloc.reset_peak()
+                try:
+                    summary = agent_server.prune_duplicate_imported_history_sync(
+                        "chat",
+                        dry_run=True,
+                    )
+                    _current, peak = tracemalloc.get_traced_memory()
+                finally:
+                    tracemalloc.stop()
+
+            self.assertEqual(summary["removed_events"], 0)
+            self.assertGreaterEqual(summary["bytes_before"], 8 * 1024 * 1024)
+            self.assertLess(
+                peak,
+                12 * 1024 * 1024,
+                f"streaming prune allocated {peak / (1024 * 1024):.1f} MiB",
+            )
+
+    def test_prune_refuses_to_replace_a_concurrently_changed_log(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            log = Path(temporary) / "events.jsonl"
+            events = [
+                {"seq": 1, "type": "turn_started", "run_id": "native", "prompt": "same"},
+                {"seq": 2, "type": "history_imported", "run_id": "import_1", "imported": True},
+                {"seq": 3, "type": "turn_started", "run_id": "import_1", "imported": True, "prompt": "same"},
+                {"seq": 4, "type": "turn_finished", "run_id": "import_1", "imported": True},
+            ]
+            self.write_log(log, events)
+            before = log.read_bytes()
+            # Exercise the generation fence directly by changing the file
+            # after the replacement stream has been fsynced.
+            real_stat = agent_server.Path.stat
+            calls = 0
+
+            def changing_stat(target, *args, **kwargs):
+                nonlocal calls
+                result = real_stat(target, *args, **kwargs)
+                if target == log:
+                    calls += 1
+                    if calls == 3:
+                        with log.open("ab") as output:
+                            output.write(b'{"seq":5,"type":"assistant_text","text":"late"}\n')
+                        result = real_stat(target, *args, **kwargs)
+                return result
+
+            with patch.object(agent_server, "events_path", return_value=log), patch.object(
+                agent_server.Path,
+                "stat",
+                changing_stat,
+            ):
+                with self.assertRaises(RuntimeError):
+                    agent_server.prune_duplicate_imported_history_sync(
+                        "chat",
+                        dry_run=False,
+                    )
+            self.assertTrue(log.read_bytes().startswith(before))
+            self.assertIn(b'"text":"late"', log.read_bytes())
+
+    def test_prune_detects_same_size_rewrite_with_restored_mtime(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            log = Path(temporary) / "events.jsonl"
+            events = [
+                {
+                    "seq": 1,
+                    "type": "turn_started",
+                    "run_id": "native",
+                    "prompt": "same",
+                },
+                {
+                    "seq": 2,
+                    "type": "history_imported",
+                    "run_id": "import_1",
+                    "imported": True,
+                },
+                {
+                    "seq": 3,
+                    "type": "turn_started",
+                    "run_id": "import_1",
+                    "imported": True,
+                    "prompt": "same",
+                },
+                {
+                    "seq": 4,
+                    "type": "turn_finished",
+                    "run_id": "import_1",
+                    "imported": True,
+                },
+            ]
+            self.write_log(log, events)
+            original = log.read_bytes()
+            rewritten_by_racer = original.replace(b'"prompt": "same"', b'"prompt": "tame"', 1)
+            self.assertEqual(len(rewritten_by_racer), len(original))
+            initial = log.stat()
+            real_stat = agent_server.Path.stat
+            calls = 0
+
+            def changing_stat(target, *args, **kwargs):
+                nonlocal calls
+                result = real_stat(target, *args, **kwargs)
+                if target == log:
+                    calls += 1
+                    if calls == 3:
+                        log.write_bytes(rewritten_by_racer)
+                        os.utime(
+                            log,
+                            ns=(initial.st_atime_ns, initial.st_mtime_ns),
+                        )
+                        result = real_stat(target, *args, **kwargs)
+                        self.assertEqual(result.st_size, initial.st_size)
+                        self.assertEqual(result.st_mtime_ns, initial.st_mtime_ns)
+                        self.assertNotEqual(result.st_ctime_ns, initial.st_ctime_ns)
+                return result
+
+            with patch.object(
+                agent_server,
+                "events_path",
+                return_value=log,
+            ), patch.object(agent_server.Path, "stat", changing_stat):
+                with self.assertRaises(RuntimeError):
+                    agent_server.prune_duplicate_imported_history_sync(
+                        "chat",
+                        dry_run=False,
+                    )
+
+            self.assertEqual(log.read_bytes(), rewritten_by_racer)
+
+    def test_prune_handles_unpaired_surrogate_keys_losslessly(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            log = Path(temporary) / "events.jsonl"
+            events = [
+                {
+                    "seq": 1,
+                    "type": "assistant_text",
+                    "run_id": "native",
+                    "text": "\ud800",
+                },
+                {
+                    "seq": 2,
+                    "type": "history_imported",
+                    "run_id": "import_\ud800_drop",
+                    "imported": True,
+                },
+                {
+                    "seq": 3,
+                    "type": "assistant_text",
+                    "run_id": "import_\ud800_drop",
+                    "imported": True,
+                    "text": "\ud800",
+                },
+                {
+                    "seq": 4,
+                    "type": "turn_finished",
+                    "run_id": "import_\ud800_drop",
+                    "imported": True,
+                },
+                {
+                    "seq": 5,
+                    "type": "history_imported",
+                    "run_id": "import_\ud800_keep",
+                    "imported": True,
+                },
+                {
+                    "seq": 6,
+                    "type": "assistant_text",
+                    "run_id": "import_\ud800_keep",
+                    "imported": True,
+                    "text": "unique",
+                },
+                {
+                    "seq": 7,
+                    "type": "turn_finished",
+                    "run_id": "import_\ud800_keep",
+                    "imported": True,
+                },
+            ]
+            self.write_log(log, events)
+            before = log.read_bytes()
+            with patch.object(
+                agent_server,
+                "events_path",
+                return_value=log,
+            ), patch.object(agent_server.hashlib, "sha256") as sha256:
+                # Every normalized key shares one digest. Full BLOB key
+                # equality must still distinguish the unique imported text.
+                sha256.return_value.digest.return_value = b"x" * 32
+                dry = agent_server.prune_duplicate_imported_history_sync(
+                    "chat",
+                    dry_run=True,
+                )
+                self.assertEqual(log.read_bytes(), before)
+                real = agent_server.prune_duplicate_imported_history_sync(
+                    "chat",
+                    dry_run=False,
+                )
+
+            self.assertEqual(dry["removed_events"], 3)
+            self.assertEqual(dry["removed_runs"], 1)
+            self.assertEqual(real["removed_events"], 3)
+            self.assertEqual(real["removed_runs"], 1)
+            rewritten = log.read_bytes()
+            self.assertIn(b'"text": "\\ud800"', rewritten)
+            self.assertIn(b'"run_id": "import_\\ud800_keep"', rewritten)
+            self.assertNotIn(b'"run_id": "import_\\ud800_drop"', rewritten)
+            self.assertEqual(real["bytes_after"], len(rewritten))
 
 
 class DarwinMetricsTests(unittest.TestCase):

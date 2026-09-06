@@ -690,22 +690,25 @@ CROSS_CHAT_DIRECT_RETRY_DELAYS_SECONDS = (1.0, 2.0, 5.0, 10.0, 30.0)
 PROVIDER_CROSS_CHAT_ROUTE_EXCHANGE_LEGS = 2
 PROVIDER_CROSS_CHAT_ROUTE_REQUEST_REPLY_LEGS = 2
 PROVIDER_CROSS_CHAT_ROUTE_EXCHANGE_TTL_SECONDS = 24 * 60 * 60
-PROVIDER_CROSS_CHAT_LIVE_WAIT_MAX_SECONDS = max(
-    30,
+# Live same-server request/reply has no semantic timeout.  Each HTTP GET is
+# nevertheless bounded so reverse proxies and provider tool transports see a
+# regular response; the provider immediately invokes another foreground helper
+# slice with the same authenticated lease after a pending heartbeat.
+PROVIDER_CROSS_CHAT_LIVE_HEARTBEAT_SECONDS = max(
+    1,
     min(
-        3600,
-        int(agentsdock_setting("CROSS_CHAT_LIVE_WAIT_MAX_SECONDS", "900")),
+        60,
+        int(agentsdock_setting("CROSS_CHAT_LIVE_HEARTBEAT_SECONDS", "20")),
     ),
 )
-# Keep a completed in-process live result briefly so the exact authenticated
-# GET can be replayed if the response socket dies after the server completed
-# the durable response leg but before the provider process received the body.
-PROVIDER_CROSS_CHAT_LIVE_RESULT_RETENTION_SECONDS = 60.0
-# A lost GET response can leave its server handler alive briefly while the
-# helper replays the exact lease.  Keep the old observer detached-but-benign
-# long enough for that replay to attach before deciding the process-local
-# waiter is truly unobserved.
-PROVIDER_CROSS_CHAT_LIVE_OBSERVER_RETRY_GRACE_SECONDS = 1.0
+# A waiter suppresses provider stuck-run watchdogs only while an authenticated
+# helper observer is attached or has checked in recently.  This covers the
+# longest supported heartbeat plus a bounded CLI reconnect/backoff window,
+# without allowing an orphaned helper process to mask a hung provider forever.
+PROVIDER_CROSS_CHAT_LIVE_OBSERVER_GRACE_SECONDS = max(
+    90.0,
+    float(PROVIDER_CROSS_CHAT_LIVE_HEARTBEAT_SECONDS) + 30.0,
+)
 PROVIDER_CROSS_CHAT_ROUTE_AUDIT_LIMIT = 64
 PROVIDER_CROSS_CHAT_ROUTE_RATE_LIMIT = 12
 PROVIDER_CROSS_CHAT_ROUTE_RATE_WINDOW_SECONDS = 60 * 60
@@ -1151,10 +1154,11 @@ HEALTH_TEAM_HUB_CAPABILITY_TIMEOUT_SECONDS = max(
         ),
     ),
 )
-# A pending update-when-idle reservation is passive: it waits for a moment
-# when no work is running and never fences admission. Earlier releases parked
-# every new turn (including Force Send) behind the reservation so the server
-# could reach idleness, which locked every chat out for 27 minutes on
+# A pending update-when-idle reservation remains passive for user work: it
+# never fences ordinary turns, Force Send, or provider controls. Autonomous
+# scheduled jobs are deferred so recurring work cannot replenish the active
+# set forever and starve the update. Earlier releases parked every new turn
+# behind the reservation, which locked every chat out for 27 minutes on
 # 2026-09-04 while one long turn ran.
 QUEUE_FENCE_LOG_INTERVAL_SECONDS = 60.0
 # Hidden cross-chat/secure-peer delivery rows retry admission when the target
@@ -1440,9 +1444,16 @@ PROVIDER_AUTHORITY_USAGE_INSTRUCTIONS = (
     "- Cross-chat routes (`cross_chat_routes`): default-deny and directional; a run can use only its listed grants "
     "and no reverse grant is implied. `\"$AGENTSDOCK_CHATS_CLI\" --authority-file " + PROVIDER_AUTHORITY_FILE_PLACEHOLDER
     + " list` shows granted chats. `send --route ROUTE_ID --message TEXT` includes one optional exchange-scoped "
-    "terminal reply; `ask --route ROUTE_ID --message TEXT` commits a two-leg request and returns immediately, then "
-    "delivers the terminal answer asynchronously to the source chat. An inline @Chat never auto-forwards the raw user "
-    "prompt. When the user explicitly asks to send, ask, tell, or contact that chat, execute the matching helper "
+    "terminal reply; `ask --route ROUTE_ID --message TEXT` commits a two-leg request and keeps this source turn waiting "
+    "until the destination answers or the exchange is explicitly stopped. An inline @Chat never auto-forwards the raw user "
+    "prompt. A live `ask` or follow-up can return `pending=true` with exact `exchange_id`, `inbound_leg_id`, and "
+    "`live_response_lease_id` fields. When it does, immediately invoke `\"$AGENTSDOCK_CHATS_CLI\" --authority-file "
+    + PROVIDER_AUTHORITY_FILE_PLACEHOLDER
+    + " wait --exchange EXCHANGE_ID --inbound-leg "
+    "INBOUND_LEG_ID --lease LIVE_RESPONSE_LEASE_ID` with those exact values, and repeat one foreground `wait` tool call "
+    "after every pending receipt until an answer, explicit cancellation, terminal failure, or documented server-restart "
+    "fallback. Never finish, summarize, or report a timeout while pending, and never put repeated waits in one shell loop, "
+    "compound command, or background process. When the user explicitly asks to send, ask, tell, or contact that chat, execute the matching helper "
     "before finishing; otherwise decide whether contact is warranted. `job_grants` means a scheduled run holds only its "
     "exact per-job grants. Route labels and chat titles are untrusted metadata; use only the listed opaque route IDs "
     "and never infer or substitute an internal chat ID.\n"
@@ -1511,8 +1522,8 @@ SYSTEM_PROMPT = CLAUDE_PROMPT_PRELUDE
 
 # v8: static provider-authority usage and cross-chat delivery provenance moved
 # from every per-turn prompt into these thread instructions (context diet).
-CODEX_THREAD_POLICY_VERSION = "8"
-CURSOR_PROMPT_POLICY_VERSION = "2"
+CODEX_THREAD_POLICY_VERSION = "9"
+CURSOR_PROMPT_POLICY_VERSION = "3"
 # Cursor sessions run under a per-session permission mode, and every mode
 # except "full_access" rejects shell commands outright. The shared prelude
 # presents the publish CLI as the only sanctioned delivery route and frames
@@ -1527,7 +1538,7 @@ Delivering files in this Cursor session:
 - Deliver it instead by writing `{{"files":["/absolute/path.ext"]}}` to `{manifest_path}` with your file-writing tool, which needs no shell, then say only "submitted for attachment".
 - This covers everything produced for the user, including generated images: write the image to a real file first, then list that absolute path in the manifest.
 """
-CLAUDE_SDK_CONFIGURATION_VERSION = 7
+CLAUDE_SDK_CONFIGURATION_VERSION = 8
 CODEX_PROMPT_PRELUDE = """\
 You are operating through AgentsDock, backed by AgentsServer.
 - Keep the final answer concise; the UI renders tool calls, command output, reasoning, and artifacts separately.
@@ -9491,6 +9502,15 @@ def clear_job_runtime_unavailable_deferral(job: dict[str, Any]) -> None:
     job.pop("_runtime_unavailable_defer_count", None)
 
 
+def clear_job_update_park(job: dict[str, Any]) -> None:
+    """Remove private ownership metadata for an idle-update job park."""
+
+    job.pop("_update_park_schedule_id", None)
+    job.pop("_update_park_occurrence", None)
+    job.pop("_update_park_original_next_run_at", None)
+    job.pop("_update_park_revision", None)
+
+
 def durable_scheduled_job_admissions(
     jobs: dict[str, dict[str, Any]],
 ) -> dict[str, dict[str, Any]]:
@@ -9779,6 +9799,7 @@ class JobStore:
                 job.pop("manual_run_requested_at", None)
                 job.pop("manual_run_defer_reason", None)
                 job.pop("_last_manual_defer_event_at", None)
+                clear_job_update_park(job)
                 job["updated_at"] = now_iso()
                 job["_revision"] = new_job_revision()
                 changed = True
@@ -10338,6 +10359,7 @@ class JobStore:
             # unavailable-runtime budget. A stale scheduler snapshot is then
             # unable to consume or advance the edited occurrence.
             clear_job_runtime_unavailable_deferral(job)
+            clear_job_update_park(job)
             job["updated_at"] = now_iso()
             job["_revision"] = new_job_revision()
             self.jobs[jid] = job
@@ -10421,6 +10443,7 @@ class JobStore:
                 job["next_run_at"] = None
                 job["scheduled_run_at"] = None
                 clear_job_runtime_unavailable_deferral(job)
+                clear_job_update_park(job)
                 if manual_pending:
                     job["manual_run_pending"] = False
                     job.pop("manual_run_requested_at", None)
@@ -10477,6 +10500,7 @@ class JobStore:
             job["next_run_at"] = None
             job["scheduled_run_at"] = None
             clear_job_runtime_unavailable_deferral(job)
+            clear_job_update_park(job)
             job["manual_run_pending"] = False
             job.pop("manual_run_requested_at", None)
             job.pop("manual_run_defer_reason", None)
@@ -10628,6 +10652,7 @@ class JobStore:
                 job["next_run_at"] = None
                 job["scheduled_run_at"] = None
             clear_job_runtime_unavailable_deferral(job)
+            clear_job_update_park(job)
             job["updated_at"] = now_iso()
             job["_revision"] = new_job_revision()
             await self.save()
@@ -10641,6 +10666,7 @@ class JobStore:
         *,
         expected_revision: str | None = None,
         expected_next_run_at: float | None = None,
+        update_schedule_id: str | None = None,
     ) -> bool:
         delay = int(delay_seconds or JOB_BUSY_RETRY_SECONDS)
         emit_event = False
@@ -10665,6 +10691,34 @@ class JobStore:
                 if not same_occurrence:
                     return False
             now = time.time()
+            if update_schedule_id is not None:
+                occurrence = job.get("scheduled_run_at")
+                if occurrence is None:
+                    occurrence = expected_next_run_at
+                try:
+                    clean_occurrence = float(occurrence)
+                    original_next_run_at = float(
+                        job.get("_update_park_original_next_run_at")
+                        if (
+                            job.get("_update_park_schedule_id")
+                            == update_schedule_id
+                            and job.get("_update_park_original_next_run_at")
+                            is not None
+                        )
+                        else job.get("next_run_at")
+                    )
+                except (TypeError, ValueError) as exc:
+                    raise RuntimeError(
+                        "scheduled update park lost its occurrence"
+                    ) from exc
+                if not math.isfinite(clean_occurrence) or not math.isfinite(
+                    original_next_run_at
+                ):
+                    raise RuntimeError(
+                        "scheduled update park has an invalid occurrence"
+                    )
+            else:
+                clear_job_update_park(job)
             job["next_run_at"] = now + max(delay, 5)
             job["last_deferred_at"] = now_iso()
             job["last_defer_reason"] = reason
@@ -10674,7 +10728,15 @@ class JobStore:
                 emit_event = True
                 event_job = public_job(job)
             job["updated_at"] = now_iso()
-            job["_revision"] = new_job_revision()
+            revision = new_job_revision()
+            job["_revision"] = revision
+            if update_schedule_id is not None:
+                job["_update_park_schedule_id"] = update_schedule_id
+                job["_update_park_occurrence"] = clean_occurrence
+                job["_update_park_original_next_run_at"] = (
+                    original_next_run_at
+                )
+                job["_update_park_revision"] = revision
             await self.save()
         if emit_event and event_job and event_job.get("session_id"):
             await append_event(str(event_job["session_id"]), "job_deferred", {
@@ -10683,6 +10745,98 @@ class JobStore:
                 "message": f"Scheduled job deferred: {event_job.get('title') or jid} — {reason}",
             })
         return True
+
+    async def defer_for_pending_server_update(
+        self,
+        jid: str,
+        reason: str,
+        *,
+        expected_revision: str | None,
+        expected_next_run_at: float | None,
+    ) -> bool:
+        """Durably park one unchanged automatic occurrence for an exact update.
+
+        Cancellation takes the same operation lock before clearing the update
+        reservation and rearming these markers. The two operations therefore
+        cannot strand a park on the wrong side of cancellation.
+        """
+
+        async with SERVER_UPDATE_OPERATION_LOCK:
+            status = read_server_update_status()
+            if not managed_server_update_is_pending(status):
+                return False
+            schedule_id = str(status.get("schedule_id") or "").strip()
+            if not schedule_id:
+                return False
+            return await self.defer(
+                jid,
+                reason,
+                JOB_BUSY_RETRY_SECONDS,
+                expected_revision=expected_revision,
+                expected_next_run_at=expected_next_run_at,
+                update_schedule_id=schedule_id,
+            )
+
+    async def resume_update_parked(
+        self,
+        schedule_id: str | None = None,
+        *,
+        active_schedule_id: str | None = None,
+    ) -> int:
+        """Rearm unchanged occurrences parked by an ended idle reservation."""
+
+        resumed = 0
+        changed = False
+        async with self._lock:
+            now = time.time()
+            updated_at = now_iso()
+            for job in self.jobs.values():
+                parked_schedule_id = str(
+                    job.get("_update_park_schedule_id") or ""
+                ).strip()
+                if not parked_schedule_id or (
+                    schedule_id is not None
+                    and parked_schedule_id != schedule_id
+                ) or (
+                    active_schedule_id is not None
+                    and parked_schedule_id == active_schedule_id
+                ):
+                    continue
+                changed = True
+                parked_revision = str(
+                    job.get("_update_park_revision") or ""
+                )
+                try:
+                    parked_occurrence = float(
+                        job.get("_update_park_occurrence")
+                    )
+                    current_occurrence = float(job.get("scheduled_run_at"))
+                    original_next_run_at = float(
+                        job.get("_update_park_original_next_run_at")
+                    )
+                except (TypeError, ValueError):
+                    exact_park = False
+                else:
+                    exact_park = (
+                        math.isfinite(parked_occurrence)
+                        and math.isfinite(current_occurrence)
+                        and math.isfinite(original_next_run_at)
+                        and job.get("_revision") == parked_revision
+                        and bool(job.get("enabled"))
+                        and current_occurrence == parked_occurrence
+                    )
+                clear_job_update_park(job)
+                if exact_park:
+                    # Preserve the canonical occurrence, but make its retry
+                    # immediately due. A future edit has already failed the
+                    # revision/occurrence CAS above and remains authoritative.
+                    job["next_run_at"] = min(original_next_run_at, now)
+                    resumed += 1
+                job["updated_at"] = updated_at
+                job["_revision"] = new_job_revision()
+            if changed:
+                await self.save()
+        return resumed
 
     async def defer_runtime_unavailable(
         self,
@@ -10737,6 +10891,7 @@ class JobStore:
                 return "exhausted"
 
             now = time.time()
+            clear_job_update_park(job)
             job["_runtime_unavailable_occurrence"] = occurrence
             job["_runtime_unavailable_defer_count"] = defer_count + 1
             job["next_run_at"] = now + max(JOB_BUSY_RETRY_SECONDS, 5)
@@ -11024,7 +11179,10 @@ class JobStore:
 
             try:
                 if not blocker_checked:
-                    blocker = await scheduled_job_blocker(session_id)
+                    blocker = await scheduled_job_blocker(
+                        session_id,
+                        manual=True,
+                    )
                     if blocker:
                         return await self._record_manual_run_deferred(jid, blocker)
                 result = await self._start_job_run(jid, manual=True)
@@ -11199,10 +11357,20 @@ class JobStore:
                             concise_error_message(exc),
                         )
                     continue
-                blocker = await scheduled_job_blocker(job_session_id)
+                blocker = await scheduled_job_blocker(
+                    job_session_id,
+                    manual=manual_run_pending,
+                )
                 if blocker:
                     if manual_run_pending:
                         await self._record_manual_run_deferred(jid, blocker)
+                    elif blocker == MANAGED_SERVER_UPDATE_PENDING_DETAIL:
+                        await self.defer_for_pending_server_update(
+                            jid,
+                            blocker,
+                            expected_revision=due_revision,
+                            expected_next_run_at=due_next_run_at,
+                        )
                     else:
                         await self.defer(
                             jid,
@@ -11341,6 +11509,13 @@ class JobStore:
                                 jid,
                                 lifecycle_defer_reason,
                             )
+                        elif isinstance(e, ManagedServerUpdatePendingError):
+                            await self.defer_for_pending_server_update(
+                                jid,
+                                lifecycle_defer_reason,
+                                expected_revision=due_revision,
+                                expected_next_run_at=due_next_run_at,
+                            )
                         else:
                             # Preserve the canonical occurrence and use the due
                             # snapshot as a CAS guard. If a user edited/replaced
@@ -11414,6 +11589,7 @@ class JobStore:
                             job["next_run_at"] = None
                             job["scheduled_run_at"] = None
                         clear_job_runtime_unavailable_deferral(job)
+                        clear_job_update_park(job)
                         await self.save()
                         failed_job = dict(job)
                     if failed_job.get("session_id"):
@@ -12296,10 +12472,10 @@ class CrossChatStore:
                     )
                 if "live_response_requested" not in exchange_columns:
                     # Preserve the immutable request shape separately from the
-                    # mutable live lease. A timed-out/restarted live request is
-                    # downgraded to async delivery, but an exact POST replay
-                    # must still compare equal to the originally accepted
-                    # wait_for_response=true request.
+                    # mutable live lease. A restarted live request is resumed
+                    # through durable async delivery, but it remains exempt
+                    # from elapsed-time expiry and an exact POST replay must
+                    # still compare equal to the originally accepted request.
                     connection.execute(
                         "ALTER TABLE cross_chat_exchanges ADD COLUMN "
                         "live_response_requested INTEGER NOT NULL DEFAULT 0 "
@@ -13211,7 +13387,10 @@ class CrossChatStore:
                 if exchange.get("status") != "active":
                     detail = "expired" if exchange.get("status") == "expired" else "response_already_committed"
                     raise HTTPException(status_code=410 if detail == "expired" else 409, detail=detail)
-                if str(exchange.get("expires_at") or "") <= timestamp:
+                if (
+                    str(exchange.get("expires_at") or "") <= timestamp
+                    and not bool(exchange.get("live_response_requested"))
+                ):
                     connection.execute(
                         """
                         UPDATE cross_chat_exchanges
@@ -13810,7 +13989,8 @@ class CrossChatStore:
                 rows = connection.execute(
                     """
                     SELECT * FROM cross_chat_exchanges
-                    WHERE status IN ('waiting_request','active') AND expires_at <= ?
+                    WHERE status IN ('waiting_request','active')
+                      AND live_response_requested=0 AND expires_at <= ?
                     ORDER BY expires_at, id
                     """,
                     (timestamp,),
@@ -17263,10 +17443,27 @@ async def _revoke_cross_chat_capability(run_id: str) -> None:
                 error="live cross-chat response capability was revoked",
             )
             if failed is not None and active_leg is not None:
+                # Refresh after the terminal CAS: a simultaneous admission may
+                # have bound its exact queue id after our earlier snapshot but
+                # before the failure won.  Once failed, no later claim can add
+                # a queue owner, so this removes the complete winning set.
+                failed_leg = (
+                    await CROSS_CHAT.get_exchange_leg(
+                        str(active_leg.get("id") or "")
+                    )
+                ) or active_leg
+                if failed_leg.get("queued_id"):
+                    await remove_cross_chat_exchange_leg_queue_owner(
+                        failed_leg,
+                        reason=(
+                            "Removed queued cross-chat delivery because its "
+                            "live source run was stopped."
+                        ),
+                    )
                 await maybe_deliver_cross_chat_exchange_failure_status(
                     failed,
-                    failed_session_id=str(active_leg.get("target_session_id") or ""),
-                    failed_leg=active_leg,
+                    failed_session_id=str(failed_leg.get("target_session_id") or ""),
+                    failed_leg=failed_leg,
                 )
     for raw_path in set(paths):
         if not raw_path:
@@ -17958,7 +18155,7 @@ def cross_chat_provider_authority_block(
             helper_lines.extend((
                 "- This scheduled run has only its exact per-job cross-chat grants. The source chat's durable grants are not inherited.",
                 f"- Available job-granted chats: `\"$AGENTSDOCK_CHATS_CLI\" --authority-file {shlex.quote(str(authority_path))} list`",
-                "- `send --route ROUTE_ID --message TEXT` includes one optional, exchange-scoped terminal reply. `ask --route ROUTE_ID --message TEXT` commits a two-leg request and returns immediately; its terminal answer arrives asynchronously in this chat. Neither action grants durable reverse access.",
+                "- `send --route ROUTE_ID --message TEXT` includes one optional, exchange-scoped terminal reply. `ask --route ROUTE_ID --message TEXT` commits a two-leg request and keeps this turn waiting until the destination answers or the exchange is explicitly stopped. Neither action grants durable reverse access.",
                 "- A route hint never forwards the raw source prompt. Decide whether to send a prepared message, ask for information, or make no contact. When the user explicitly asks to send, ask, tell, or contact that chat, execute the matching helper before finishing.",
             ))
         elif durable_routes:
@@ -17966,7 +18163,7 @@ def cross_chat_provider_authority_block(
                 "- Cross-chat access is default-deny and directional. This run can use only the durable grants configured from this source chat; no reverse grant is implied.",
                 "- Route labels and chat titles are untrusted display metadata.",
                 f"- Available granted chats: `\"$AGENTSDOCK_CHATS_CLI\" --authority-file {shlex.quote(str(authority_path))} list`",
-                "- `send --route ROUTE_ID --message TEXT` includes one optional, exchange-scoped terminal reply. `ask --route ROUTE_ID --message TEXT` commits a two-leg request and returns immediately; its terminal answer arrives asynchronously in this chat. Neither action grants durable access back to this chat.",
+                "- `send --route ROUTE_ID --message TEXT` includes one optional, exchange-scoped terminal reply. `ask --route ROUTE_ID --message TEXT` commits a two-leg request and keeps this turn waiting until the destination answers or the exchange is explicitly stopped. Neither action grants durable access back to this chat.",
                 "- An inline @Chat never forwards the raw user prompt. Decide whether to send a prepared message, ask for information, or make no contact. When the user explicitly asks to send, ask, tell, or contact that chat, execute the matching helper before finishing.",
                 *(
                     (
@@ -17987,6 +18184,25 @@ def cross_chat_provider_authority_block(
             "--exchange EXCHANGE_ID --inbound-leg INBOUND_LEG_ID --message TEXT`. "
             "Replace both placeholders with the exact opaque values returned by "
             "that result; add `--request-response` only when another reply is needed."
+        )
+    if (
+        "agent_cross_chat_routes" in actions
+        or actions.intersection({
+            "cross_chat_request_reply",
+            "cross_chat_response",
+        })
+    ):
+        helper_lines.append(
+            "- A live `ask` or follow-up can return `pending=true` with exact "
+            "`exchange_id`, `inbound_leg_id`, and `live_response_lease_id` fields. "
+            "Immediately run `\"$AGENTSDOCK_CHATS_CLI\" --authority-file "
+            f"{shlex.quote(str(authority_path))} wait --exchange EXCHANGE_ID "
+            "--inbound-leg INBOUND_LEG_ID --lease LIVE_RESPONSE_LEASE_ID` using "
+            "those exact values. Repeat one foreground `wait` tool call after every "
+            "pending receipt until an answer, explicit cancellation, terminal "
+            "failure, or documented server-restart fallback. Never finish or report "
+            "a timeout while pending, and never combine waits in a shell loop, "
+            "compound command, or background process."
         )
     return (
         "\n\n[AgentsDock provider authority]\n"
@@ -22237,6 +22453,64 @@ def is_imported_history_event(event: dict[str, Any]) -> bool:
     return event.get("imported") is True or str(event.get("run_id") or "").startswith("import_")
 
 
+def fsync_parent_directory(path: Path) -> None:
+    """Persist an atomic rename on POSIX; file fsync is sufficient on Windows."""
+
+    if os.name == "nt":
+        return
+    flags = os.O_RDONLY
+    flags |= getattr(os, "O_DIRECTORY", 0)
+    flags |= getattr(os, "O_CLOEXEC", 0)
+    descriptor = os.open(path.parent, flags)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def _prune_history_bookkeeping_connection(path: Path) -> sqlite3.Connection:
+    """Create bounded-memory, disposable bookkeeping for one history prune."""
+
+    connection = sqlite3.connect(path)
+    # This database is disposable and never becomes authoritative. Keeping its
+    # journal and cache small moves the unbounded key/drop sets out of Python
+    # without adding durability work to the real event log transaction.
+    connection.execute("PRAGMA journal_mode=OFF")
+    connection.execute("PRAGMA synchronous=OFF")
+    connection.execute("PRAGMA temp_store=FILE")
+    connection.execute("PRAGMA cache_size=-2048")
+    connection.executescript(
+        """
+        CREATE TABLE seen_messages (
+            digest BLOB NOT NULL,
+            kind TEXT NOT NULL,
+            normalized_text BLOB NOT NULL,
+            PRIMARY KEY (digest, kind, normalized_text)
+        ) WITHOUT ROWID;
+        CREATE TABLE kept_runs (
+            run_id BLOB PRIMARY KEY,
+            kept_count INTEGER NOT NULL
+        ) WITHOUT ROWID;
+        CREATE TABLE dropped_lines (
+            byte_offset INTEGER PRIMARY KEY,
+            byte_length INTEGER NOT NULL,
+            run_id BLOB,
+            is_import_marker INTEGER NOT NULL DEFAULT 0
+        );
+        """
+    )
+    return connection
+
+
+def _prune_history_message_key(event: dict[str, Any]) -> tuple[str, str] | None:
+    event_type = str(event.get("type") or "")
+    if event_type == "turn_started":
+        return history_dedup_key("user", event.get("prompt"))
+    if event_type == "assistant_text":
+        return history_dedup_key("assistant", event.get("text"))
+    return None
+
+
 def prune_duplicate_imported_history_sync(
     session_id: str,
     *,
@@ -22263,108 +22537,248 @@ def prune_duplicate_imported_history_sync(
     }
     if not path.exists():
         return summary
-    raw_lines = path.read_bytes().split(b"\n")
-    summary["bytes_before"] = path.stat().st_size
-    parsed: list[tuple[bytes, dict[str, Any] | None]] = []
-    for raw in raw_lines:
-        if not raw.strip():
-            parsed.append((raw, None))
-            continue
+    source_stat = path.stat()
+    summary["bytes_before"] = source_stat.st_size
+    token = f"{os.getpid()}.{threading.get_ident()}.{uuid.uuid4().hex}"
+    bookkeeping_path = path.with_name(f".{path.name}.prune-{token}.sqlite3")
+    replacement_path = path.with_name(f".{path.name}.{token}.prune-tmp")
+    connection: sqlite3.Connection | None = None
+    try:
+        connection = _prune_history_bookkeeping_connection(bookkeeping_path)
+        # Pass one establishes exactly the same first-copy-wins relation as
+        # the historical in-memory implementation. Both the normalized text
+        # and a fixed digest are stored: the digest keeps lookups efficient,
+        # while the full key makes hash collisions semantically harmless.
+        with path.open("rb") as source:
+            while True:
+                byte_offset = source.tell()
+                raw_line = source.readline()
+                if not raw_line:
+                    break
+                if not raw_line.strip():
+                    continue
+                try:
+                    loaded = json.loads(raw_line)
+                except Exception:
+                    continue
+                if not isinstance(loaded, dict):
+                    continue
+                summary["events_before"] += 1
+                with suppress(TypeError, ValueError):
+                    summary["_max_seq_before"] = max(
+                        int(summary.get("_max_seq_before") or 0),
+                        int(loaded.get("seq") or 0),
+                    )
+                key = _prune_history_message_key(loaded)
+                if key is None:
+                    continue
+                kind, normalized = key
+                digest = hashlib.sha256(
+                    kind.encode("utf-8", "surrogatepass")
+                    + b"\0"
+                    + normalized.encode("utf-8", "surrogatepass")
+                ).digest()
+                normalized_bytes = normalized.encode("utf-8", "surrogatepass")
+                duplicate = connection.execute(
+                    """
+                    SELECT 1 FROM seen_messages
+                    WHERE digest = ? AND kind = ? AND normalized_text = ?
+                    """,
+                    (digest, kind, normalized_bytes),
+                ).fetchone() is not None
+                if is_imported_history_event(loaded) and duplicate:
+                    run_id = str(loaded.get("run_id") or "").encode(
+                        "utf-8",
+                        "surrogatepass",
+                    )
+                    connection.execute(
+                        """
+                        INSERT OR IGNORE INTO dropped_lines
+                            (byte_offset, byte_length, run_id, is_import_marker)
+                        VALUES (?, ?, ?, 0)
+                        """,
+                        (
+                            byte_offset,
+                            len(raw_line),
+                            run_id,
+                        ),
+                    )
+                    continue
+                if is_imported_history_event(loaded):
+                    run_id = str(loaded.get("run_id") or "").encode(
+                        "utf-8",
+                        "surrogatepass",
+                    )
+                    connection.execute(
+                        """
+                        INSERT INTO kept_runs (run_id, kept_count) VALUES (?, 1)
+                        ON CONFLICT(run_id) DO UPDATE
+                            SET kept_count = kept_count + 1
+                        """,
+                        (run_id,),
+                    )
+                connection.execute(
+                    """
+                    INSERT OR IGNORE INTO seen_messages
+                        (digest, kind, normalized_text)
+                    VALUES (?, ?, ?)
+                    """,
+                    (digest, kind, normalized_bytes),
+                )
+        connection.commit()
+
+        # Pass two drops empty import-run markers and computes the surviving
+        # sequence high-water mark without retaining any raw event or line.
+        max_kept_seq = 0
+        with path.open("rb") as source:
+            while True:
+                byte_offset = source.tell()
+                raw_line = source.readline()
+                if not raw_line:
+                    break
+                dropped = connection.execute(
+                    "SELECT 1 FROM dropped_lines WHERE byte_offset = ?",
+                    (byte_offset,),
+                ).fetchone() is not None
+                event: dict[str, Any] | None = None
+                if raw_line.strip():
+                    with suppress(Exception):
+                        loaded = json.loads(raw_line)
+                        if isinstance(loaded, dict):
+                            event = loaded
+                if event is not None and not dropped and is_imported_history_event(event):
+                    event_type = str(event.get("type") or "")
+                    run_id = str(event.get("run_id") or "").encode(
+                        "utf-8",
+                        "surrogatepass",
+                    )
+                    if event_type in {"history_imported", "turn_finished"} and run_id:
+                        kept = connection.execute(
+                            "SELECT kept_count FROM kept_runs WHERE run_id = ?",
+                            (run_id,),
+                        ).fetchone()
+                        if kept is None or int(kept[0]) == 0:
+                            connection.execute(
+                                """
+                                INSERT OR IGNORE INTO dropped_lines
+                                    (byte_offset, byte_length, run_id, is_import_marker)
+                                VALUES (?, ?, ?, ?)
+                                """,
+                                (
+                                    byte_offset,
+                                    len(raw_line),
+                                    run_id,
+                                    1 if event_type == "history_imported" else 0,
+                                ),
+                            )
+                            dropped = True
+                if event is not None and not dropped:
+                    seq = durable_event_seq(event)
+                    if seq is not None:
+                        max_kept_seq = max(max_kept_seq, seq)
+        connection.commit()
+
+        dropped = connection.execute(
+            """
+            SELECT COUNT(*), COALESCE(SUM(byte_length), 0)
+            FROM dropped_lines
+            """
+        ).fetchone()
+        summary["removed_events"] = int(dropped[0] if dropped else 0)
+        removed_bytes = int(dropped[1] if dropped else 0)
+        summary["removed_runs"] = int(connection.execute(
+            """
+            SELECT COUNT(DISTINCT run_id)
+            FROM dropped_lines
+            WHERE is_import_marker = 1 AND length(run_id) > 0
+            """
+        ).fetchone()[0])
+        summary.setdefault("_max_seq_before", 0)
+        summary["bytes_after"] = summary["bytes_before"] - removed_bytes
+        if dry_run or not summary["removed_events"]:
+            return summary
+
+        # Stream the replacement on the same filesystem. Malformed JSON,
+        # blank lines, original newline framing, and every non-dropped byte
+        # are copied verbatim.
+        mode = stat.S_IMODE(source_stat.st_mode)
+        descriptor = os.open(
+            replacement_path,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+            mode or 0o600,
+        )
+        bytes_written = 0
+        last_byte = b""
         try:
-            loaded = json.loads(raw)
-            parsed.append((raw, loaded if isinstance(loaded, dict) else None))
-        except Exception:
-            parsed.append((raw, None))
-    summary["events_before"] = sum(1 for _raw, event in parsed if event is not None)
-    max_seq_before = 0
-    for _raw, event in parsed:
-        if not isinstance(event, dict):
-            continue
-        with suppress(TypeError, ValueError):
-            max_seq_before = max(max_seq_before, int(event.get("seq") or 0))
-    summary["_max_seq_before"] = max_seq_before
+            with os.fdopen(descriptor, "wb") as replacement, path.open("rb") as source:
+                while True:
+                    byte_offset = source.tell()
+                    raw_line = source.readline()
+                    if not raw_line:
+                        break
+                    if connection.execute(
+                        "SELECT 1 FROM dropped_lines WHERE byte_offset = ?",
+                        (byte_offset,),
+                    ).fetchone() is not None:
+                        continue
+                    replacement.write(raw_line)
+                    bytes_written += len(raw_line)
+                    last_byte = raw_line[-1:]
 
-    seen: Counter[tuple[str, str]] = Counter()
-    kept_per_import_run: Counter[str] = Counter()
-    drop_indexes: set[int] = set()
-    for index, (_raw, event) in enumerate(parsed):
-        if event is None:
-            continue
-        event_type = str(event.get("type") or "")
-        if event_type == "turn_started":
-            key = history_dedup_key("user", event.get("prompt"))
-        elif event_type == "assistant_text":
-            key = history_dedup_key("assistant", event.get("text"))
-        else:
-            continue
-        if is_imported_history_event(event):
-            run_id = str(event.get("run_id") or "")
-            if seen.get(key):
-                drop_indexes.add(index)
-                continue
-            kept_per_import_run[run_id] += 1
-        seen[key] += 1
-    for index, (_raw, event) in enumerate(parsed):
-        if event is None or not is_imported_history_event(event):
-            continue
-        event_type = str(event.get("type") or "")
-        if event_type in {"history_imported", "turn_finished"}:
-            run_id = str(event.get("run_id") or "")
-            if run_id and kept_per_import_run.get(run_id, 0) == 0:
-                drop_indexes.add(index)
-    removed_runs = {
-        str(event.get("run_id") or "")
-        for index, (_raw, event) in enumerate(parsed)
-        if index in drop_indexes and event is not None
-        and str(event.get("type") or "") == "history_imported"
-    }
-    summary["removed_events"] = len(drop_indexes)
-    summary["removed_runs"] = len(removed_runs)
-    kept = [raw for index, (raw, _event) in enumerate(parsed) if index not in drop_indexes]
-    rewritten = b"\n".join(kept)
-    summary["bytes_after"] = len(rewritten)
-    if dry_run or not drop_indexes:
-        summary["bytes_after"] = summary["bytes_before"] if not drop_indexes else summary["bytes_after"]
+                # A client may already have advanced its cursor through a
+                # removed tail. Persist that high-water mark in the same
+                # replacement so a crash cannot make a later event reuse it.
+                max_seq_before = int(summary.get("_max_seq_before") or 0)
+                if max_kept_seq < max_seq_before:
+                    checkpoint = {
+                        "seq": max_seq_before,
+                        "id": f"evt_checkpoint_{uuid.uuid4().hex[:16]}",
+                        "session_id": session_id,
+                        "type": "_event_sequence_checkpoint",
+                        "ts": now_iso(),
+                        "server_internal": True,
+                    }
+                    if bytes_written and last_byte != b"\n":
+                        replacement.write(b"\n")
+                        bytes_written += 1
+                    checkpoint_line = json.dumps(
+                        checkpoint,
+                        separators=(",", ":"),
+                    ).encode("utf-8") + b"\n"
+                    replacement.write(checkpoint_line)
+                    bytes_written += len(checkpoint_line)
+                replacement.flush()
+                os.fsync(replacement.fileno())
+        except BaseException:
+            with suppress(OSError):
+                replacement_path.unlink()
+            raise
+
+        current_stat = path.stat()
+        if (
+            current_stat.st_dev != source_stat.st_dev
+            or current_stat.st_ino != source_stat.st_ino
+            or current_stat.st_size != source_stat.st_size
+            or current_stat.st_mtime_ns != source_stat.st_mtime_ns
+            or current_stat.st_ctime_ns != source_stat.st_ctime_ns
+        ):
+            raise RuntimeError("event log changed while duplicate history was pruned")
+        os.replace(replacement_path, path)
+        # The sparse timeline index is inode-bound and would be ignored, but
+        # remove it now so recovery never mistakes dead metadata for state.
+        with suppress(OSError):
+            events_index_path(path).unlink()
+        fsync_parent_directory(path)
+        summary["bytes_after"] = bytes_written
         return summary
-
-    # A client may already have advanced its cursor through a duplicate at
-    # the old tail. If pruning removes that tail, retain an internal sequence
-    # checkpoint in the same atomic replacement so even a crash before the
-    # session registry is updated cannot make a later event reuse the number.
-    max_kept_seq = max(
-        (
-            seq
-            for _raw, event in (
-                item for index, item in enumerate(parsed) if index not in drop_indexes
-            )
-            if event is not None
-            and (seq := durable_event_seq(event)) is not None
-        ),
-        default=0,
-    )
-    if max_kept_seq < max_seq_before:
-        checkpoint = {
-            "seq": max_seq_before,
-            "id": f"evt_checkpoint_{uuid.uuid4().hex[:16]}",
-            "session_id": session_id,
-            "type": "_event_sequence_checkpoint",
-            "ts": now_iso(),
-            "server_internal": True,
-        }
-        if rewritten and not rewritten.endswith(b"\n"):
-            rewritten += b"\n"
-        rewritten += json.dumps(
-            checkpoint,
-            separators=(",", ":"),
-        ).encode("utf-8") + b"\n"
-        summary["bytes_after"] = len(rewritten)
-    tmp = path.with_suffix(".jsonl.prune-tmp")
-    with tmp.open("wb") as stream:
-        stream.write(rewritten)
-        stream.flush()
-        os.fsync(stream.fileno())
-    os.replace(tmp, path)
-    return summary
+    finally:
+        if connection is not None:
+            with suppress(Exception):
+                connection.close()
+        with suppress(OSError):
+            bookkeeping_path.unlink()
+        with suppress(OSError):
+            replacement_path.unlink()
 
 
 async def recover_abandoned_codex_compactions_after_start(
@@ -32982,7 +33396,7 @@ def cross_chat_handoffs_capability() -> dict[str, Any]:
         "required": False,
         "message": message,
         "action": action,
-        "version": 12,
+        "version": 13,
         "actions": [
             "route",
             "request_reply",
@@ -32990,8 +33404,9 @@ def cross_chat_handoffs_capability() -> dict[str, Any]:
             "final_result",
         ],
         # One @ is a structured target hint. It never forwards the source
-        # prompt; the source agent chooses a prepared Send, asynchronous Ask,
-        # or no contact. Legacy direct_message/@@ records remain readable only
+        # prompt; the source agent chooses a prepared Send, live Ask, explicit
+        # asynchronous Ask, or no contact. Legacy direct_message/@@ records
+        # remain readable only
         # for migration/recovery and are quarantined from ordinary authority;
         # they can never mint a durable route grant.
         "default_action": "route",
@@ -33007,8 +33422,15 @@ def cross_chat_handoffs_capability() -> dict[str, Any]:
             "agent_cross_chat_routes": True,
             "agent_ambient_local_handoffs": False,
             "configured_route_async_request_reply": True,
+            "configured_route_live_request_reply": True,
+            "configured_route_request_reply_default": "live",
             "live_same_server_request_reply": True,
-            "live_wait_async_fallback": True,
+            # Elapsed time and HTTP reconnects never change delivery mode.
+            # A process restart cannot retain the in-memory provider call, so
+            # its durable exchange alone resumes as an asynchronous source
+            # delivery after startup reconciliation.
+            "live_wait_timeout_async_fallback": False,
+            "live_wait_restart_async_fallback": True,
             "exact_queued_delivery_skip": True,
             "secure_peer_fifo_barriers": False,
             "secure_peer_agent_relay": False,
@@ -33021,8 +33443,10 @@ def cross_chat_handoffs_capability() -> dict[str, Any]:
             "followup_supported": True,
             "duplicate_provider_turns": False,
             "max_legs": CROSS_CHAT_EXCHANGE_DEFAULT_LEGS,
-            "max_wait_seconds": PROVIDER_CROSS_CHAT_LIVE_WAIT_MAX_SECONDS,
-            "wait_timeout_delivery": "asynchronous",
+            "max_wait_seconds": None,
+            "heartbeat_seconds": PROVIDER_CROSS_CHAT_LIVE_HEARTBEAT_SECONDS,
+            "wait_timeout_delivery": "none",
+            "restart_delivery": "asynchronous_source_chat",
         },
         "ambient_local_handoffs": {
             "enabled": False,
@@ -34444,11 +34868,61 @@ async def cross_chat_live_lease_lock(
         yield
 
 
-def cross_chat_live_wait_seconds(requested: int | None) -> float:
-    return float(min(
-        int(requested or PROVIDER_CROSS_CHAT_LIVE_WAIT_MAX_SECONDS),
-        PROVIDER_CROSS_CHAT_LIVE_WAIT_MAX_SECONDS,
+def cross_chat_live_heartbeat_seconds(requested: int | None) -> float:
+    """Return a transport heartbeat interval, never a response deadline.
+
+    ``response_timeout_seconds`` remains accepted on the wire so helpers from
+    the immediately preceding release keep working during an update.  It no
+    longer limits how long a same-server agent waits for its peer.
+    """
+
+    if requested is None:
+        return float(PROVIDER_CROSS_CHAT_LIVE_HEARTBEAT_SECONDS)
+    return float(max(
+        1,
+        min(
+            int(requested),
+            PROVIDER_CROSS_CHAT_LIVE_HEARTBEAT_SECONDS,
+        ),
     ))
+
+
+def provider_run_owns_pending_cross_chat_live_wait(
+    session_id: str,
+    run_id: str,
+) -> bool:
+    """Whether one exact provider run is observably blocked on a peer.
+
+    Provider transports have general stuck-run watchdogs.  A pending live
+    cross-chat lease is different: the provider is waiting exactly as the
+    user requested.  Suppress those watchdogs only while its authenticated
+    helper has an attached HTTP observer or a recent check-in; a killed helper
+    must eventually expose a genuinely hung provider.  Completed or abandoned
+    waiters never suppress watchdogs.
+    """
+
+    observed_at = time.monotonic()
+
+    def helper_is_attached(waiter: dict[str, Any]) -> bool:
+        observers = waiter.get("observers")
+        if isinstance(observers, set) and bool(observers):
+            return True
+        last_observer = waiter.get("last_observer_at_monotonic")
+        return (
+            isinstance(last_observer, (int, float))
+            and observed_at - float(last_observer)
+            <= PROVIDER_CROSS_CHAT_LIVE_OBSERVER_GRACE_SECONDS
+        )
+
+    return any(
+        str(waiter.get("owner_session_id") or "") == session_id
+        and str(waiter.get("owner_run_id") or "") == run_id
+        and not bool(waiter.get("abandoned"))
+        and isinstance(waiter.get("future"), asyncio.Future)
+        and not waiter["future"].done()
+        and helper_is_attached(waiter)
+        for waiter in CROSS_CHAT_LIVE_RESPONSE_WAITERS.values()
+    )
 
 
 def cross_chat_live_waiter_capability_locked(
@@ -34487,8 +34961,8 @@ async def register_cross_chat_live_waiter_locked(
     """Attach one exact live provider call to the leg awaiting its response.
 
     The caller must hold the exchange's live-lease lock.  SQLite remains the
-    routing authority; this process-local future is deliberately unrecoverable
-    so a restart can only fail a live lease closed.
+    routing authority; this process-local future cannot survive a restart, so
+    startup reconciliation resumes its durable exchange asynchronously.
     """
 
     exchange_id = str(exchange.get("id") or "")
@@ -34546,12 +35020,13 @@ async def register_cross_chat_live_waiter_locked(
         "token_hash": token_hash,
         "abandoned": False,
         "observers": set(),
-        "deadline": (
-            asyncio.get_running_loop().time()
-            + cross_chat_live_wait_seconds(timeout_seconds)
-        ),
+        "last_observer_at_monotonic": time.monotonic(),
         "future": asyncio.get_running_loop().create_future(),
     }
+    # Retain the compatibility argument deliberately: it participates in no
+    # deadline.  Live-run ownership, explicit cancellation, participant
+    # lifecycle, or server shutdown are the only terminal fences.
+    del timeout_seconds
     # Publish the waiter while its capability is still protected. Revocation
     # removes the capability under this same lock before scanning waiters, so
     # it must observe either no waiter or this fully initialized owner.
@@ -34628,12 +35103,10 @@ async def register_or_replay_cross_chat_live_waiter_locked(
         "token_hash": token_hash,
         "abandoned": False,
         "observers": set(),
-        "deadline": (
-            asyncio.get_running_loop().time()
-            + cross_chat_live_wait_seconds(timeout_seconds)
-        ),
+        "last_observer_at_monotonic": time.monotonic(),
         "future": asyncio.get_running_loop().create_future(),
     }
+    del timeout_seconds
     waiter["future"].set_result({
         "ok": True,
         "exchange_id": exchange_id,
@@ -34641,10 +35114,6 @@ async def register_or_replay_cross_chat_live_waiter_locked(
         "body": str(response.get("body") or ""),
         "request_response": bool(response.get("expects_reply")),
     })
-    waiter["deadline"] = (
-        asyncio.get_running_loop().time()
-        + PROVIDER_CROSS_CHAT_LIVE_RESULT_RETENTION_SECONDS
-    )
     async with CROSS_CHAT_CAPABILITY_LOCK:
         cross_chat_live_waiter_capability_locked(waiter)
         CROSS_CHAT_LIVE_RESPONSE_WAITERS[(exchange_id, inbound_leg_id)] = waiter
@@ -34812,10 +35281,6 @@ async def deliver_cross_chat_live_response_locked(
             status_code=409,
             detail="live cross-chat response lease changed during delivery",
         )
-    waiter["deadline"] = (
-        asyncio.get_running_loop().time()
-        + PROVIDER_CROSS_CHAT_LIVE_RESULT_RETENTION_SECONDS
-    )
     waiter["future"].set_result({
         "ok": True,
         "exchange_id": exchange_id,
@@ -34853,56 +35318,15 @@ async def settle_cross_chat_live_waiter_failure(
 
 
 async def prune_expired_cross_chat_live_waiters() -> set[str]:
-    now = asyncio.get_running_loop().time()
-    exchange_ids = {
-        key[0]
-        for key, waiter in CROSS_CHAT_LIVE_RESPONSE_WAITERS.items()
-        if float(waiter.get("deadline") or 0) <= now
-    }
-    removed = 0
-    deferred_exchange_ids: set[str] = set()
-    for exchange_id in exchange_ids:
-        async with cross_chat_live_lease_lock(exchange_id):
-            for key, waiter in list(CROSS_CHAT_LIVE_RESPONSE_WAITERS.items()):
-                if (
-                    key[0] != exchange_id
-                    or float(waiter.get("deadline") or 0) > now
-                ):
-                    continue
-                exchange = await CROSS_CHAT.get_exchange(exchange_id)
-                downgraded: dict[str, Any] | None = None
-                if exchange is not None:
-                    downgraded, _changed = (
-                        await CROSS_CHAT.downgrade_live_exchange(
-                            exchange_id,
-                            active_leg_id=str(key[1]),
-                            expected_instance_id=str(
-                                exchange.get("live_response_instance_id") or ""
-                            ),
-                        )
-                    )
-                CROSS_CHAT_LIVE_RESPONSE_WAITERS.pop(key, None)
-                removed += 1
-                if not waiter["future"].done():
-                    if (
-                        downgraded is not None
-                        and str(downgraded.get("status") or "") == "active"
-                        and not bool(downgraded.get("live_response_lease"))
-                    ):
-                        deferred_exchange_ids.add(exchange_id)
-                        waiter["future"].set_result(
-                            deferred_cross_chat_live_response(
-                                exchange_id,
-                                str(key[1]),
-                            )
-                        )
-                    else:
-                        waiter["future"].set_result({
-                            "ok": False,
-                            "error_code": "live_response_timeout",
-                            "error": "live cross-chat response timed out",
-                        })
-    return deferred_exchange_ids if removed else set()
+    """Compatibility no-op: live waiters no longer expire by elapsed time.
+
+    They are bounded by the exact provider run and are removed synchronously
+    when that run is revoked, an exchange is cancelled, or the server shuts
+    down.  Keeping this coroutine avoids a mixed-version call-site hazard
+    while removing the former semantic timeout/downgrade behavior.
+    """
+
+    return set()
 
 
 async def settle_cross_chat_live_waiters_for_shutdown() -> None:
@@ -35005,6 +35429,11 @@ async def authorized_cross_chat_live_waiter(
                 status_code=410,
                 detail="live cross-chat wait lease no longer owns this leg",
             )
+        # This exact, capability-authenticated GET proves the provider helper
+        # is still attached even during the short gap before its HTTP observer
+        # is registered below.  Provider watchdogs accept only a boundedly
+        # fresh check-in, never the mere existence of a pending Future.
+        waiter["last_observer_at_monotonic"] = time.monotonic()
         return exchange, waiter
 
 
@@ -35109,7 +35538,13 @@ async def defer_cross_chat_live_acceptance(
     inbound_leg_id: str,
     waiter: dict[str, Any] | None,
 ) -> dict[str, Any]:
-    """Convert an unobserved live acceptance into durable async delivery."""
+    """Preserve a live lease when its durable target admission is deferred.
+
+    The historical name is retained for compatibility with mixed-version
+    call sites.  Busy/update admission and a lost POST response are not
+    semantic reasons to turn a synchronous agent request into an unrelated
+    future source-chat turn.
+    """
 
     waiter_key = (exchange_id, inbound_leg_id)
     async with cross_chat_live_lease_lock(exchange_id):
@@ -35121,21 +35556,7 @@ async def defer_cross_chat_live_acceptance(
         if bool(exchange.get("live_response_lease")):
             if waiter is None or mapped is not waiter:
                 return {"state": "closed", "exchange": exchange, "leg": leg}
-            observers = waiter.setdefault("observers", set())
-            if waiter["future"].done() or (
-                isinstance(observers, set) and observers
-            ):
-                # Another exact replay has already exposed/observed this lease,
-                # so its live leg remains authoritative.
-                return {"state": "live", "exchange": exchange, "leg": leg}
-            waiter["abandoned"] = True
-            exchange, _changed = await CROSS_CHAT.downgrade_live_exchange(
-                exchange_id,
-                active_leg_id=inbound_leg_id,
-                expected_instance_id=str(
-                    exchange.get("live_response_instance_id") or ""
-                ),
-            )
+            return {"state": "live", "exchange": exchange, "leg": leg}
         if (
             exchange is not None
             and str(exchange.get("status") or "") == "active"
@@ -35163,7 +35584,7 @@ async def defer_cross_chat_live_acceptance(
 async def preserve_cancelled_cross_chat_live_acceptance(
     accepted: dict[str, Any],
 ) -> None:
-    """Detach an unreturned live receipt without cancelling its durable leg."""
+    """Keep an unreturned live receipt replayable on its exact provider run."""
 
     exchange = accepted.get("_live_exchange")
     waiter = accepted.get("_live_waiter")
@@ -35178,7 +35599,7 @@ async def preserve_cancelled_cross_chat_live_acceptance(
     )
     leg = outcome.get("leg")
     if (
-        outcome.get("state") == "deferred"
+        outcome.get("state") in {"deferred", "live"}
         and isinstance(leg, dict)
         and str(leg.get("status") or "") == "registered"
     ):
@@ -35225,65 +35646,36 @@ async def defer_cross_chat_live_wait_after_observation(
     observer_id: str | None = None,
     retry_grace_seconds: float = 0.0,
 ) -> dict[str, Any]:
-    """Detach a lost HTTP waiter without discarding the durable exchange."""
+    """Detach one HTTP observer while preserving the exact live lease.
+
+    A heartbeat response, socket disconnect, or cancelled HTTP handler is a
+    transport event, not permission to change delivery semantics.  The source
+    provider run remains the owner and may attach the next GET to this same
+    waiter.  ``retry_grace_seconds`` is accepted for mixed-version callers but
+    intentionally has no effect.
+    """
 
     waiter_key = (exchange_id, inbound_leg_id)
 
     async def detach() -> dict[str, Any]:
-        if observer_id is not None:
-            async with cross_chat_live_lease_lock(exchange_id):
-                observers = waiter.setdefault("observers", set())
-                if isinstance(observers, set):
-                    observers.discard(observer_id)
-                if waiter["future"].done():
-                    return {"state": "result", "result": waiter["future"].result()}
-                if CROSS_CHAT_LIVE_RESPONSE_WAITERS.get(waiter_key) is not waiter:
-                    return {"state": "closed"}
-            if retry_grace_seconds > 0:
-                await asyncio.sleep(retry_grace_seconds)
         async with cross_chat_live_lease_lock(exchange_id):
+            observers = waiter.setdefault("observers", set())
+            if observer_id is not None and isinstance(observers, set):
+                observers.discard(observer_id)
             if waiter["future"].done():
                 return {"state": "result", "result": waiter["future"].result()}
             if CROSS_CHAT_LIVE_RESPONSE_WAITERS.get(waiter_key) is not waiter:
                 return {"state": "closed"}
-            observers = waiter.setdefault("observers", set())
             if isinstance(observers, set) and observers:
                 return {"state": "observed"}
-            # This flag is a fail-safe for an exceptional SQLite failure. The
-            # automatic and explicit response paths treat an abandoned waiter
-            # as async-only and never commit a response to an unobserved
-            # process-local future.
-            waiter["abandoned"] = True
-            current = await CROSS_CHAT.get_exchange(exchange_id)
-            if current is None:
-                CROSS_CHAT_LIVE_RESPONSE_WAITERS.pop(waiter_key, None)
-                return {"state": "closed"}
-            downgraded, _changed = await CROSS_CHAT.downgrade_live_exchange(
-                exchange_id,
-                active_leg_id=inbound_leg_id,
-                expected_instance_id=str(
-                    current.get("live_response_instance_id") or ""
-                ),
-            )
-            if (
-                downgraded is not None
-                and str(downgraded.get("status") or "") in {"active", "completed"}
-                and not bool(downgraded.get("live_response_lease"))
-            ):
-                CROSS_CHAT_LIVE_RESPONSE_WAITERS.pop(waiter_key, None)
-                return {
-                    "state": "deferred",
-                    "result": deferred_cross_chat_live_response(
-                        exchange_id,
-                        inbound_leg_id,
-                    ),
-                }
-            return {"state": "closed"}
+            return {"state": "live"}
+
+    del retry_grace_seconds
 
     # This is completion/cleanup of an already-admitted mutation, not admission
     # of new work. Like exact queued-delivery cancellation, it must finish even
     # after an update/restart drain closes the new-work gate or the HTTP caller
-    # disconnects; otherwise a durable answer can be committed to no observer.
+    # disconnects.
     completion = asyncio.create_task(detach())
     try:
         return await asyncio.shield(completion)
@@ -35309,7 +35701,7 @@ async def await_cross_chat_live_waiter(
     disconnected = False
     cancelled = False
     disconnect_task: asyncio.Task[None] | None = None
-    configured_wait = cross_chat_live_wait_seconds(timeout_seconds)
+    heartbeat_seconds = cross_chat_live_heartbeat_seconds(timeout_seconds)
     async with cross_chat_live_lease_lock(exchange_id):
         if (
             CROSS_CHAT_LIVE_RESPONSE_WAITERS.get(waiter_key) is not waiter
@@ -35319,29 +35711,15 @@ async def await_cross_chat_live_waiter(
                 status_code=410,
                 detail="live cross-chat wait lease no longer owns this leg",
             )
-        deadline = float(
-            waiter.get("deadline")
-            or asyncio.get_running_loop().time() + configured_wait
-        )
-        if waiter["future"].done() and deadline <= asyncio.get_running_loop().time():
-            CROSS_CHAT_LIVE_RESPONSE_WAITERS.pop(waiter_key, None)
-            raise HTTPException(
-                status_code=410,
-                detail="live cross-chat response retention expired",
-            )
         observers = waiter.setdefault("observers", set())
         if not isinstance(observers, set):
             raise RuntimeError("live cross-chat observer registry is invalid")
         observers.add(observer_id)
-    remaining = max(
-        0.0,
-        min(configured_wait, deadline - asyncio.get_running_loop().time()),
-    )
     try:
         if request is None:
             result = await asyncio.wait_for(
                 asyncio.shield(waiter["future"]),
-                timeout=remaining,
+                timeout=heartbeat_seconds,
             )
         else:
             disconnect_task = asyncio.create_task(
@@ -35349,7 +35727,7 @@ async def await_cross_chat_live_waiter(
             )
             done, _pending = await asyncio.wait(
                 {waiter["future"], disconnect_task},
-                timeout=remaining,
+                timeout=heartbeat_seconds,
                 return_when=asyncio.FIRST_COMPLETED,
             )
             if waiter["future"] in done:
@@ -35373,11 +35751,6 @@ async def await_cross_chat_live_waiter(
                 inbound_leg_id,
                 waiter,
                 observer_id=observer_id,
-                retry_grace_seconds=(
-                    PROVIDER_CROSS_CHAT_LIVE_OBSERVER_RETRY_GRACE_SECONDS
-                    if disconnected or cancelled
-                    else 0.0
-                ),
             )
         )
         try:
@@ -35386,38 +35759,32 @@ async def await_cross_chat_live_waiter(
             outcome = await join_task_despite_caller_cancellation(cleanup)
         except Exception:
             outcome = {"state": "closed"}
-        if outcome.get("state") in {"result", "deferred"}:
+        if outcome.get("state") == "result":
             result = outcome.get("result")
         if cancelled:
             raise asyncio.CancelledError
-        if result is None or disconnected:
+        if disconnected:
             raise HTTPException(
-                status_code=499 if disconnected else 504,
-                detail=(
-                    "live cross-chat response caller disconnected; the answer "
-                    "will be delivered asynchronously"
-                    if disconnected and outcome.get("state") == "deferred"
-                    else "live cross-chat response caller disconnected"
-                    if disconnected
-                    else "live cross-chat response timed out"
-                ),
+                status_code=499,
+                detail="live cross-chat response caller disconnected",
             )
+        if result is None and outcome.get("state") == "closed":
+            raise HTTPException(
+                status_code=410,
+                detail="live cross-chat wait lease no longer owns this leg",
+            )
+        if result is None:
+            return {
+                "ok": True,
+                "exchange_id": exchange_id,
+                "inbound_leg_id": inbound_leg_id,
+                "pending": True,
+            }
 
-    retain_completed_result = (
-        bool(result.get("ok"))
-        and not bool(result.get("deferred"))
-        and isinstance(result.get("body"), str)
-    )
     async with cross_chat_live_lease_lock(exchange_id):
         observers = waiter.setdefault("observers", set())
         if isinstance(observers, set):
             observers.discard(observer_id)
-        if CROSS_CHAT_LIVE_RESPONSE_WAITERS.get(waiter_key) is waiter:
-            if not retain_completed_result:
-                CROSS_CHAT_LIVE_RESPONSE_WAITERS.pop(
-                    waiter_key,
-                    None,
-                )
     if not bool(result.get("ok")):
         raise HTTPException(
             status_code=410,
@@ -36487,9 +36854,20 @@ async def reconcile_cross_chat_exchange_leg(leg_snapshot: dict[str, Any]) -> int
                 int(leg.get("ordinal") or 0) == 1
                 and status in {"registered", "submitting"}
             ):
-                # The accepting POST owns this transition and registers its
-                # exact waiter before it submits the first target turn.
-                return 0
+                # Before waiter publication, the accepting POST exclusively
+                # owns this transition. Once its exact waiter exists, the leg
+                # admission lock serializes that POST with periodic recovery,
+                # so recovery may continue retrying a transiently unavailable
+                # target after the short eager-retry window is exhausted.
+                waiter = CROSS_CHAT_LIVE_RESPONSE_WAITERS.get(
+                    (str(exchange.get("id") or ""), leg_id)
+                )
+                if (
+                    waiter is None
+                    or bool(waiter.get("abandoned"))
+                    or waiter["future"].done()
+                ):
+                    return 0
             if int(leg.get("ordinal") or 0) > 1:
                 async with cross_chat_live_lease_lock(str(exchange["id"])):
                     refreshed_leg = await CROSS_CHAT.get_exchange_leg(leg_id)
@@ -43675,9 +44053,15 @@ def host_pressure_snapshot() -> dict[str, Any]:
     }
 
 
-async def scheduled_job_blocker(session_id: str) -> str | None:
+async def scheduled_job_blocker(
+    session_id: str,
+    *,
+    manual: bool = False,
+) -> str | None:
     async with ACTIVE_LOCK:
-        update_blocker = managed_server_update_admission_blocker()
+        update_blocker = managed_server_update_scheduled_job_blocker(
+            manual=manual,
+        )
         if update_blocker:
             return update_blocker
         session = STORE.sessions.get(session_id) or {}
@@ -52321,6 +52705,15 @@ async def run_claude_print(
             try:
                 raw = await asyncio.wait_for(proc.stdout.readline(), timeout=5)  # type: ignore[union-attr]
             except asyncio.TimeoutError:
+                if provider_run_owns_pending_cross_chat_live_wait(
+                    session_id,
+                    run_id,
+                ):
+                    # This provider is intentionally blocked inside the
+                    # same-server Ask helper. Its exact lease owns liveness;
+                    # Stop/cancel or capability revocation removes it.
+                    last_event = time.time()
+                    continue
                 idle = time.time() - last_event
                 if idle >= IDLE_WARN_SECONDS:
                     await append_event(session_id, "idle_warning", {"run_id": run_id, "idle_seconds": int(idle)})
@@ -53236,6 +53629,8 @@ async def run_claude_sdk(
     outputs_finished_run_ids: set[str] = set()
     logical_started_monotonic = time.monotonic()
     last_activity_monotonic = logical_started_monotonic
+    deadline_clock_checked_monotonic = logical_started_monotonic
+    deadline_clock_was_paused = False
     provider_acknowledged = initial_provider_ready
     idle_warning_emitted = False
     manifest_watch_task: asyncio.Task[Any] | None = asyncio.create_task(
@@ -53280,7 +53675,13 @@ async def run_claude_sdk(
         # A terminal result can complete immediately before this timeout wins
         # its scheduling race. That completion is provider activity even if
         # the iterator consumer has not projected the frame yet.
-        return not bool(getattr(logical_handle, "done", False))
+        return (
+            not bool(getattr(logical_handle, "done", False))
+            and not provider_run_owns_pending_cross_chat_live_wait(
+                session_id,
+                current_run_id,
+            )
+        )
 
     async def cancel_first_activity_watchdog() -> None:
         nonlocal first_activity_task
@@ -53350,7 +53751,10 @@ async def run_claude_sdk(
         now_monotonic: float | None = None,
     ) -> bool:
         nonlocal provider_acknowledged
+        nonlocal logical_started_monotonic
         nonlocal last_activity_monotonic
+        nonlocal deadline_clock_checked_monotonic
+        nonlocal deadline_clock_was_paused
         nonlocal idle_warning_emitted
         nonlocal stream_error
         nonlocal retire_supervisor
@@ -53361,6 +53765,20 @@ async def run_claude_sdk(
             if now_monotonic is None
             else now_monotonic
         )
+        if deadline_clock_was_paused:
+            # Exclude only elapsed time during which this exact run owned a
+            # pending live lease.  Once the answer/cancel settles its future,
+            # both the idle and absolute watchdog clocks resume normally.
+            logical_started_monotonic += max(
+                0.0,
+                observed_at - deadline_clock_checked_monotonic,
+            )
+        pending_live_wait = provider_run_owns_pending_cross_chat_live_wait(
+            session_id,
+            current_run_id,
+        )
+        deadline_clock_checked_monotonic = observed_at
+        deadline_clock_was_paused = pending_live_wait
         acknowledged_now = bool(
             getattr(current_handle, "acknowledged", False)
         )
@@ -53368,6 +53786,14 @@ async def run_claude_sdk(
             provider_acknowledged = True
             last_activity_monotonic = observed_at
             idle_warning_emitted = False
+        if pending_live_wait:
+            # Reaching the authenticated helper is itself proof that this
+            # logical provider turn is active, even if the SDK emits no frame
+            # while its tool call waits.
+            provider_acknowledged = True
+            last_activity_monotonic = observed_at
+            idle_warning_emitted = False
+            return False
         elapsed = observed_at - logical_started_monotonic
         idle = observed_at - last_activity_monotonic
         if (
@@ -53446,7 +53872,14 @@ async def run_claude_sdk(
             idle = now_monotonic - last_activity_monotonic
             timeout_candidates = [
                 5.0,
-                max(0.01, CLAUDE_SDK_TURN_TIMEOUT_SECONDS - elapsed),
+                (
+                    CLAUDE_SDK_TURN_TIMEOUT_SECONDS
+                    if deadline_clock_was_paused
+                    else max(
+                        0.01,
+                        CLAUDE_SDK_TURN_TIMEOUT_SECONDS - elapsed,
+                    )
+                ),
             ]
             if provider_acknowledged:
                 idle_deadline = (
@@ -54049,6 +54482,8 @@ async def run_claude_sdk(
             )
             logical_started_monotonic = time.monotonic()
             last_activity_monotonic = logical_started_monotonic
+            deadline_clock_checked_monotonic = logical_started_monotonic
+            deadline_clock_was_paused = False
             provider_acknowledged = candidate_provider_ready
             idle_warning_emitted = False
             delivery_unknown = False
@@ -55021,6 +55456,12 @@ async def run_codex_exec(
             except asyncio.TimeoutError:
                 if await drain_codex_history():
                     last_event = time.time()
+                if provider_run_owns_pending_cross_chat_live_wait(
+                    session_id,
+                    run_id,
+                ):
+                    last_event = time.time()
+                    continue
                 produced_activity = bool(
                     text_parts
                     or seen_reasoning
@@ -55580,6 +56021,8 @@ async def run_cursor(
     provider_id: str | None = sess.get("cursor_session_id")
     started_monotonic = time.monotonic()
     last_event_monotonic = started_monotonic
+    deadline_clock_checked_monotonic = started_monotonic
+    deadline_clock_was_paused = False
     provider_started = False
     terminal_event_seen = False
     terminal_exit_forced = False
@@ -55648,9 +56091,24 @@ async def run_cursor(
                 await terminate_process_tree(proc)
         while stream_error is None:
             now_monotonic = time.monotonic()
+            if deadline_clock_was_paused:
+                started_monotonic += max(
+                    0.0,
+                    now_monotonic - deadline_clock_checked_monotonic,
+                )
+            pending_live_wait = provider_run_owns_pending_cross_chat_live_wait(
+                session_id,
+                run_id,
+            )
+            deadline_clock_checked_monotonic = now_monotonic
+            deadline_clock_was_paused = pending_live_wait
+            if pending_live_wait:
+                last_event_monotonic = now_monotonic
+                idle_warning_emitted = False
             elapsed = now_monotonic - started_monotonic
             if (
-                not provider_started
+                not pending_live_wait
+                and not provider_started
                 and elapsed >= CURSOR_STARTUP_TIMEOUT_SECONDS
             ):
                 timeout_error = (
@@ -55659,7 +56117,10 @@ async def run_cursor(
                 )
                 await terminate_process_tree(proc)
                 break
-            if elapsed >= CURSOR_TURN_TIMEOUT_SECONDS:
+            if (
+                not pending_live_wait
+                and elapsed >= CURSOR_TURN_TIMEOUT_SECONDS
+            ):
                 timeout_error = (
                     "Cursor exceeded the absolute turn timeout of "
                     f"{CURSOR_TURN_TIMEOUT_SECONDS:g} seconds."
@@ -55668,10 +56129,14 @@ async def run_cursor(
                 break
             startup_remaining = (
                 CURSOR_STARTUP_TIMEOUT_SECONDS - elapsed
-                if not provider_started
+                if not provider_started and not pending_live_wait
                 else CURSOR_TURN_TIMEOUT_SECONDS
             )
-            turn_remaining = CURSOR_TURN_TIMEOUT_SECONDS - elapsed
+            turn_remaining = (
+                CURSOR_TURN_TIMEOUT_SECONDS
+                if pending_live_wait
+                else CURSOR_TURN_TIMEOUT_SECONDS - elapsed
+            )
             idle_elapsed = now_monotonic - last_event_monotonic
             idle_deadline = (
                 CURSOR_IDLE_TIMEOUT_SECONDS
@@ -55695,6 +56160,23 @@ async def run_cursor(
                 )
             except asyncio.TimeoutError:
                 now_monotonic = time.monotonic()
+                if deadline_clock_was_paused:
+                    started_monotonic += max(
+                        0.0,
+                        now_monotonic - deadline_clock_checked_monotonic,
+                    )
+                pending_live_wait = (
+                    provider_run_owns_pending_cross_chat_live_wait(
+                        session_id,
+                        run_id,
+                    )
+                )
+                deadline_clock_checked_monotonic = now_monotonic
+                deadline_clock_was_paused = pending_live_wait
+                if pending_live_wait:
+                    last_event_monotonic = now_monotonic
+                    idle_warning_emitted = False
+                    continue
                 elapsed = now_monotonic - started_monotonic
                 idle = now_monotonic - last_event_monotonic
                 if (
@@ -57903,6 +58385,17 @@ async def run_codex_app_server(
                             return_when=asyncio.FIRST_COMPLETED,
                         )
                         if not done:
+                            if provider_run_owns_pending_cross_chat_live_wait(
+                                session_id,
+                                current_run_id,
+                            ):
+                                # A valid helper lease proves the provider has
+                                # progressed into an intentional peer wait,
+                                # even if no provider notification is emitted
+                                # while its tool process remains blocked.
+                                last_activity = time.monotonic()
+                                first_activity_seen = True
+                                continue
                             idle = time.monotonic() - last_activity
                             if (
                                 not first_activity_seen
@@ -58901,11 +59394,23 @@ async def _start_turn_locked(
                 )
             )
     async with ACTIVE_LOCK:
-        update_blocker = managed_server_update_admission_blocker()
+        automatic_scheduled_job = (
+            req.purpose == "scheduled_job"
+            and scheduled_job_revision is not None
+            and not scheduled_job_manual_run
+        )
+        update_blocker = (
+            managed_server_update_scheduled_job_blocker(manual=False)
+            if automatic_scheduled_job
+            else managed_server_update_admission_blocker()
+        )
         if update_blocker:
-            # Only an update or restart that is actually replacing this
-            # process fences admission; a pending when-idle reservation never
-            # does.
+            if update_blocker == MANAGED_SERVER_UPDATE_PENDING_DETAIL:
+                # The scheduler normally observes this before dispatch. Keep
+                # the turn-level check under ACTIVE_LOCK as the authoritative
+                # race fence when an update is scheduled between that probe
+                # and reservation of the provider slot.
+                raise ManagedServerUpdatePendingError()
             raise HTTPException(status_code=503, detail=update_blocker)
         requested_backend = str(
             req.backend or sess.get("backend") or DEFAULT_BACKEND
@@ -59930,12 +60435,35 @@ def managed_server_update_admission_blocker() -> str | None:
 
     A pending update-when-idle reservation is deliberately NOT a blocker: it
     waits for a moment when nothing is running and must never refuse a turn,
-    a Force Send, a scheduled job, or a provider control. Earlier releases
-    parked every new turn behind the reservation, which locked the operator
-    out of every chat while one long turn ran.
+    a Force Send, a manual Run Now, or a provider control. Automatic
+    scheduled jobs use the narrower durable deferral path below. Earlier
+    releases parked every new turn behind the reservation, which locked the
+    operator out of every chat while one long turn ran.
     """
 
     return managed_server_update_blocker()
+
+
+def managed_server_update_scheduled_job_blocker(
+    *,
+    manual: bool = False,
+) -> str | None:
+    """Fence autonomous job admission while an idle update is reserved.
+
+    A pending reservation deliberately stays invisible to ordinary user turns,
+    Force Send, provider controls, and manual Run Now. Automatic job
+    dispatches are durable and retryable, so deferring only that autonomous
+    admission path prevents recurring jobs from starving the updater without
+    reviving the global pending fence that locked operators out on
+    2026-09-04.
+    """
+
+    blocker = managed_server_update_blocker()
+    if blocker:
+        return blocker
+    if not manual and managed_server_update_is_pending():
+        return MANAGED_SERVER_UPDATE_PENDING_DETAIL
+    return None
 
 
 def live_unsafe_http_mutation_ids_locked() -> list[str]:
@@ -62499,7 +63027,19 @@ async def lifespan(app: FastAPI):
     )
     reconcile_server_restart_status_after_startup()
     clear_imported_active_runs()
-    await reconcile_server_update_status_after_startup()
+    startup_update_status = await reconcile_server_update_status_after_startup()
+    active_update_schedule_id = (
+        str(startup_update_status.get("schedule_id") or "").strip()
+        if managed_server_update_is_pending(startup_update_status)
+        else None
+    )
+    # A completed/failed update, an offline cancellation, or replacement by a
+    # new reservation may leave exact automatic occurrences parked in the
+    # durable job registry. Rearm untouched revisions except those owned by
+    # the one reservation that is still live.
+    await JOBS.resume_update_parked(
+        active_schedule_id=active_update_schedule_id,
+    )
     abandoned_compaction_count = (
         await recover_abandoned_codex_compactions_after_start(
             forced_restart_request_id=(forced_restart_request_id or None),
@@ -62850,6 +63390,7 @@ TEAM_HUB_SERVER_SESSION_ROUTE_RULES: tuple[tuple[str, re.Pattern[str]], ...] = (
     ("POST", re.compile(r"^/v1/teams/[^/]+/network/agents$")),
     ("GET", re.compile(r"^/v1/teams/[^/]+/network/bulletin$")),
     ("POST", re.compile(r"^/v1/teams/[^/]+/network/bulletin$")),
+    ("DELETE", re.compile(r"^/v1/teams/[^/]+/network/bulletin/[^/]+$")),
     ("GET", re.compile(r"^/v1/teams/[^/]+/network/mailbox$")),
     ("POST", re.compile(r"^/v1/teams/[^/]+/network/mailbox$")),
     ("GET", re.compile(r"^/v1/teams/[^/]+/network/items/[^/]+$")),
@@ -62866,7 +63407,9 @@ TEAM_HUB_SERVER_SESSION_ROUTE_RULES: tuple[tuple[str, re.Pattern[str]], ...] = (
     # Team Messages V2 JSON routes. Attachment content uses the binary lane.
     ("GET", re.compile(r"^/v1/teams/[^/]+/network/messages$")),
     ("POST", re.compile(r"^/v1/teams/[^/]+/network/messages$")),
+    ("GET", re.compile(r"^/v1/teams/[^/]+/network/deletions$")),
     ("GET", re.compile(r"^/v1/teams/[^/]+/network/messages/[^/]+$")),
+    ("DELETE", re.compile(r"^/v1/teams/[^/]+/network/messages/[^/]+$")),
     ("POST", re.compile(r"^/v1/teams/[^/]+/network/messages/[^/]+/receipts$")),
     ("POST", re.compile(r"^/v1/teams/[^/]+/network/attachments$")),
     ("GET", re.compile(r"^/v1/teams/[^/]+/network/attachments/[^/]+$")),
@@ -63655,7 +64198,7 @@ async def require_agent_token(request: Request, call_next):
                 {"detail": "attachment downloads do not accept a query"},
                 status_code=422,
             )
-        if request.method.upper() in {"POST", "PUT", "PATCH"}:
+        if request.method.upper() in {"POST", "PUT", "PATCH", "DELETE"}:
             transport_error = (
                 secure_peer_attachment_put_transport_error(request)
                 if (
@@ -63695,7 +64238,7 @@ async def require_agent_token(request: Request, call_next):
             )
         if not request_exact_secure_peer_control_authorized(request):
             return JSONResponse({"detail": "unauthorized"}, status_code=401)
-        if request.method.upper() in {"POST", "PUT", "PATCH"}:
+        if request.method.upper() in {"POST", "PUT", "PATCH", "DELETE"}:
             transport_error = (
                 secure_peer_attachment_put_transport_error(request)
                 if secure_peer_attachment_route and request.method.upper() == "PUT"
@@ -64410,11 +64953,12 @@ async def secure_peer_route_revoke_endpoint(
 
 @app.get("/api/team-hub-secure/{connection_id}/{hub_path:path}")
 @app.post("/api/team-hub-secure/{connection_id}/{hub_path:path}")
+@app.delete("/api/team-hub-secure/{connection_id}/{hub_path:path}")
 @app.put("/api/team-hub-secure/{connection_id}/{hub_path:path}")
 @app.head("/api/team-hub-secure/{connection_id}/{hub_path:path}")
 @app.api_route(
     "/api/team-hub-secure/{connection_id}/{hub_path:path}",
-    methods=["GET", "POST", "PUT", "HEAD"],
+    methods=["GET", "POST", "DELETE", "PUT", "HEAD"],
     include_in_schema=False,
 )
 async def secure_peer_hub_proxy_endpoint(
@@ -64521,7 +65065,7 @@ async def secure_peer_hub_proxy_endpoint(
     # Content-Length and stream an unbounded chunked body; GET has no body in
     # this proxy contract, so the ASGI receive channel is intentionally left
     # unread and the response closes the request.
-    if request.method not in {"GET", "POST"}:
+    if request.method not in {"GET", "POST", "DELETE"}:
         raise HTTPException(status_code=404, detail="Resource not found")
     body = b"" if request.method == "GET" else await request.body()
     # Forward only ordinary content negotiation. The core token and any Hub
@@ -64815,9 +65359,10 @@ async def health() -> dict[str, Any]:
                 "required": False,
                 "message": "Signed Stable and Beta AgentsServer channels are available.",
                 "action": None,
-                # v9 binds status and controls to the exact live responder.
-                # v8 fenced new materialization while existing work drained.
-                "version": 9,
+                # v10 keeps human work passive while pending updates defer
+                # autonomous scheduled-job admission. v9 binds status and
+                # controls to the exact live responder.
+                "version": 10,
                 "tracks": ["stable", "beta"],
             },
             "tmux": tmux,
@@ -66371,6 +66916,12 @@ async def server_update_status(
         # second update attempt before reconnecting.
         public_status = public_server_update_status(status)
         await TERMINAL_ATTACHMENTS.reopen_if_update_inactive(public_status)
+        if managed_server_update_is_pending(status):
+            await JOBS.resume_update_parked(
+                active_schedule_id=str(status.get("schedule_id") or "").strip(),
+            )
+        elif not managed_server_update_blocks_work(status):
+            await JOBS.resume_update_parked()
         return public_status
 
 
@@ -67139,6 +67690,9 @@ async def cancel_server_update(
         )
         public_status = public_server_update_status(cancelled)
         await TERMINAL_ATTACHMENTS.reopen_if_update_inactive(public_status)
+        # The status transition and exact job rearm share the operation lock,
+        # so a concurrent scheduler park cannot land after cancellation.
+        await JOBS.resume_update_parked(actual_schedule_id)
         # Messages accepted while the drain was pending are already durable.
         # Wake their queues immediately when the user cancels instead of
         # waiting for the periodic deferred-turn retry.
@@ -67346,11 +67900,18 @@ async def server_update_pending_waiter_loop() -> None:
                     diagnostic or "transient server transition",
                 )
             else:
-                terminal = await asyncio.to_thread(
-                    fail_pending_server_update,
-                    schedule_id,
-                    exc,
-                )
+                async with SERVER_UPDATE_OPERATION_LOCK:
+                    terminal = await asyncio.to_thread(
+                        fail_pending_server_update,
+                        schedule_id,
+                        exc,
+                    )
+                    if not (
+                        managed_server_update_is_pending(terminal)
+                        and str(terminal.get("schedule_id") or "").strip()
+                        == schedule_id
+                    ):
+                        await JOBS.resume_update_parked(schedule_id)
                 logger.warning(
                     "pending server update advance stopped phase=%s "
                     "error_type=%s error_code=%s detail=%s",
@@ -73505,7 +74066,15 @@ async def get_agent_cross_chat_live_response(
     inbound_leg_id: str,
     request: Request,
     lease_id: str = Query(pattern=r"^lease_[0-9a-f]{32}$"),
-    timeout_seconds: int = Query(default=75, ge=1, le=3600),
+    timeout_seconds: int = Query(
+        default=PROVIDER_CROSS_CHAT_LIVE_HEARTBEAT_SECONDS,
+        ge=1,
+        le=3600,
+        description=(
+            "Legacy query name for the bounded transport heartbeat; this is "
+            "not a total response deadline."
+        ),
+    ),
 ) -> dict[str, Any]:
     if not request_client_is_loopback(request):
         raise HTTPException(

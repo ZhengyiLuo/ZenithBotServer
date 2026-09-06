@@ -1288,6 +1288,37 @@ while True:
         error = next(event for event in events if event["type"] == "error")
         self.assertIn("absolute turn timeout", error["message"])
 
+    async def test_pending_live_cross_chat_wait_pauses_cursor_watchdogs(self) -> None:
+        agent_server.CURSOR_STARTUP_TIMEOUT_SECONDS = 0.05
+        agent_server.CURSOR_TURN_TIMEOUT_SECONDS = 0.05
+        agent_server.CURSOR_IDLE_WARN_SECONDS = 0.01
+        agent_server.CURSOR_IDLE_TIMEOUT_SECONDS = 0.03
+        with patch.object(
+            agent_server,
+            "provider_run_owns_pending_cross_chat_live_wait",
+            return_value=True,
+        ):
+            events = await self._run_script(
+                """#!/usr/bin/env python3
+import json, sys, time
+sys.stdin.read()
+session_id = "cursor-sess-test"
+print(json.dumps({"type":"system","subtype":"init","session_id":session_id,"cwd":".","model":"Auto"}), flush=True)
+time.sleep(0.12)
+print(json.dumps({"type":"result","subtype":"success","is_error":False,"result":"peer answered","session_id":session_id}), flush=True)
+"""
+            )
+
+        terminal = next(
+            event for event in events if event["type"] == "turn_finished"
+        )
+        self.assertFalse(terminal["is_error"])
+        self.assertEqual(terminal["result_text"], "peer answered")
+        self.assertFalse(any(
+            event["type"] in {"error", "idle_warning"}
+            for event in events
+        ))
+
     async def test_idle_warning_is_emitted_once_per_idle_period(self) -> None:
         agent_server.CURSOR_IDLE_WARN_SECONDS = 0.02
         agent_server.CURSOR_IDLE_TIMEOUT_SECONDS = 0.12
@@ -1820,6 +1851,17 @@ class CursorFileDeliveryInstructionTests(unittest.TestCase):
                 "chat-x", {}, manifest
             )
         current = agent_server.cursor_instruction_hash("chat-x", {}, manifest)
+        self.assertNotEqual(previous, current)
+
+    def test_policy_version_changes_so_resumed_sessions_reinject(self) -> None:
+        manifest = Path("/tmp/agentsdock-state/sessions/chat-x/manifest.json")
+        with patch.object(agent_server, "CURSOR_PROMPT_POLICY_VERSION", "2"):
+            previous = agent_server.cursor_instruction_hash(
+                "chat-x", {}, manifest
+            )
+        current = agent_server.cursor_instruction_hash("chat-x", {}, manifest)
+
+        self.assertEqual(agent_server.CURSOR_PROMPT_POLICY_VERSION, "3")
         self.assertNotEqual(previous, current)
 
 

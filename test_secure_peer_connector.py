@@ -398,6 +398,64 @@ class SecurePeerConnectorTests(unittest.IsolatedAsyncioTestCase):
             1,
         )
 
+    async def test_local_secure_proxy_forwards_delete_json_without_core_credentials(self) -> None:
+        runtime = Mock()
+        runtime.proxy.return_value = ProxyResponse(
+            200,
+            (("content-type", "application/json"),),
+            b'{"deleted":true,"message_id":"tmsg_gateway_delete_001"}',
+        )
+        payload = b'{"idempotency_key":"local-gateway-delete-001"}'
+        request = Mock()
+        request.method = "DELETE"
+        request.scope = {
+            "headers": [
+                (b"content-type", b"application/json"),
+                (b"content-length", str(len(payload)).encode("ascii")),
+                (b"x-agentsdock-token", b"local-secret"),
+            ]
+        }
+        request.headers = {
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+            "Authorization": "Bearer must-not-cross",
+            "X-AgentsDock-Token": "local-secret",
+        }
+        request.url.query = ""
+        request.url.path = (
+            f"/api/team-hub-secure/{self.connection_id}/v1/teams/{self.team_id}/"
+            "network/messages/tmsg_gateway_delete_001"
+        )
+        request.body = AsyncMock(return_value=payload)
+        agent_server.SECURE_PEER_RUNTIME = runtime
+        try:
+            with patch.object(agent_server, "require_secure_peer_control"):
+                response = await agent_server.secure_peer_hub_proxy_endpoint(
+                    self.connection_id,
+                    f"v1/teams/{self.team_id}/network/messages/tmsg_gateway_delete_001",
+                    request,
+                )
+        finally:
+            agent_server.SECURE_PEER_RUNTIME = self.runtime
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(
+            response.body,
+            b'{"deleted":true,"message_id":"tmsg_gateway_delete_001"}',
+        )
+        self.assertEqual(response.headers["cache-control"], "no-store")
+        runtime.proxy.assert_called_once_with(
+            self.connection_id,
+            "DELETE",
+            f"/v1/teams/{self.team_id}/network/messages/tmsg_gateway_delete_001",
+            query="",
+            headers={
+                "Content-Type": "application/json",
+                "Accept": "application/json",
+            },
+            body=payload,
+        )
+
     def snapshot(
         self,
         *,

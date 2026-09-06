@@ -1,5 +1,6 @@
 import base64
 import copy
+from datetime import datetime, timedelta, timezone
 import hashlib
 import ipaddress
 import json
@@ -17,10 +18,12 @@ import uuid
 from cryptography import x509
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+from cryptography.x509.oid import ExtendedKeyUsageOID
 
 from agentsdock_team_hub.secure_peer import (
     ACTIVATED_RENEWAL_HISTORY_LIMIT,
     MAX_RELAY_LEGS,
+    PAIRING_CLOCK_SKEW_SECONDS,
     PAIRING_ATTEMPT_RETENTION_SECONDS,
     PAIRING_STATUS_LIMIT,
     PAIRING_TTL_SECONDS,
@@ -30,6 +33,7 @@ from agentsdock_team_hub.secure_peer import (
     RENEWAL_REQUEST_TTL_SECONDS,
     RETIRED_RENEWAL_MATERIAL_LIMIT,
     PeerAuthorization,
+    ProxyRequest,
     ProxyResponse,
     SecurePeerClient,
     SecurePeerError,
@@ -835,6 +839,131 @@ class SecurePeerStoreTests(unittest.TestCase):
                 (("Content-Type", "application/json"),),
                 b'{"to":{"kind":"server","id":"node_12345678"},"body":"no","idempotency_key":"mail-denied-001"}',
             )
+
+    def test_proxy_delete_and_deletion_journal_are_narrowly_sanitized(self) -> None:
+        peer = PeerAuthorization(
+            _uuid(),
+            _uuid(),
+            "peer-server-delete",
+            "team-alpha",
+            frozenset({"teamspace.read", "teamspace.write"}),
+            "sha256:" + "b" * 64,
+            self.clock.value + 600,
+            "Deleting peer",
+        )
+        body = b'{"idempotency_key":"delete-message-001"}'
+        message = sanitize_proxy_request(
+            peer,
+            "DELETE",
+            "/v1/teams/team-alpha/network/messages/tmsg_12345678",
+            "",
+            (
+                ("Content-Type", "application/json"),
+                ("Authorization", "Bearer must-not-cross"),
+                ("Accept", "application/json"),
+            ),
+            body,
+        )
+        self.assertEqual(message.method, "DELETE")
+        self.assertEqual(
+            message.path,
+            "/v1/teams/team-alpha/network/messages/tmsg_12345678",
+        )
+        self.assertEqual(message.query, "")
+        self.assertEqual(message.body, body)
+        self.assertEqual(
+            message.headers,
+            (("content-type", "application/json"), ("accept", "application/json")),
+        )
+        bulletin = sanitize_proxy_request(
+            peer,
+            "DELETE",
+            "/v1/teams/team-alpha/network/bulletin/message_12345678",
+            "",
+            (("Content-Type", "application/json"),),
+            b'{"idempotency_key":"delete-bulletin-001"}',
+        )
+        self.assertEqual(bulletin.method, "DELETE")
+        journal = sanitize_proxy_request(
+            peer,
+            "GET",
+            "/v1/teams/team-alpha/network/deletions",
+            "after_sequence=0&limit=100",
+            (),
+            b"",
+        )
+        self.assertEqual(journal.query, "after_sequence=0&limit=100")
+
+        invalid_requests = (
+            (
+                "DELETE",
+                "/v1/teams/team-alpha/network/messages/tmsg_12345678",
+                "",
+                (("Content-Type", "application/json"),),
+                b"",
+            ),
+            (
+                "DELETE",
+                "/v1/teams/team-alpha/network/messages/tmsg_12345678",
+                "",
+                (("Content-Type", "application/json"),),
+                b"[]",
+            ),
+            (
+                "DELETE",
+                "/v1/teams/team-alpha/network/messages/tmsg_12345678",
+                "force=1",
+                (("Content-Type", "application/json"),),
+                body,
+            ),
+            (
+                "DELETE",
+                "/v1/teams/team-alpha/network/messages",
+                "",
+                (("Content-Type", "application/json"),),
+                body,
+            ),
+            (
+                "GET",
+                "/v1/teams/team-alpha/network/deletions",
+                "",
+                (("Content-Type", "application/json"),),
+                body,
+            ),
+        )
+        for method, path, query, headers, request_body in invalid_requests:
+            with self.subTest(method=method, path=path, query=query), self.assertRaises(
+                SecurePeerError
+            ):
+                sanitize_proxy_request(
+                    peer,
+                    method,
+                    path,
+                    query,
+                    headers,
+                    request_body,
+                )
+
+        read_only = PeerAuthorization(
+            peer.peer_id,
+            peer.pairing_id,
+            peer.peer_server_identity,
+            peer.team_id,
+            frozenset({"teamspace.read"}),
+            peer.certificate_fingerprint,
+            peer.certificate_expires_at,
+            peer.peer_display_name,
+        )
+        with self.assertRaises(SecurePeerError) as denied:
+            sanitize_proxy_request(
+                read_only,
+                "DELETE",
+                message.path,
+                "",
+                (("Content-Type", "application/json"),),
+                body,
+            )
+        self.assertEqual(denied.exception.status_code, 403)
 
     def test_proxy_response_is_bounded_and_strips_peer_control_headers(self) -> None:
         sanitized = sanitize_proxy_response(
@@ -1936,6 +2065,170 @@ class SecurePeerStoreTests(unittest.TestCase):
         with self.assertRaisesRegex(PermissionError, "quarantined"):
             SecurePeerClient(client_root, "other-peer-001", "Other peer")
 
+    def test_expired_host_leaf_repairs_without_identity_or_san_rollover(self) -> None:
+        host_dir = self.root / "expired-host-leaf"
+        original = SecurePeerStore(
+            host_dir,
+            "expired-host-001",
+            "expired-hub-001",
+        )
+        original.configure_listener_identity("192.0.2.44")
+        old_certificate = x509.load_pem_x509_certificate(
+            original.server_certificate_path.read_bytes()
+        )
+        old_ca = original.ca_certificate_path.read_bytes()
+        old_server_key = original.server_key_path.read_bytes()
+        old_sans = list(
+            old_certificate.extensions.get_extension_for_class(
+                x509.SubjectAlternativeName
+            ).value
+        )
+        after_expiry = old_certificate.not_valid_after_utc + timedelta(seconds=1)
+
+        class AfterLeafExpiry(datetime):
+            @classmethod
+            def now(cls, tz=None):
+                return (
+                    after_expiry
+                    if tz is not None
+                    else after_expiry.replace(tzinfo=None)
+                )
+
+        with mock.patch(
+            "agentsdock_team_hub.secure_peer.datetime", AfterLeafExpiry
+        ):
+            repaired = SecurePeerStore(
+                host_dir,
+                "expired-host-001",
+                "expired-hub-001",
+            )
+
+        new_certificate = x509.load_pem_x509_certificate(
+            repaired.server_certificate_path.read_bytes()
+        )
+        self.assertNotEqual(new_certificate.serial_number, old_certificate.serial_number)
+        self.assertEqual(repaired.ca_certificate_path.read_bytes(), old_ca)
+        self.assertEqual(repaired.server_key_path.read_bytes(), old_server_key)
+        self.assertEqual(
+            new_certificate.public_key().public_bytes(
+                serialization.Encoding.Raw,
+                serialization.PublicFormat.Raw,
+            ),
+            old_certificate.public_key().public_bytes(
+                serialization.Encoding.Raw,
+                serialization.PublicFormat.Raw,
+            ),
+        )
+        self.assertEqual(
+            list(
+                new_certificate.extensions.get_extension_for_class(
+                    x509.SubjectAlternativeName
+                ).value
+            ),
+            old_sans,
+        )
+        self.assertGreater(new_certificate.not_valid_after_utc, after_expiry)
+
+    def test_expired_host_leaf_with_non_expiry_defect_remains_quarantined(self) -> None:
+        host_dir = self.root / "defective-expired-host-leaf"
+        store = SecurePeerStore(
+            host_dir,
+            "defective-host-001",
+            "defective-hub-001",
+        )
+        now = datetime.now(timezone.utc)
+        server_key = serialization.load_pem_private_key(
+            store.server_key_path.read_bytes(), password=None
+        )
+        defective = (
+            x509.CertificateBuilder()
+            .subject_name(store._server_certificate.subject)
+            .issuer_name(store._ca_certificate.subject)
+            .public_key(server_key.public_key())
+            .serial_number(x509.random_serial_number())
+            .not_valid_before(now - timedelta(days=2))
+            .not_valid_after(now - timedelta(days=1))
+            .add_extension(x509.BasicConstraints(ca=False, path_length=None), True)
+            .add_extension(
+                x509.ExtendedKeyUsage([ExtendedKeyUsageOID.SERVER_AUTH]),
+                False,
+            )
+            .add_extension(
+                x509.SubjectAlternativeName(
+                    [
+                        x509.DNSName("unexpected.invalid"),
+                        x509.UniformResourceIdentifier(
+                            "urn:agentsdock:server:defective-host-001"
+                        ),
+                    ]
+                ),
+                False,
+            )
+            .add_extension(
+                x509.AuthorityKeyIdentifier.from_issuer_public_key(
+                    store._ca_key.public_key()
+                ),
+                False,
+            )
+            .sign(store._ca_key, algorithm=None)
+        )
+        store.server_certificate_path.write_bytes(
+            defective.public_bytes(serialization.Encoding.PEM)
+        )
+        with self.assertRaisesRegex(PermissionError, "host identity is invalid"):
+            SecurePeerStore(
+                host_dir,
+                "defective-host-001",
+                "defective-hub-001",
+            )
+
+    def test_listener_leaf_at_near_expiry_ca_ceiling_does_not_rotate_repeatedly(
+        self,
+    ) -> None:
+        store = SecurePeerStore(
+            self.root / "near-ca-expiry-host",
+            "near-expiry-host-001",
+            "near-expiry-hub-001",
+        )
+        now = datetime.now(timezone.utc)
+        builder = (
+            x509.CertificateBuilder()
+            .subject_name(store._ca_certificate.subject)
+            .issuer_name(store._ca_certificate.issuer)
+            .public_key(store._ca_key.public_key())
+            .serial_number(x509.random_serial_number())
+            .not_valid_before(now - timedelta(minutes=5))
+            .not_valid_after(now + timedelta(days=20))
+        )
+        for extension in store._ca_certificate.extensions:
+            builder = builder.add_extension(extension.value, extension.critical)
+        near_expiry_ca = builder.sign(store._ca_key, algorithm=None)
+        server_key = serialization.load_pem_private_key(
+            store.server_key_path.read_bytes(), password=None
+        )
+        ceiling_leaf = store._issue_server_certificate(
+            store._ca_key,
+            near_expiry_ca,
+            server_key,
+            now,
+            advertised_ip="192.0.2.45",
+        )
+        store.ca_certificate_path.write_bytes(
+            near_expiry_ca.public_bytes(serialization.Encoding.PEM)
+        )
+        store._ca_certificate = near_expiry_ca
+        with store._guard:
+            store._replace_server_certificate(ceiling_leaf)
+
+        serial = store._server_certificate.serial_number
+        self.assertEqual(
+            store._server_certificate.not_valid_after_utc,
+            near_expiry_ca.not_valid_after_utc,
+        )
+        self.assertFalse(store.configure_listener_identity("192.0.2.45"))
+        self.assertIsNone(store.refresh_tls_server_context("192.0.2.45"))
+        self.assertEqual(store._server_certificate.serial_number, serial)
+
     def test_remote_revocation_retires_exact_connection_and_routes_atomically(self) -> None:
         client = SecurePeerClient(
             self.root / "revoked-client",
@@ -2476,6 +2769,180 @@ class SecurePeerLiveTLSTests(unittest.TestCase):
             idempotency_key=_uuid(),
         )
         return self.client.poll_pairing(connection["connection_id"])
+
+    def test_outgoing_pending_pairing_expires_offline_and_retires_authority(
+        self,
+    ) -> None:
+        clock = _Clock()
+        client = SecurePeerClient(
+            self.client.data_dir.parent / "expiring-client",
+            "expiring-peer-live",
+            "Expiring peer",
+            clock=clock,
+            timeout_seconds=5,
+        )
+        pending = client.begin_pairing(
+            self.host_ip,
+            self.port,
+            expected_ca_fingerprint=self.store.ca_fingerprint,
+            requested_scopes=["teamspace.read"],
+        )
+        self.assertIsInstance(pending["pairing_expires_at"], int)
+        self.assertGreater(pending["pairing_expires_at"], clock.value)
+        clock.value = pending["pairing_expires_at"] + 1
+
+        with mock.patch.object(client, "_request") as remote_request:
+            expired = client.poll_pairing(pending["connection_id"])
+        remote_request.assert_not_called()
+        self.assertEqual(expired["status"], "expired")
+        self.assertEqual(expired["pairing_expires_at"], pending["pairing_expires_at"])
+        self.assertEqual(client.actionable_pairing_count(), 0)
+        self.assertEqual(list(client.keys_dir.iterdir()), [])
+        self.assertTrue(any((client.data_dir / "retired").iterdir()))
+
+    def test_pending_pairing_rejects_past_and_far_future_remote_deadlines(
+        self,
+    ) -> None:
+        deadlines = {
+            "past": lambda: int(time.time()) - 1,
+            "far-future": lambda: (
+                int(time.time())
+                + PAIRING_TTL_SECONDS
+                + PAIRING_CLOCK_SKEW_SECONDS
+                + 10
+            ),
+        }
+        for label, deadline in deadlines.items():
+            with self.subTest(deadline=label):
+                original_decode = self.client._decode_json_response
+                calls = 0
+
+                def replace_deadline(*args, **kwargs):
+                    nonlocal calls
+                    response = original_decode(*args, **kwargs)
+                    calls += 1
+                    if calls == 2:
+                        self.assertEqual(response.get("status"), "pending")
+                        response["expires_at"] = deadline()
+                    return response
+
+                with mock.patch.object(
+                    self.client,
+                    "_decode_json_response",
+                    side_effect=replace_deadline,
+                ):
+                    with self.assertRaises(SecurePeerError) as invalid:
+                        self.client.begin_pairing(
+                            self.host_ip,
+                            self.port,
+                            expected_ca_fingerprint=self.store.ca_fingerprint,
+                            requested_scopes=["teamspace.read"],
+                        )
+                self.assertEqual(invalid.exception.code, "remote_invalid")
+                self.assertEqual(list(self.client.keys_dir.iterdir()), [])
+
+    def test_outgoing_expiry_cas_wins_over_concurrent_approved_poll(self) -> None:
+        pending = self.client.begin_pairing(
+            self.host_ip,
+            self.port,
+            expected_ca_fingerprint=self.store.ca_fingerprint,
+            requested_scopes=["teamspace.read"],
+        )
+        incoming = self.store.list_pairings(status="pending")[0]
+        self.store.approve_pairing(
+            incoming["pairing_id"],
+            "team-alpha",
+            incoming["requested_scopes"],
+            "owner-admin",
+            expected_peer_server_identity=incoming["peer_server_identity"],
+            expected_transcript_hash=incoming["transcript_hash"],
+            idempotency_key=_uuid(),
+        )
+        competing = SecurePeerClient(
+            self.client.data_dir,
+            self.client.server_identity,
+            self.client.display_name,
+            clock=lambda: pending["pairing_expires_at"] + 1,
+            timeout_seconds=5,
+        )
+        validated = threading.Event()
+        release = threading.Event()
+        results: list[dict] = []
+        errors: list[BaseException] = []
+        original_validate = self.client._validate_issued_client_certificate
+
+        def pause_after_validation(*args, **kwargs):
+            result = original_validate(*args, **kwargs)
+            validated.set()
+            if not release.wait(5):
+                raise TimeoutError("test did not release pairing poll")
+            return result
+
+        def poll() -> None:
+            try:
+                results.append(self.client.poll_pairing(pending["connection_id"]))
+            except BaseException as exc:
+                errors.append(exc)
+
+        with mock.patch.object(
+            self.client,
+            "_validate_issued_client_certificate",
+            side_effect=pause_after_validation,
+        ):
+            worker = threading.Thread(target=poll)
+            worker.start()
+            self.assertTrue(validated.wait(5))
+            self.assertEqual(competing.expire_pending_pairings(), 1)
+            release.set()
+            worker.join(5)
+
+        self.assertFalse(worker.is_alive())
+        self.assertEqual(errors, [])
+        self.assertEqual([item["status"] for item in results], ["expired"])
+        self.assertEqual(
+            self.client.get_connection(pending["connection_id"])["status"],
+            "expired",
+        )
+        self.assertEqual(list(self.client.keys_dir.iterdir()), [])
+
+    def test_client_schema_migration_preserves_legacy_unknown_pairing_deadline(
+        self,
+    ) -> None:
+        pending = self.client.begin_pairing(
+            self.host_ip,
+            self.port,
+            expected_ca_fingerprint=self.store.ca_fingerprint,
+            requested_scopes=["teamspace.read"],
+        )
+        database = self.client._connect()
+        try:
+            database.execute(
+                "ALTER TABLE client_connections DROP COLUMN pairing_expires_at"
+            )
+        finally:
+            database.close()
+
+        restarted = SecurePeerClient(
+            self.client.data_dir,
+            self.client.server_identity,
+            self.client.display_name,
+            clock=lambda: pending["pairing_expires_at"] + 10_000,
+            timeout_seconds=5,
+        )
+        database = restarted._connect()
+        try:
+            columns = {
+                row["name"]
+                for row in database.execute(
+                    "PRAGMA table_info(client_connections)"
+                ).fetchall()
+            }
+        finally:
+            database.close()
+        migrated = restarted.get_connection(pending["connection_id"])
+        self.assertIn("pairing_expires_at", columns)
+        self.assertIsNone(migrated["pairing_expires_at"])
+        self.assertEqual(migrated["status"], "pending")
 
     def test_cancel_pairing_is_locally_terminal_and_response_loss_idempotent(self) -> None:
         pending = self.client.begin_pairing(
@@ -3243,6 +3710,74 @@ class SecurePeerLiveTLSTests(unittest.TestCase):
         )
         self.assertEqual(deactivated["status"], "deactivated")
         self.assertFalse(deactivated["active"])
+
+    def test_gateway_delete_forwards_authenticated_json_body_and_peer_binding(self) -> None:
+        requested_scopes = ["teamspace.read", "teamspace.write"]
+        connection = self.client.begin_pairing(
+            self.host_ip,
+            self.port,
+            expected_ca_fingerprint=self.store.ca_fingerprint,
+            requested_scopes=requested_scopes,
+        )
+        pending = self.store.list_pairings(status="pending")[0]
+        approved = self.store.approve_pairing(
+            pending["pairing_id"],
+            "team-alpha",
+            requested_scopes,
+            "owner-admin",
+            expected_peer_server_identity=pending["peer_server_identity"],
+            expected_transcript_hash=pending["transcript_hash"],
+            idempotency_key=_uuid(),
+        )
+        paired = self.client.poll_pairing(connection["connection_id"])
+        self.client.peer_health(connection["connection_id"])
+        self.client.set_active_connection(
+            connection["connection_id"],
+            expected_current=None,
+        )
+
+        forwarded: list[ProxyRequest] = []
+
+        def forward(request: ProxyRequest) -> ProxyResponse:
+            forwarded.append(request)
+            return ProxyResponse(
+                200,
+                (("content-type", "application/json"),),
+                canonical_json(
+                    {"deleted": True, "message_id": "tmsg_gateway_delete_001"}
+                ),
+            )
+
+        self.gateway.forwarder = forward
+        body = {"idempotency_key": "gateway-delete-key-001"}
+        response = self.client.proxy(
+            connection["connection_id"],
+            "DELETE",
+            "/v1/teams/team-alpha/network/messages/tmsg_gateway_delete_001",
+            headers={"content-type": "application/json"},
+            body=body,
+        )
+        self.assertEqual(response.status, 200)
+        self.assertEqual(
+            json.loads(response.body),
+            {"deleted": True, "message_id": "tmsg_gateway_delete_001"},
+        )
+        self.assertEqual(len(forwarded), 1)
+        request = forwarded[0]
+        self.assertEqual(request.method, "DELETE")
+        self.assertEqual(
+            request.path,
+            "/v1/teams/team-alpha/network/messages/tmsg_gateway_delete_001",
+        )
+        self.assertEqual(request.query, "")
+        self.assertEqual(json.loads(request.body), body)
+        self.assertEqual(request.peer.peer_id, approved["peer_id"])
+        self.assertEqual(request.peer.team_id, "team-alpha")
+        self.assertEqual(request.peer.scopes, frozenset(requested_scopes))
+        self.assertEqual(
+            request.peer.certificate_fingerprint,
+            paired["certificate_fingerprint"],
+        )
 
     def test_lowercase_forwarded_accept_header_is_not_duplicated(self) -> None:
         status, _headers, _raw, _leaf = self.client._request(
@@ -4048,6 +4583,67 @@ class SecurePeerLiveTLSTests(unittest.TestCase):
         finally:
             stalled.close()
         self.assertEqual(closed, b"")
+
+    def test_running_gateway_rotates_leaf_context_without_listener_or_key_rollover(
+        self,
+    ) -> None:
+        server = self.gateway._server
+        listener_thread = self.gateway._thread
+        assert server is not None and listener_thread is not None
+        original_context = server.current_tls_context()
+        original_ca = self.store.ca_certificate_path.read_bytes()
+        original_server_key = self.store.server_key_path.read_bytes()
+        original_certificate = x509.load_pem_x509_certificate(
+            self.store.server_certificate_path.read_bytes()
+        )
+        original_sans = list(
+            original_certificate.extensions.get_extension_for_class(
+                x509.SubjectAlternativeName
+            ).value
+        )
+        server_key = serialization.load_pem_private_key(
+            original_server_key, password=None
+        )
+        now = datetime.now(timezone.utc)
+        short_lived = self.store._issue_server_certificate(
+            self.store._ca_key,
+            self.store._ca_certificate,
+            server_key,
+            now - timedelta(days=824),
+            advertised_ip=self.host_ip,
+        )
+        with self.store._guard:
+            self.store._replace_server_certificate(short_lived)
+
+        self.assertTrue(self.gateway.refresh_listener_identity())
+        rotated = x509.load_pem_x509_certificate(
+            self.store.server_certificate_path.read_bytes()
+        )
+        self.assertIsNot(server.current_tls_context(), original_context)
+        self.assertIs(self.gateway._thread, listener_thread)
+        self.assertTrue(listener_thread.is_alive())
+        self.assertEqual(self.store.ca_certificate_path.read_bytes(), original_ca)
+        self.assertEqual(self.store.server_key_path.read_bytes(), original_server_key)
+        self.assertEqual(
+            list(
+                rotated.extensions.get_extension_for_class(
+                    x509.SubjectAlternativeName
+                ).value
+            ),
+            original_sans,
+        )
+        self.assertGreater(rotated.not_valid_after_utc, now + timedelta(days=800))
+        self.assertFalse(self.gateway.refresh_listener_identity())
+
+        # A fresh TLS client must see the swapped context without rebinding or
+        # restarting the listener thread.
+        pending = self.client.begin_pairing(
+            self.host_ip,
+            self.port,
+            expected_ca_fingerprint=self.store.ca_fingerprint,
+            requested_scopes=["teamspace.read"],
+        )
+        self.assertEqual(pending["status"], "pending")
 
     def test_rate_limits_cover_health_poll_and_pairing(self) -> None:
         for action, allowed in (("health", 60), ("poll", 120), ("pair", 8)):

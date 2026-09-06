@@ -22,7 +22,7 @@ SPLIT_ROUTE_CASES = {
             "v1/health"
         ),
         "schema_path": "/api/team-hub-secure/{connection_id}/{hub_path}",
-        "methods": {"get", "head", "post", "put"},
+        "methods": {"delete", "get", "head", "post", "put"},
     },
     "/api/sessions/{session_id}/workspace/preview": {
         "concrete_path": "/api/sessions/chat/workspace/preview",
@@ -143,8 +143,9 @@ class OpenAPIOperationIdTests(unittest.TestCase):
                 )
                 self.assertTrue(all(len(route.methods or ()) == 1 for route in visible))
 
+                unsupported_method = "PATCH" if "DELETE" in expected else "DELETE"
                 status, headers = self.router_response(
-                    "DELETE",
+                    unsupported_method,
                     case["concrete_path"],
                 )
                 self.assertEqual(status, 405)

@@ -3723,6 +3723,149 @@ class CodexAppServerRunnerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(finals), 1)
         self.assertEqual(finals[0]["run_id"], run_now["run_id"])
 
+    async def test_pending_live_cross_chat_wait_pauses_codex_idle_watchdog(self) -> None:
+        turn = FakeTurn()
+        manager = FakeManager(turn)
+        real_wait = asyncio.wait
+
+        async def fast_poll(
+            futures: set[asyncio.Future[object] | asyncio.Task[object]],
+            *,
+            timeout: float | None = None,
+            return_when: str = asyncio.ALL_COMPLETED,
+        ) -> tuple[
+            set[asyncio.Future[object] | asyncio.Task[object]],
+            set[asyncio.Future[object] | asyncio.Task[object]],
+        ]:
+            return await real_wait(
+                futures,
+                timeout=min(0.01, timeout) if timeout is not None else 0.01,
+                return_when=return_when,
+            )
+
+        stack, events, finished, _exec_fallback = self.runner_patches(manager)
+        with stack, patch.object(
+            agent_server.asyncio,
+            "wait",
+            fast_poll,
+        ), patch.object(
+            agent_server,
+            "CODEX_APP_SERVER_FIRST_ACTIVITY_TIMEOUT_SECONDS",
+            0.02,
+        ), patch.object(
+            agent_server,
+            "IDLE_WARN_SECONDS",
+            0.02,
+        ), patch.object(
+            agent_server,
+            "IDLE_KILL_SECONDS",
+            0.03,
+        ), patch.object(
+            agent_server,
+            "provider_run_owns_pending_cross_chat_live_wait",
+            return_value=True,
+        ):
+            runner = asyncio.create_task(
+                agent_server.run_codex_app_server(
+                    "chat-native",
+                    "run-original",
+                    "Wait for a peer",
+                    dict(self.session),
+                    Path(self.cwd) / ".runner-test-manifest.json",
+                    allow_exec_fallback=True,
+                    allow_resume_rollover=False,
+                )
+            )
+            await asyncio.sleep(0.08)
+            self.assertFalse(runner.done())
+            turn.feed(agent_message(
+                "final-after-peer",
+                "Peer answered after the idle window.",
+                "final_answer",
+            ))
+            turn.feed(completed_notification())
+            await asyncio.wait_for(runner, timeout=2)
+
+        self.assertEqual(finished.await_args.args[1]["exit_code"], 0)
+        self.assertFalse(any(
+            call.args[1] in {"error", "idle_warning"}
+            for call in events.await_args_list
+        ))
+        self.assertEqual(turn.interrupt_calls, 0)
+
+    async def test_stale_live_wait_without_replay_resumes_codex_idle_watchdog(self) -> None:
+        turn = FakeTurn()
+        manager = FakeManager(turn)
+        real_wait = asyncio.wait
+        liveness_checks = 0
+
+        async def fast_poll(
+            futures: set[asyncio.Future[object] | asyncio.Task[object]],
+            *,
+            timeout: float | None = None,
+            return_when: str = asyncio.ALL_COMPLETED,
+        ) -> tuple[
+            set[asyncio.Future[object] | asyncio.Task[object]],
+            set[asyncio.Future[object] | asyncio.Task[object]],
+        ]:
+            return await real_wait(
+                futures,
+                timeout=min(0.01, timeout) if timeout is not None else 0.01,
+                return_when=return_when,
+            )
+
+        def live_helper_is_recent(*_args, **_kwargs) -> bool:
+            nonlocal liveness_checks
+            liveness_checks += 1
+            # Registration/a few authenticated heartbeat checks pause the
+            # watchdog. Once the helper stops replaying, freshness expires and
+            # the normal idle watchdog must become authoritative again.
+            return liveness_checks <= 4
+
+        stack, events, finished, _exec_fallback = self.runner_patches(manager)
+        with stack, patch.object(
+            agent_server.asyncio,
+            "wait",
+            fast_poll,
+        ), patch.object(
+            agent_server,
+            "CODEX_APP_SERVER_FIRST_ACTIVITY_TIMEOUT_SECONDS",
+            0.02,
+        ), patch.object(
+            agent_server,
+            "IDLE_WARN_SECONDS",
+            0.02,
+        ), patch.object(
+            agent_server,
+            "IDLE_KILL_SECONDS",
+            0.04,
+        ), patch.object(
+            agent_server,
+            "provider_run_owns_pending_cross_chat_live_wait",
+            side_effect=live_helper_is_recent,
+        ):
+            await asyncio.wait_for(
+                agent_server.run_codex_app_server(
+                    "chat-native",
+                    "run-original",
+                    "Wait for a peer whose helper disappears",
+                    dict(self.session),
+                    Path(self.cwd) / ".runner-test-manifest.json",
+                    allow_exec_fallback=True,
+                    allow_resume_rollover=False,
+                ),
+                timeout=2,
+            )
+
+        self.assertGreater(liveness_checks, 4)
+        self.assertEqual(finished.await_args.args[1]["exit_code"], 1)
+        self.assertTrue(any(
+            call.args[1] == "error"
+            and "idle timeout" in call.args[2]["message"]
+            for call in events.await_args_list
+        ))
+        self.assertGreaterEqual(turn.interrupt_calls, 1)
+
     async def test_first_activity_timeout_fails_fast_instead_of_hanging(self) -> None:
         # turn/start is accepted (FakeManager.start_turn returns a FakeTurn),
         # but nothing is ever fed into it - simulating a notification that
