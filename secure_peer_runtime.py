@@ -1913,6 +1913,20 @@ class SecurePeerRuntime:
         with self._guard:
             adapter = self._adapter
             host_store = self._host_store
+            gateway = self._gateway
+        if gateway is not None:
+            try:
+                # The service-owned 30-second maintenance loop is the sole
+                # scheduler. Rotation is synchronous and only swaps the TLS
+                # context used by future accepts, so shutdown has no extra
+                # task or worker to cancel.
+                gateway.refresh_listener_identity()
+            except Exception as exc:
+                if self.logger is not None:
+                    self.logger.warning(
+                        "secure peer listener certificate rotation deferred error_type=%s",
+                        type(exc).__name__,
+                    )
         if adapter is not None and host_store is not None:
             # Replay each trust tombstone independently.  Already-retired Hub
             # bindings are skipped so a permanent tombstone does not generate

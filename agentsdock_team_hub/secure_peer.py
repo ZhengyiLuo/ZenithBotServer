@@ -75,6 +75,8 @@ RELAY_TERMINAL_RETENTION_SECONDS = 7 * 24 * 60 * 60
 AUDIT_RETENTION_SECONDS = 90 * 24 * 60 * 60
 AUDIT_EVENT_LIMIT = 100_000
 SECURE_STATE_LIVE_BYTES_LIMIT = 128 * 1024 * 1024
+SERVER_CERT_TTL_DAYS = 825
+SERVER_CERT_RENEW_WINDOW_DAYS = 30
 MAX_PAIRING_BODY_BYTES = 64 * 1024
 MAX_PROXY_BODY_BYTES = 65_536
 MAX_RESPONSE_BODY_BYTES = 2 * 1024 * 1024
@@ -625,84 +627,118 @@ class SecurePeerStore:
             self._poll_key = read_secret_file(self.poll_key_path)
             if len(self._poll_key) != 32:
                 raise PermissionError("pairing poll key is invalid")
-            try:
-                now = datetime.now(timezone.utc)
-                ca_constraints = self._ca_certificate.extensions.get_extension_for_class(
-                    x509.BasicConstraints
-                ).value
-                ca_usage = self._ca_certificate.extensions.get_extension_for_class(
-                    x509.KeyUsage
-                ).value
-                server_constraints = self._server_certificate.extensions.get_extension_for_class(
-                    x509.BasicConstraints
-                ).value
-                server_eku = self._server_certificate.extensions.get_extension_for_class(
-                    x509.ExtendedKeyUsage
-                ).value
-                server_sans = self._server_certificate.extensions.get_extension_for_class(
-                    x509.SubjectAlternativeName
-                ).value
-                server_uris = server_sans.get_values_for_type(
-                    x509.UniformResourceIdentifier
+            now = datetime.now(timezone.utc)
+            advertised_address = self._validate_loaded_host_identity(server_key, now)
+            if self._server_certificate.not_valid_after_utc <= now:
+                # An expired leaf is not an identity rollover.  Reissue it from
+                # the already-validated CA and server key, preserving the exact
+                # optional listener IP SAN. Every other identity defect above
+                # remains a hard quarantine boundary.
+                self._replace_server_certificate(
+                    self._issue_server_certificate(
+                        self._ca_key,
+                        self._ca_certificate,
+                        server_key,
+                        now,
+                        advertised_ip=(
+                            str(advertised_address)
+                            if advertised_address is not None
+                            else None
+                        ),
+                    )
                 )
-                ca_names = self._ca_certificate.subject.get_attributes_for_oid(
-                    NameOID.COMMON_NAME
-                )
-                server_names = self._server_certificate.subject.get_attributes_for_oid(
-                    NameOID.COMMON_NAME
-                )
-                self._ca_certificate.public_key().verify(
-                    self._ca_certificate.signature,
-                    self._ca_certificate.tbs_certificate_bytes,
-                )
-                self._ca_certificate.public_key().verify(
-                    self._server_certificate.signature,
-                    self._server_certificate.tbs_certificate_bytes,
-                )
-            except Exception as exc:
-                raise PermissionError("secure peer host identity is invalid") from exc
-            if (
-                self._ca_certificate.subject != self._ca_certificate.issuer
-                or self._server_certificate.issuer != self._ca_certificate.subject
-                or len(ca_names) != 1
-                or ca_names[0].value != self.host_server_identity
-                or len(server_names) != 1
-                or server_names[0].value != self.host_server_identity
-                or not ca_constraints.ca
-                or ca_constraints.path_length != 0
-                or not ca_usage.key_cert_sign
-                or not ca_usage.crl_sign
-                or server_constraints.ca
-                or ExtendedKeyUsageOID.SERVER_AUTH not in server_eku
-                or ExtendedKeyUsageOID.CLIENT_AUTH in server_eku
-                or server_uris
-                != [f"urn:agentsdock:server:{self.host_server_identity}"]
-                or self._ca_key.public_key().public_bytes(
-                    serialization.Encoding.Raw,
-                    serialization.PublicFormat.Raw,
-                )
-                != self._ca_certificate.public_key().public_bytes(
-                    serialization.Encoding.Raw,
-                    serialization.PublicFormat.Raw,
-                )
-                or server_key.public_key().public_bytes(
-                    serialization.Encoding.Raw,
-                    serialization.PublicFormat.Raw,
-                )
-                != self._server_certificate.public_key().public_bytes(
-                    serialization.Encoding.Raw,
-                    serialization.PublicFormat.Raw,
-                )
-                or not self._ca_certificate.not_valid_before_utc
-                <= now
-                < self._ca_certificate.not_valid_after_utc
-                or not self._server_certificate.not_valid_before_utc
-                <= now
-                < self._server_certificate.not_valid_after_utc
-            ):
-                raise PermissionError("secure peer host identity is invalid")
             if not committed:
                 create_secret_file(self.identity_ready_path, secrets.token_bytes(32))
+
+    def _validate_loaded_host_identity(
+        self,
+        server_key: Ed25519PrivateKey,
+        now: datetime,
+    ) -> ipaddress.IPv4Address | None:
+        """Validate durable host identity while allowing only leaf expiry repair."""
+
+        try:
+            ca_constraints = self._ca_certificate.extensions.get_extension_for_class(
+                x509.BasicConstraints
+            ).value
+            ca_usage = self._ca_certificate.extensions.get_extension_for_class(
+                x509.KeyUsage
+            ).value
+            server_constraints = self._server_certificate.extensions.get_extension_for_class(
+                x509.BasicConstraints
+            ).value
+            server_eku = self._server_certificate.extensions.get_extension_for_class(
+                x509.ExtendedKeyUsage
+            ).value
+            server_sans = self._server_certificate.extensions.get_extension_for_class(
+                x509.SubjectAlternativeName
+            ).value
+            server_uris = server_sans.get_values_for_type(
+                x509.UniformResourceIdentifier
+            )
+            server_addresses = server_sans.get_values_for_type(x509.IPAddress)
+            ca_names = self._ca_certificate.subject.get_attributes_for_oid(
+                NameOID.COMMON_NAME
+            )
+            server_names = self._server_certificate.subject.get_attributes_for_oid(
+                NameOID.COMMON_NAME
+            )
+            self._ca_certificate.public_key().verify(
+                self._ca_certificate.signature,
+                self._ca_certificate.tbs_certificate_bytes,
+            )
+            self._ca_certificate.public_key().verify(
+                self._server_certificate.signature,
+                self._server_certificate.tbs_certificate_bytes,
+            )
+        except Exception as exc:
+            raise PermissionError("secure peer host identity is invalid") from exc
+        if (
+            self._ca_certificate.subject != self._ca_certificate.issuer
+            or self._server_certificate.issuer != self._ca_certificate.subject
+            or len(ca_names) != 1
+            or ca_names[0].value != self.host_server_identity
+            or len(server_names) != 1
+            or server_names[0].value != self.host_server_identity
+            or not ca_constraints.ca
+            or ca_constraints.path_length != 0
+            or not ca_usage.key_cert_sign
+            or not ca_usage.crl_sign
+            or server_constraints.ca
+            or list(server_eku) != [ExtendedKeyUsageOID.SERVER_AUTH]
+            or server_uris
+            != [f"urn:agentsdock:server:{self.host_server_identity}"]
+            or len(server_addresses) > 1
+            or any(
+                not isinstance(address, ipaddress.IPv4Address)
+                for address in server_addresses
+            )
+            # Reject DNS names, duplicate names, and every unrecognized SAN
+            # type instead of silently dropping them during expiry repair.
+            or len(server_sans) != len(server_uris) + len(server_addresses)
+            or self._ca_key.public_key().public_bytes(
+                serialization.Encoding.Raw,
+                serialization.PublicFormat.Raw,
+            )
+            != self._ca_certificate.public_key().public_bytes(
+                serialization.Encoding.Raw,
+                serialization.PublicFormat.Raw,
+            )
+            or server_key.public_key().public_bytes(
+                serialization.Encoding.Raw,
+                serialization.PublicFormat.Raw,
+            )
+            != self._server_certificate.public_key().public_bytes(
+                serialization.Encoding.Raw,
+                serialization.PublicFormat.Raw,
+            )
+            or not self._ca_certificate.not_valid_before_utc
+            <= now
+            < self._ca_certificate.not_valid_after_utc
+            or not self._server_certificate.not_valid_before_utc <= now
+        ):
+            raise PermissionError("secure peer host identity is invalid")
+        return server_addresses[0] if server_addresses else None
 
     def _issue_server_certificate(
         self,
@@ -710,8 +746,18 @@ class SecurePeerStore:
         ca_cert: x509.Certificate,
         server_key: Ed25519PrivateKey,
         now: datetime,
+        *,
+        advertised_ip: str | None = None,
     ) -> x509.Certificate:
         subject = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, self.host_server_identity)])
+        names: list[x509.GeneralName] = []
+        if advertised_ip is not None:
+            names.append(x509.IPAddress(ipaddress.IPv4Address(advertised_ip)))
+        names.append(
+            x509.UniformResourceIdentifier(
+                f"urn:agentsdock:server:{self.host_server_identity}"
+            )
+        )
         return (
             x509.CertificateBuilder()
             .subject_name(subject)
@@ -719,18 +765,44 @@ class SecurePeerStore:
             .public_key(server_key.public_key())
             .serial_number(x509.random_serial_number())
             .not_valid_before(now - timedelta(minutes=5))
-            .not_valid_after(now + timedelta(days=825))
+            .not_valid_after(
+                min(
+                    now + timedelta(days=SERVER_CERT_TTL_DAYS),
+                    ca_cert.not_valid_after_utc,
+                )
+            )
             .add_extension(x509.BasicConstraints(ca=False, path_length=None), True)
             .add_extension(x509.ExtendedKeyUsage([ExtendedKeyUsageOID.SERVER_AUTH]), False)
             .add_extension(
-                x509.SubjectAlternativeName(
-                    [x509.UniformResourceIdentifier(f"urn:agentsdock:server:{self.host_server_identity}")]
-                ),
+                x509.SubjectAlternativeName(names),
                 False,
             )
             .add_extension(x509.AuthorityKeyIdentifier.from_issuer_public_key(ca_key.public_key()), False)
             .sign(ca_key, algorithm=None)
         )
+
+    def _replace_server_certificate(self, certificate: x509.Certificate) -> None:
+        temporary = self.data_dir / (
+            f".server-certificate-{secrets.token_hex(8)}.tmp"
+        )
+        try:
+            create_secret_file(
+                temporary,
+                certificate.public_bytes(serialization.Encoding.PEM),
+            )
+            os.replace(temporary, self.server_certificate_path)
+            directory = os.open(
+                self.data_dir,
+                os.O_RDONLY | getattr(os, "O_DIRECTORY", 0),
+            )
+            try:
+                os.fsync(directory)
+            finally:
+                os.close(directory)
+            self._server_certificate = certificate
+        finally:
+            with suppress(FileNotFoundError):
+                temporary.unlink()
 
     @property
     def ca_certificate_pem(self) -> str:
@@ -1099,7 +1171,7 @@ class SecurePeerStore:
             (current_window - 2 * RELAY_USAGE_WINDOW_SECONDS,),
         )
 
-    def configure_listener_identity(self, advertised_ip: str) -> None:
+    def configure_listener_identity(self, advertised_ip: str) -> bool:
         """Ensure the TLS server leaf has the exact advertised literal IP SAN."""
 
         try:
@@ -1108,65 +1180,34 @@ class SecurePeerStore:
         except ValueError as exc:
             raise ValueError("secure peer listener requires a literal IP") from exc
         with self._guard:
-            try:
-                sans = self._server_certificate.extensions.get_extension_for_class(
-                    x509.SubjectAlternativeName
-                ).value
-                current = sans.get_values_for_type(x509.IPAddress)
-            except x509.ExtensionNotFound:
-                current = []
             now = datetime.now(timezone.utc)
-            if (
-                current == [address]
-                and self._server_certificate.not_valid_after_utc
-                > now + timedelta(days=30)
-            ):
-                return
             key = _load_private_key(self.server_key_path)
-            subject = x509.Name(
-                [x509.NameAttribute(NameOID.COMMON_NAME, self.host_server_identity)]
-            )
-            certificate = (
-                x509.CertificateBuilder()
-                .subject_name(subject)
-                .issuer_name(self._ca_certificate.subject)
-                .public_key(key.public_key())
-                .serial_number(x509.random_serial_number())
-                .not_valid_before(now - timedelta(minutes=5))
-                .not_valid_after(now + timedelta(days=825))
-                .add_extension(x509.BasicConstraints(ca=False, path_length=None), True)
-                .add_extension(x509.ExtendedKeyUsage([ExtendedKeyUsageOID.SERVER_AUTH]), False)
-                .add_extension(
-                    x509.SubjectAlternativeName(
-                        [
-                            x509.IPAddress(address),
-                            x509.UniformResourceIdentifier(
-                                f"urn:agentsdock:server:{self.host_server_identity}"
-                            ),
-                        ]
-                    ),
-                    False,
+            existing_address = self._validate_loaded_host_identity(key, now)
+            if (
+                existing_address == address
+                and (
+                    self._server_certificate.not_valid_after_utc
+                    > now + timedelta(days=SERVER_CERT_RENEW_WINDOW_DAYS)
+                    # Once the leaf reaches the CA's fixed ceiling there is no
+                    # longer validity to gain. Keep serving that exact context
+                    # until the CA expires, at which point identity validation
+                    # fails closed, instead of rewriting it every 30 seconds.
+                    or self._server_certificate.not_valid_after_utc
+                    == self._ca_certificate.not_valid_after_utc
                 )
-                .add_extension(
-                    x509.AuthorityKeyIdentifier.from_issuer_public_key(
-                        self._ca_key.public_key()
-                    ),
-                    False,
-                )
-                .sign(self._ca_key, algorithm=None)
+            ):
+                return False
+            certificate = self._issue_server_certificate(
+                self._ca_key,
+                self._ca_certificate,
+                key,
+                now,
+                advertised_ip=canonical,
             )
-            temporary = self.data_dir / f".server-certificate-{secrets.token_hex(8)}.tmp"
-            create_secret_file(temporary, certificate.public_bytes(serialization.Encoding.PEM))
-            os.replace(temporary, self.server_certificate_path)
-            directory = os.open(self.data_dir, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
-            try:
-                os.fsync(directory)
-            finally:
-                os.close(directory)
-            self._server_certificate = certificate
+            self._replace_server_certificate(certificate)
+            return True
 
-    def tls_server_context(self, advertised_ip: str) -> ssl.SSLContext:
-        self.configure_listener_identity(advertised_ip)
+    def _tls_server_context(self) -> ssl.SSLContext:
         context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
         context.minimum_version = ssl.TLSVersion.TLSv1_3
         context.maximum_version = ssl.TLSVersion.TLSv1_3
@@ -1175,6 +1216,21 @@ class SecurePeerStore:
         context.load_verify_locations(cafile=self.ca_certificate_path)
         context.options |= getattr(ssl, "OP_NO_COMPRESSION", 0)
         return context
+
+    def tls_server_context(self, advertised_ip: str) -> ssl.SSLContext:
+        with self._guard:
+            self.configure_listener_identity(advertised_ip)
+            return self._tls_server_context()
+
+    def refresh_tls_server_context(
+        self, advertised_ip: str
+    ) -> ssl.SSLContext | None:
+        """Return a replacement context only when listener identity rotated."""
+
+        with self._guard:
+            if not self.configure_listener_identity(advertised_ip):
+                return None
+            return self._tls_server_context()
 
     def public_health(self) -> dict[str, Any]:
         return {
@@ -5028,8 +5084,17 @@ class _GatewayHTTPServer(http.server.ThreadingHTTPServer):
         self._worker_guard = threading.Condition()
         self._workers: set[threading.Thread] = set()
         self._maximum_per_source = 8
-        self.tls_context: ssl.SSLContext | None = None
+        self._tls_guard = threading.Lock()
+        self._tls_context: ssl.SSLContext | None = None
         super().__init__(*args, **kwargs)
+
+    def install_tls_context(self, context: ssl.SSLContext) -> None:
+        with self._tls_guard:
+            self._tls_context = context
+
+    def current_tls_context(self) -> ssl.SSLContext | None:
+        with self._tls_guard:
+            return self._tls_context
 
     def process_request(self, request: socket.socket, client_address: tuple[str, int]) -> None:
         if not self._worker_slots.acquire(blocking=False):
@@ -5082,7 +5147,9 @@ class _GatewayHTTPServer(http.server.ThreadingHTTPServer):
     ) -> None:
         tls_socket: ssl.SSLSocket | None = None
         try:
-            context = self.tls_context
+            # Keep this exact context alive for the accepted connection. A
+            # maintenance rotation swaps only what future accepts snapshot.
+            context = self.current_tls_context()
             if context is None:
                 raise RuntimeError("TLS context is unavailable")
             request.settimeout(3)
@@ -5150,6 +5217,7 @@ class SecurePeerGateway:
         self.peer_revoker = peer_revoker
         self._server: _GatewayHTTPServer | None = None
         self._thread: threading.Thread | None = None
+        self._stopping = False
         self._guard = threading.RLock()
         self._rate_guard = threading.Lock()
         self._pairing_rate: dict[str, tuple[int, int]] = {}
@@ -5872,7 +5940,9 @@ class SecurePeerGateway:
             try:
                 server.server_bind()
                 server.server_activate()
-                server.tls_context = self.store.tls_server_context(self.bind_ip)
+                server.install_tls_context(
+                    self.store.tls_server_context(self.bind_ip)
+                )
             except BaseException:
                 server.server_close()
                 raise
@@ -5904,20 +5974,37 @@ class SecurePeerGateway:
                         thread.join(timeout=5)
                 raise
 
+    def refresh_listener_identity(self) -> bool:
+        """Atomically rotate the leaf context used by future TLS accepts."""
+
+        with self._guard:
+            server = self._server
+            if server is None or self._stopping:
+                return False
+            replacement = self.store.refresh_tls_server_context(self.bind_ip)
+            if replacement is None:
+                return False
+            server.install_tls_context(replacement)
+            return True
+
     def stop(self, *, timeout_seconds: float = 15.0) -> None:
         with self._guard:
             server, thread = self._server, self._thread
-        if server is not None:
-            server.shutdown()
-            server.server_close()
-        if thread is not None and thread is not threading.current_thread():
-            thread.join(timeout=5)
-        if server is not None and not server.wait_for_workers(timeout_seconds):
-            raise RuntimeError("secure peer gateway did not drain active requests")
-        with self._guard:
-            if self._server is server:
-                self._server = None
-                self._thread = None
+            self._stopping = server is not None
+        try:
+            if server is not None:
+                server.shutdown()
+                server.server_close()
+            if thread is not None and thread is not threading.current_thread():
+                thread.join(timeout=5)
+            if server is not None and not server.wait_for_workers(timeout_seconds):
+                raise RuntimeError("secure peer gateway did not drain active requests")
+        finally:
+            with self._guard:
+                if self._server is server:
+                    self._server = None
+                    self._thread = None
+                self._stopping = False
 
 
 class _NoSNIHTTPSConnection(http.client.HTTPSConnection):

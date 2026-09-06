@@ -1370,6 +1370,45 @@ class SecurePeerRuntimeTests(unittest.TestCase):
             self.assertIsNone(runtime._client_error)
             runtime.shutdown()
 
+    def test_maintenance_refreshes_listener_identity_without_blocking_client_work(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            runtime = SecurePeerRuntime(
+                Path(temporary) / "secure-peers",
+                server_identity="server_identity_test",
+                server_instance_id="server_instance_test",
+                display_name="Test server",
+            )
+            gateway = mock.Mock()
+            gateway.refresh_listener_identity.side_effect = RuntimeError(
+                "injected certificate write failure"
+            )
+            runtime._gateway = gateway
+            logger = mock.Mock()
+            runtime.logger = logger
+            try:
+                with (
+                    mock.patch.object(
+                        runtime.client,
+                        "recover_pairing_attempts",
+                        return_value={"remaining": 0},
+                    ) as recover,
+                    mock.patch.object(
+                        runtime.client,
+                        "list_connections",
+                        return_value=[],
+                    ),
+                ):
+                    result = runtime.maintenance_once()
+                gateway.refresh_listener_identity.assert_called_once_with()
+                recover.assert_called_once_with(limit=2)
+                self.assertFalse(result["active"])
+                logger.warning.assert_called_once()
+            finally:
+                runtime._gateway = None
+                runtime.shutdown()
+
     def test_maintenance_never_retires_transient_or_unpinned_errors(self) -> None:
         failures = (
             SecurePeerError("peer_revoked", "untrusted status", 503),

@@ -1,5 +1,6 @@
 import base64
 import copy
+from datetime import datetime, timedelta, timezone
 import hashlib
 import ipaddress
 import json
@@ -17,6 +18,7 @@ import uuid
 from cryptography import x509
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+from cryptography.x509.oid import ExtendedKeyUsageOID
 
 from agentsdock_team_hub.secure_peer import (
     ACTIVATED_RENEWAL_HISTORY_LIMIT,
@@ -2062,6 +2064,170 @@ class SecurePeerStoreTests(unittest.TestCase):
         SecurePeerClient(client_root, "bound-peer-001", "Bound peer")
         with self.assertRaisesRegex(PermissionError, "quarantined"):
             SecurePeerClient(client_root, "other-peer-001", "Other peer")
+
+    def test_expired_host_leaf_repairs_without_identity_or_san_rollover(self) -> None:
+        host_dir = self.root / "expired-host-leaf"
+        original = SecurePeerStore(
+            host_dir,
+            "expired-host-001",
+            "expired-hub-001",
+        )
+        original.configure_listener_identity("192.0.2.44")
+        old_certificate = x509.load_pem_x509_certificate(
+            original.server_certificate_path.read_bytes()
+        )
+        old_ca = original.ca_certificate_path.read_bytes()
+        old_server_key = original.server_key_path.read_bytes()
+        old_sans = list(
+            old_certificate.extensions.get_extension_for_class(
+                x509.SubjectAlternativeName
+            ).value
+        )
+        after_expiry = old_certificate.not_valid_after_utc + timedelta(seconds=1)
+
+        class AfterLeafExpiry(datetime):
+            @classmethod
+            def now(cls, tz=None):
+                return (
+                    after_expiry
+                    if tz is not None
+                    else after_expiry.replace(tzinfo=None)
+                )
+
+        with mock.patch(
+            "agentsdock_team_hub.secure_peer.datetime", AfterLeafExpiry
+        ):
+            repaired = SecurePeerStore(
+                host_dir,
+                "expired-host-001",
+                "expired-hub-001",
+            )
+
+        new_certificate = x509.load_pem_x509_certificate(
+            repaired.server_certificate_path.read_bytes()
+        )
+        self.assertNotEqual(new_certificate.serial_number, old_certificate.serial_number)
+        self.assertEqual(repaired.ca_certificate_path.read_bytes(), old_ca)
+        self.assertEqual(repaired.server_key_path.read_bytes(), old_server_key)
+        self.assertEqual(
+            new_certificate.public_key().public_bytes(
+                serialization.Encoding.Raw,
+                serialization.PublicFormat.Raw,
+            ),
+            old_certificate.public_key().public_bytes(
+                serialization.Encoding.Raw,
+                serialization.PublicFormat.Raw,
+            ),
+        )
+        self.assertEqual(
+            list(
+                new_certificate.extensions.get_extension_for_class(
+                    x509.SubjectAlternativeName
+                ).value
+            ),
+            old_sans,
+        )
+        self.assertGreater(new_certificate.not_valid_after_utc, after_expiry)
+
+    def test_expired_host_leaf_with_non_expiry_defect_remains_quarantined(self) -> None:
+        host_dir = self.root / "defective-expired-host-leaf"
+        store = SecurePeerStore(
+            host_dir,
+            "defective-host-001",
+            "defective-hub-001",
+        )
+        now = datetime.now(timezone.utc)
+        server_key = serialization.load_pem_private_key(
+            store.server_key_path.read_bytes(), password=None
+        )
+        defective = (
+            x509.CertificateBuilder()
+            .subject_name(store._server_certificate.subject)
+            .issuer_name(store._ca_certificate.subject)
+            .public_key(server_key.public_key())
+            .serial_number(x509.random_serial_number())
+            .not_valid_before(now - timedelta(days=2))
+            .not_valid_after(now - timedelta(days=1))
+            .add_extension(x509.BasicConstraints(ca=False, path_length=None), True)
+            .add_extension(
+                x509.ExtendedKeyUsage([ExtendedKeyUsageOID.SERVER_AUTH]),
+                False,
+            )
+            .add_extension(
+                x509.SubjectAlternativeName(
+                    [
+                        x509.DNSName("unexpected.invalid"),
+                        x509.UniformResourceIdentifier(
+                            "urn:agentsdock:server:defective-host-001"
+                        ),
+                    ]
+                ),
+                False,
+            )
+            .add_extension(
+                x509.AuthorityKeyIdentifier.from_issuer_public_key(
+                    store._ca_key.public_key()
+                ),
+                False,
+            )
+            .sign(store._ca_key, algorithm=None)
+        )
+        store.server_certificate_path.write_bytes(
+            defective.public_bytes(serialization.Encoding.PEM)
+        )
+        with self.assertRaisesRegex(PermissionError, "host identity is invalid"):
+            SecurePeerStore(
+                host_dir,
+                "defective-host-001",
+                "defective-hub-001",
+            )
+
+    def test_listener_leaf_at_near_expiry_ca_ceiling_does_not_rotate_repeatedly(
+        self,
+    ) -> None:
+        store = SecurePeerStore(
+            self.root / "near-ca-expiry-host",
+            "near-expiry-host-001",
+            "near-expiry-hub-001",
+        )
+        now = datetime.now(timezone.utc)
+        builder = (
+            x509.CertificateBuilder()
+            .subject_name(store._ca_certificate.subject)
+            .issuer_name(store._ca_certificate.issuer)
+            .public_key(store._ca_key.public_key())
+            .serial_number(x509.random_serial_number())
+            .not_valid_before(now - timedelta(minutes=5))
+            .not_valid_after(now + timedelta(days=20))
+        )
+        for extension in store._ca_certificate.extensions:
+            builder = builder.add_extension(extension.value, extension.critical)
+        near_expiry_ca = builder.sign(store._ca_key, algorithm=None)
+        server_key = serialization.load_pem_private_key(
+            store.server_key_path.read_bytes(), password=None
+        )
+        ceiling_leaf = store._issue_server_certificate(
+            store._ca_key,
+            near_expiry_ca,
+            server_key,
+            now,
+            advertised_ip="192.0.2.45",
+        )
+        store.ca_certificate_path.write_bytes(
+            near_expiry_ca.public_bytes(serialization.Encoding.PEM)
+        )
+        store._ca_certificate = near_expiry_ca
+        with store._guard:
+            store._replace_server_certificate(ceiling_leaf)
+
+        serial = store._server_certificate.serial_number
+        self.assertEqual(
+            store._server_certificate.not_valid_after_utc,
+            near_expiry_ca.not_valid_after_utc,
+        )
+        self.assertFalse(store.configure_listener_identity("192.0.2.45"))
+        self.assertIsNone(store.refresh_tls_server_context("192.0.2.45"))
+        self.assertEqual(store._server_certificate.serial_number, serial)
 
     def test_remote_revocation_retires_exact_connection_and_routes_atomically(self) -> None:
         client = SecurePeerClient(
@@ -4417,6 +4583,67 @@ class SecurePeerLiveTLSTests(unittest.TestCase):
         finally:
             stalled.close()
         self.assertEqual(closed, b"")
+
+    def test_running_gateway_rotates_leaf_context_without_listener_or_key_rollover(
+        self,
+    ) -> None:
+        server = self.gateway._server
+        listener_thread = self.gateway._thread
+        assert server is not None and listener_thread is not None
+        original_context = server.current_tls_context()
+        original_ca = self.store.ca_certificate_path.read_bytes()
+        original_server_key = self.store.server_key_path.read_bytes()
+        original_certificate = x509.load_pem_x509_certificate(
+            self.store.server_certificate_path.read_bytes()
+        )
+        original_sans = list(
+            original_certificate.extensions.get_extension_for_class(
+                x509.SubjectAlternativeName
+            ).value
+        )
+        server_key = serialization.load_pem_private_key(
+            original_server_key, password=None
+        )
+        now = datetime.now(timezone.utc)
+        short_lived = self.store._issue_server_certificate(
+            self.store._ca_key,
+            self.store._ca_certificate,
+            server_key,
+            now - timedelta(days=824),
+            advertised_ip=self.host_ip,
+        )
+        with self.store._guard:
+            self.store._replace_server_certificate(short_lived)
+
+        self.assertTrue(self.gateway.refresh_listener_identity())
+        rotated = x509.load_pem_x509_certificate(
+            self.store.server_certificate_path.read_bytes()
+        )
+        self.assertIsNot(server.current_tls_context(), original_context)
+        self.assertIs(self.gateway._thread, listener_thread)
+        self.assertTrue(listener_thread.is_alive())
+        self.assertEqual(self.store.ca_certificate_path.read_bytes(), original_ca)
+        self.assertEqual(self.store.server_key_path.read_bytes(), original_server_key)
+        self.assertEqual(
+            list(
+                rotated.extensions.get_extension_for_class(
+                    x509.SubjectAlternativeName
+                ).value
+            ),
+            original_sans,
+        )
+        self.assertGreater(rotated.not_valid_after_utc, now + timedelta(days=800))
+        self.assertFalse(self.gateway.refresh_listener_identity())
+
+        # A fresh TLS client must see the swapped context without rebinding or
+        # restarting the listener thread.
+        pending = self.client.begin_pairing(
+            self.host_ip,
+            self.port,
+            expected_ca_fingerprint=self.store.ca_fingerprint,
+            requested_scopes=["teamspace.read"],
+        )
+        self.assertEqual(pending["status"], "pending")
 
     def test_rate_limits_cover_health_poll_and_pairing(self) -> None:
         for action, allowed in (("health", 60), ("poll", 120), ("pair", 8)):
