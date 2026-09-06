@@ -3,6 +3,7 @@ storms, health-poll reconcile spam, and update-when-idle lockout."""
 
 import asyncio
 import json
+import os
 import tempfile
 import tracemalloc
 import unittest
@@ -1200,6 +1201,153 @@ class PruneImportedHistoryTests(unittest.TestCase):
                     )
             self.assertTrue(log.read_bytes().startswith(before))
             self.assertIn(b'"text":"late"', log.read_bytes())
+
+    def test_prune_detects_same_size_rewrite_with_restored_mtime(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            log = Path(temporary) / "events.jsonl"
+            events = [
+                {
+                    "seq": 1,
+                    "type": "turn_started",
+                    "run_id": "native",
+                    "prompt": "same",
+                },
+                {
+                    "seq": 2,
+                    "type": "history_imported",
+                    "run_id": "import_1",
+                    "imported": True,
+                },
+                {
+                    "seq": 3,
+                    "type": "turn_started",
+                    "run_id": "import_1",
+                    "imported": True,
+                    "prompt": "same",
+                },
+                {
+                    "seq": 4,
+                    "type": "turn_finished",
+                    "run_id": "import_1",
+                    "imported": True,
+                },
+            ]
+            self.write_log(log, events)
+            original = log.read_bytes()
+            rewritten_by_racer = original.replace(b'"prompt": "same"', b'"prompt": "tame"', 1)
+            self.assertEqual(len(rewritten_by_racer), len(original))
+            initial = log.stat()
+            real_stat = agent_server.Path.stat
+            calls = 0
+
+            def changing_stat(target, *args, **kwargs):
+                nonlocal calls
+                result = real_stat(target, *args, **kwargs)
+                if target == log:
+                    calls += 1
+                    if calls == 3:
+                        log.write_bytes(rewritten_by_racer)
+                        os.utime(
+                            log,
+                            ns=(initial.st_atime_ns, initial.st_mtime_ns),
+                        )
+                        result = real_stat(target, *args, **kwargs)
+                        self.assertEqual(result.st_size, initial.st_size)
+                        self.assertEqual(result.st_mtime_ns, initial.st_mtime_ns)
+                        self.assertNotEqual(result.st_ctime_ns, initial.st_ctime_ns)
+                return result
+
+            with patch.object(
+                agent_server,
+                "events_path",
+                return_value=log,
+            ), patch.object(agent_server.Path, "stat", changing_stat):
+                with self.assertRaises(RuntimeError):
+                    agent_server.prune_duplicate_imported_history_sync(
+                        "chat",
+                        dry_run=False,
+                    )
+
+            self.assertEqual(log.read_bytes(), rewritten_by_racer)
+
+    def test_prune_handles_unpaired_surrogate_keys_losslessly(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            log = Path(temporary) / "events.jsonl"
+            events = [
+                {
+                    "seq": 1,
+                    "type": "assistant_text",
+                    "run_id": "native",
+                    "text": "\ud800",
+                },
+                {
+                    "seq": 2,
+                    "type": "history_imported",
+                    "run_id": "import_\ud800_drop",
+                    "imported": True,
+                },
+                {
+                    "seq": 3,
+                    "type": "assistant_text",
+                    "run_id": "import_\ud800_drop",
+                    "imported": True,
+                    "text": "\ud800",
+                },
+                {
+                    "seq": 4,
+                    "type": "turn_finished",
+                    "run_id": "import_\ud800_drop",
+                    "imported": True,
+                },
+                {
+                    "seq": 5,
+                    "type": "history_imported",
+                    "run_id": "import_\ud800_keep",
+                    "imported": True,
+                },
+                {
+                    "seq": 6,
+                    "type": "assistant_text",
+                    "run_id": "import_\ud800_keep",
+                    "imported": True,
+                    "text": "unique",
+                },
+                {
+                    "seq": 7,
+                    "type": "turn_finished",
+                    "run_id": "import_\ud800_keep",
+                    "imported": True,
+                },
+            ]
+            self.write_log(log, events)
+            before = log.read_bytes()
+            with patch.object(
+                agent_server,
+                "events_path",
+                return_value=log,
+            ), patch.object(agent_server.hashlib, "sha256") as sha256:
+                # Every normalized key shares one digest. Full BLOB key
+                # equality must still distinguish the unique imported text.
+                sha256.return_value.digest.return_value = b"x" * 32
+                dry = agent_server.prune_duplicate_imported_history_sync(
+                    "chat",
+                    dry_run=True,
+                )
+                self.assertEqual(log.read_bytes(), before)
+                real = agent_server.prune_duplicate_imported_history_sync(
+                    "chat",
+                    dry_run=False,
+                )
+
+            self.assertEqual(dry["removed_events"], 3)
+            self.assertEqual(dry["removed_runs"], 1)
+            self.assertEqual(real["removed_events"], 3)
+            self.assertEqual(real["removed_runs"], 1)
+            rewritten = log.read_bytes()
+            self.assertIn(b'"text": "\\ud800"', rewritten)
+            self.assertIn(b'"run_id": "import_\\ud800_keep"', rewritten)
+            self.assertNotIn(b'"run_id": "import_\\ud800_drop"', rewritten)
+            self.assertEqual(real["bytes_after"], len(rewritten))
 
 
 class DarwinMetricsTests(unittest.TestCase):

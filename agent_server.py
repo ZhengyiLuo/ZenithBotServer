@@ -22484,17 +22484,17 @@ def _prune_history_bookkeeping_connection(path: Path) -> sqlite3.Connection:
         CREATE TABLE seen_messages (
             digest BLOB NOT NULL,
             kind TEXT NOT NULL,
-            normalized_text TEXT NOT NULL,
+            normalized_text BLOB NOT NULL,
             PRIMARY KEY (digest, kind, normalized_text)
         ) WITHOUT ROWID;
         CREATE TABLE kept_runs (
-            run_id TEXT PRIMARY KEY,
+            run_id BLOB PRIMARY KEY,
             kept_count INTEGER NOT NULL
         ) WITHOUT ROWID;
         CREATE TABLE dropped_lines (
             byte_offset INTEGER PRIMARY KEY,
             byte_length INTEGER NOT NULL,
-            run_id TEXT,
+            run_id BLOB,
             is_import_marker INTEGER NOT NULL DEFAULT 0
         );
         """
@@ -22578,14 +22578,19 @@ def prune_duplicate_imported_history_sync(
                     + b"\0"
                     + normalized.encode("utf-8", "surrogatepass")
                 ).digest()
+                normalized_bytes = normalized.encode("utf-8", "surrogatepass")
                 duplicate = connection.execute(
                     """
                     SELECT 1 FROM seen_messages
                     WHERE digest = ? AND kind = ? AND normalized_text = ?
                     """,
-                    (digest, kind, normalized),
+                    (digest, kind, normalized_bytes),
                 ).fetchone() is not None
                 if is_imported_history_event(loaded) and duplicate:
+                    run_id = str(loaded.get("run_id") or "").encode(
+                        "utf-8",
+                        "surrogatepass",
+                    )
                     connection.execute(
                         """
                         INSERT OR IGNORE INTO dropped_lines
@@ -22595,12 +22600,15 @@ def prune_duplicate_imported_history_sync(
                         (
                             byte_offset,
                             len(raw_line),
-                            str(loaded.get("run_id") or ""),
+                            run_id,
                         ),
                     )
                     continue
                 if is_imported_history_event(loaded):
-                    run_id = str(loaded.get("run_id") or "")
+                    run_id = str(loaded.get("run_id") or "").encode(
+                        "utf-8",
+                        "surrogatepass",
+                    )
                     connection.execute(
                         """
                         INSERT INTO kept_runs (run_id, kept_count) VALUES (?, 1)
@@ -22615,7 +22623,7 @@ def prune_duplicate_imported_history_sync(
                         (digest, kind, normalized_text)
                     VALUES (?, ?, ?)
                     """,
-                    (digest, kind, normalized),
+                    (digest, kind, normalized_bytes),
                 )
         connection.commit()
 
@@ -22640,7 +22648,10 @@ def prune_duplicate_imported_history_sync(
                             event = loaded
                 if event is not None and not dropped and is_imported_history_event(event):
                     event_type = str(event.get("type") or "")
-                    run_id = str(event.get("run_id") or "")
+                    run_id = str(event.get("run_id") or "").encode(
+                        "utf-8",
+                        "surrogatepass",
+                    )
                     if event_type in {"history_imported", "turn_finished"} and run_id:
                         kept = connection.execute(
                             "SELECT kept_count FROM kept_runs WHERE run_id = ?",
@@ -22679,7 +22690,7 @@ def prune_duplicate_imported_history_sync(
             """
             SELECT COUNT(DISTINCT run_id)
             FROM dropped_lines
-            WHERE is_import_marker = 1 AND run_id <> ''
+            WHERE is_import_marker = 1 AND length(run_id) > 0
             """
         ).fetchone()[0])
         summary.setdefault("_max_seq_before", 0)
@@ -22749,6 +22760,7 @@ def prune_duplicate_imported_history_sync(
             or current_stat.st_ino != source_stat.st_ino
             or current_stat.st_size != source_stat.st_size
             or current_stat.st_mtime_ns != source_stat.st_mtime_ns
+            or current_stat.st_ctime_ns != source_stat.st_ctime_ns
         ):
             raise RuntimeError("event log changed while duplicate history was pruned")
         os.replace(replacement_path, path)
