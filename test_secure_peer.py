@@ -30,6 +30,7 @@ from agentsdock_team_hub.secure_peer import (
     RENEWAL_REQUEST_TTL_SECONDS,
     RETIRED_RENEWAL_MATERIAL_LIMIT,
     PeerAuthorization,
+    ProxyRequest,
     ProxyResponse,
     SecurePeerClient,
     SecurePeerError,
@@ -835,6 +836,131 @@ class SecurePeerStoreTests(unittest.TestCase):
                 (("Content-Type", "application/json"),),
                 b'{"to":{"kind":"server","id":"node_12345678"},"body":"no","idempotency_key":"mail-denied-001"}',
             )
+
+    def test_proxy_delete_and_deletion_journal_are_narrowly_sanitized(self) -> None:
+        peer = PeerAuthorization(
+            _uuid(),
+            _uuid(),
+            "peer-server-delete",
+            "team-alpha",
+            frozenset({"teamspace.read", "teamspace.write"}),
+            "sha256:" + "b" * 64,
+            self.clock.value + 600,
+            "Deleting peer",
+        )
+        body = b'{"idempotency_key":"delete-message-001"}'
+        message = sanitize_proxy_request(
+            peer,
+            "DELETE",
+            "/v1/teams/team-alpha/network/messages/tmsg_12345678",
+            "",
+            (
+                ("Content-Type", "application/json"),
+                ("Authorization", "Bearer must-not-cross"),
+                ("Accept", "application/json"),
+            ),
+            body,
+        )
+        self.assertEqual(message.method, "DELETE")
+        self.assertEqual(
+            message.path,
+            "/v1/teams/team-alpha/network/messages/tmsg_12345678",
+        )
+        self.assertEqual(message.query, "")
+        self.assertEqual(message.body, body)
+        self.assertEqual(
+            message.headers,
+            (("content-type", "application/json"), ("accept", "application/json")),
+        )
+        bulletin = sanitize_proxy_request(
+            peer,
+            "DELETE",
+            "/v1/teams/team-alpha/network/bulletin/message_12345678",
+            "",
+            (("Content-Type", "application/json"),),
+            b'{"idempotency_key":"delete-bulletin-001"}',
+        )
+        self.assertEqual(bulletin.method, "DELETE")
+        journal = sanitize_proxy_request(
+            peer,
+            "GET",
+            "/v1/teams/team-alpha/network/deletions",
+            "after_sequence=0&limit=100",
+            (),
+            b"",
+        )
+        self.assertEqual(journal.query, "after_sequence=0&limit=100")
+
+        invalid_requests = (
+            (
+                "DELETE",
+                "/v1/teams/team-alpha/network/messages/tmsg_12345678",
+                "",
+                (("Content-Type", "application/json"),),
+                b"",
+            ),
+            (
+                "DELETE",
+                "/v1/teams/team-alpha/network/messages/tmsg_12345678",
+                "",
+                (("Content-Type", "application/json"),),
+                b"[]",
+            ),
+            (
+                "DELETE",
+                "/v1/teams/team-alpha/network/messages/tmsg_12345678",
+                "force=1",
+                (("Content-Type", "application/json"),),
+                body,
+            ),
+            (
+                "DELETE",
+                "/v1/teams/team-alpha/network/messages",
+                "",
+                (("Content-Type", "application/json"),),
+                body,
+            ),
+            (
+                "GET",
+                "/v1/teams/team-alpha/network/deletions",
+                "",
+                (("Content-Type", "application/json"),),
+                body,
+            ),
+        )
+        for method, path, query, headers, request_body in invalid_requests:
+            with self.subTest(method=method, path=path, query=query), self.assertRaises(
+                SecurePeerError
+            ):
+                sanitize_proxy_request(
+                    peer,
+                    method,
+                    path,
+                    query,
+                    headers,
+                    request_body,
+                )
+
+        read_only = PeerAuthorization(
+            peer.peer_id,
+            peer.pairing_id,
+            peer.peer_server_identity,
+            peer.team_id,
+            frozenset({"teamspace.read"}),
+            peer.certificate_fingerprint,
+            peer.certificate_expires_at,
+            peer.peer_display_name,
+        )
+        with self.assertRaises(SecurePeerError) as denied:
+            sanitize_proxy_request(
+                read_only,
+                "DELETE",
+                message.path,
+                "",
+                (("Content-Type", "application/json"),),
+                body,
+            )
+        self.assertEqual(denied.exception.status_code, 403)
 
     def test_proxy_response_is_bounded_and_strips_peer_control_headers(self) -> None:
         sanitized = sanitize_proxy_response(
@@ -3243,6 +3369,74 @@ class SecurePeerLiveTLSTests(unittest.TestCase):
         )
         self.assertEqual(deactivated["status"], "deactivated")
         self.assertFalse(deactivated["active"])
+
+    def test_gateway_delete_forwards_authenticated_json_body_and_peer_binding(self) -> None:
+        requested_scopes = ["teamspace.read", "teamspace.write"]
+        connection = self.client.begin_pairing(
+            self.host_ip,
+            self.port,
+            expected_ca_fingerprint=self.store.ca_fingerprint,
+            requested_scopes=requested_scopes,
+        )
+        pending = self.store.list_pairings(status="pending")[0]
+        approved = self.store.approve_pairing(
+            pending["pairing_id"],
+            "team-alpha",
+            requested_scopes,
+            "owner-admin",
+            expected_peer_server_identity=pending["peer_server_identity"],
+            expected_transcript_hash=pending["transcript_hash"],
+            idempotency_key=_uuid(),
+        )
+        paired = self.client.poll_pairing(connection["connection_id"])
+        self.client.peer_health(connection["connection_id"])
+        self.client.set_active_connection(
+            connection["connection_id"],
+            expected_current=None,
+        )
+
+        forwarded: list[ProxyRequest] = []
+
+        def forward(request: ProxyRequest) -> ProxyResponse:
+            forwarded.append(request)
+            return ProxyResponse(
+                200,
+                (("content-type", "application/json"),),
+                canonical_json(
+                    {"deleted": True, "message_id": "tmsg_gateway_delete_001"}
+                ),
+            )
+
+        self.gateway.forwarder = forward
+        body = {"idempotency_key": "gateway-delete-key-001"}
+        response = self.client.proxy(
+            connection["connection_id"],
+            "DELETE",
+            "/v1/teams/team-alpha/network/messages/tmsg_gateway_delete_001",
+            headers={"content-type": "application/json"},
+            body=body,
+        )
+        self.assertEqual(response.status, 200)
+        self.assertEqual(
+            json.loads(response.body),
+            {"deleted": True, "message_id": "tmsg_gateway_delete_001"},
+        )
+        self.assertEqual(len(forwarded), 1)
+        request = forwarded[0]
+        self.assertEqual(request.method, "DELETE")
+        self.assertEqual(
+            request.path,
+            "/v1/teams/team-alpha/network/messages/tmsg_gateway_delete_001",
+        )
+        self.assertEqual(request.query, "")
+        self.assertEqual(json.loads(request.body), body)
+        self.assertEqual(request.peer.peer_id, approved["peer_id"])
+        self.assertEqual(request.peer.team_id, "team-alpha")
+        self.assertEqual(request.peer.scopes, frozenset(requested_scopes))
+        self.assertEqual(
+            request.peer.certificate_fingerprint,
+            paired["certificate_fingerprint"],
+        )
 
     def test_lowercase_forwarded_accept_header_is_not_duplicated(self) -> None:
         status, _headers, _raw, _leaf = self.client._request(

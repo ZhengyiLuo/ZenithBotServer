@@ -1646,12 +1646,13 @@ class VendoredTeamHubParityTests(unittest.TestCase):
             "migrations/0009_team_messages.sql": "2ce774f0934e111c6443bda74fa7e8bbf8617094341c91b01b89cc0415eb05af",
             "migrations/0010_team_attachment_orphan_reclamation.sql": "85192a1c821378743a5abf89f916070cfccb1aa67a79eac95f6a07ec1d888bc5",
             "migrations/0011_human_admin_paging.sql": "29d165f8397f13451422a63ce948c67de49774de6fbb77b70fdca09647bb46f5",
+            "migrations/0012_network_content_deletions.sql": "71cf06fb160158530c7620da314364b1f8bc71d2981b788127193053875538b4",
             "migrations/__init__.py": "aaf340c45c8d39c2939814977ba4cef8eb6b3bd0671b0f7542ebe06f5431d6ec",
             "security.py": "0c1895c7443e7be07a2f53c7e4c4228e3ee04c65d6cd36f039b7bbba1813e4fa",
-            "secure_peer.py": "5ff4d75e87d56f49118166b3802b17b2c087765978b3bdc26d1c7fdecb9ce79f",
-            "secure_peer_hub.py": "249d6550cc9f8dceacdd9fdb914b518017b6ac04f0713170bacdcd27ad6cf407",
-            "service.py": "9a1a4b97f37317b89412342bdb5dbbbe2416b58c804f5f335f4fb6b0a0fafc72",
-            "store.py": "440bfbc3cc833b04886c7bd12475d09b00baf76f790eacbae71c1af82008349a",
+            "secure_peer.py": "75afd3af59fc080c873635be686bdf006837c40e84b98676221b690a49f018f7",
+            "secure_peer_hub.py": "e716fac4560a4c03e226db4b6b5f96e7dbd846caa27db1db67248a1325bcef49",
+            "service.py": "e46b0a1248bb539402ed6984116ecc0b012b73ab2f48ff7e113148b386a5ee27",
+            "store.py": "22988c449ddec9ca3570491c5d40e40a7922eee5db5e77fd5cdb05526b510b52",
         }
         entries = list(vendored.rglob("*"))
         for path in entries:

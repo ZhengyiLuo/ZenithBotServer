@@ -4653,7 +4653,7 @@ def sanitize_proxy_request(
     """Authorize and normalize one request for the fixed loopback Hub target."""
 
     normalized_method = str(method).upper()
-    if normalized_method not in {"GET", "POST"}:
+    if normalized_method not in {"GET", "POST", "DELETE"}:
         raise SecurePeerError("method_not_allowed", "Proxy method is not permitted", 405)
     if (
         not isinstance(path, str)
@@ -4729,6 +4729,12 @@ def sanitize_proxy_request(
                 route_allowed = True
                 allow_query = normalized_method == "GET"
                 allowed_query_keys = {"after_sequence", "limit"}
+            elif (
+                len(pieces) == 2
+                and pieces[0] == "bulletin"
+                and normalized_method == "DELETE"
+            ):
+                route_allowed = True
             elif pieces == ["mailbox"] and normalized_method in {"GET", "POST"}:
                 route_allowed = True
                 allow_query = normalized_method == "GET"
@@ -4785,9 +4791,13 @@ def sanitize_proxy_request(
             elif (
                 len(pieces) == 2
                 and pieces[0] == "messages"
-                and normalized_method == "GET"
+                and normalized_method in {"GET", "DELETE"}
             ):
                 route_allowed = True
+            elif pieces == ["deletions"] and normalized_method == "GET":
+                route_allowed = True
+                allow_query = True
+                allowed_query_keys = {"after_sequence", "limit"}
             elif (
                 len(pieces) == 3
                 and pieces[0] == "messages"
@@ -4952,7 +4962,7 @@ def sanitize_proxy_request(
                 raise SecurePeerError("invalid_request", "Proxy request headers are invalid", 400)
             forwarded.append((name, value))
     content_types = [value for name, value in forwarded if name == "content-type"]
-    if normalized_method == "POST":
+    if normalized_method in {"POST", "DELETE"}:
         if content_types != ["application/json"] or not body:
             raise SecurePeerError("invalid_request", "JSON proxy body is required", 415)
         try:
@@ -4961,7 +4971,7 @@ def sanitize_proxy_request(
         except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as exc:
             raise SecurePeerError("invalid_request", "Proxy body must be a JSON object", 422) from exc
     elif body:
-        raise SecurePeerError("invalid_request", "GET proxy requests cannot have a body", 422)
+        raise SecurePeerError("invalid_request", "Proxy request body is not permitted", 422)
     return ProxyRequest(normalized_method, path, query, tuple(forwarded), body, peer)
 
 
@@ -5723,6 +5733,39 @@ class SecurePeerGateway:
                         self._error(exc)
                     except Exception:
                         self._error(SecurePeerError("internal_error", "Internal server error", 500))
+
+                def do_DELETE(self) -> None:  # noqa: N802
+                    try:
+                        path, query = self._split()
+                        self._validate_headers()
+                        if query:
+                            raise SecurePeerError(
+                                "invalid_request",
+                                "Query is not accepted",
+                                422,
+                            )
+                        if path.startswith("/v1/hub/"):
+                            self._proxy(
+                                path,
+                                "",
+                                self._body(MAX_PROXY_BODY_BYTES),
+                            )
+                            return
+                        raise SecurePeerError(
+                            "not_found",
+                            "Resource not found",
+                            404,
+                        )
+                    except SecurePeerError as exc:
+                        self._error(exc)
+                    except Exception:
+                        self._error(
+                            SecurePeerError(
+                                "internal_error",
+                                "Internal server error",
+                                500,
+                            )
+                        )
 
                 def _reject_browser_headers(self) -> None:
                     forbidden = {

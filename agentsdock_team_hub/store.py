@@ -9756,6 +9756,12 @@ class HubStore:
                     + """
                     WHERE m.channel_id=? AND m.channel_sequence>?
                       AND m.deleted_at IS NULL
+                      AND NOT EXISTS (
+                        SELECT 1 FROM network_content_deletions AS deletion
+                        WHERE deletion.team_id=m.team_id
+                          AND deletion.resource_kind='bulletin'
+                          AND deletion.resource_id=m.id
+                      )
                     ORDER BY m.channel_sequence ASC LIMIT ?
                     """,
                     (board["id"], clean_after, bounded_limit + 1),
@@ -9831,6 +9837,13 @@ class HubStore:
                         SELECT id,thread_root_message_id FROM messages
                         WHERE team_id=? AND channel_id=? AND id=?
                           AND deleted_at IS NULL
+                          AND NOT EXISTS (
+                            SELECT 1
+                            FROM network_content_deletions AS deletion
+                            WHERE deletion.team_id=messages.team_id
+                              AND deletion.resource_kind='bulletin'
+                              AND deletion.resource_id=messages.id
+                          )
                         """,
                         (team_id, board["id"], reply_to),
                     ).fetchone()
@@ -9912,6 +9925,130 @@ class HubStore:
                     "network.bulletin.posted",
                     timestamp,
                 )
+                return response
+        finally:
+            connection.close()
+
+    def delete_network_bulletin_post(
+        self,
+        claims: AccessClaims,
+        team_id: str,
+        post_id: str,
+        request: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Globally hide one bulletin post through the immutable journal."""
+
+        timestamp = _now()
+        idempotency_key = self._team_idempotency_key(request)
+        fingerprint = canonical_fingerprint(
+            {"team_id": team_id, "post_id": post_id}
+        )
+        connection = self.connect()
+        try:
+            with _write_transaction(connection):
+                membership = self._require_network_scope(
+                    connection,
+                    claims,
+                    team_id,
+                    write=True,
+                )
+                cached = self._idempotency_lookup(
+                    connection,
+                    team_id,
+                    claims.principal_id,
+                    "network.bulletin.delete",
+                    idempotency_key,
+                    fingerprint,
+                )
+                if cached is not None:
+                    return cached
+                row = connection.execute(
+                    self._bulletin_post_select()
+                    + """
+                    JOIN network_boards AS network_board
+                      ON network_board.team_id=m.team_id
+                     AND network_board.channel_id=m.channel_id
+                    WHERE m.team_id=? AND m.id=? AND m.deleted_at IS NULL
+                    """,
+                    (team_id, post_id),
+                ).fetchone()
+                if row is None:
+                    raise HubError("not_found", "Resource not found", 404)
+                if (
+                    not self._network_source_author_matches(
+                        connection,
+                        claims,
+                        team_id,
+                        principal_id=str(row["author_principal_id"]),
+                        node_id=(
+                            str(row["author_node_id"])
+                            if row["author_node_id"] is not None
+                            else None
+                        ),
+                    )
+                    and membership["role"] not in {"owner", "admin"}
+                ):
+                    raise HubError("forbidden", "Operation is not permitted", 403)
+                existing = connection.execute(
+                    """
+                    SELECT id FROM network_content_deletions
+                    WHERE team_id=? AND resource_kind='bulletin' AND resource_id=?
+                    """,
+                    (team_id, post_id),
+                ).fetchone()
+                inserted = existing is None
+                deletion_id = (
+                    _id("deletion") if existing is None else str(existing["id"])
+                )
+                if inserted:
+                    connection.execute(
+                        """
+                        INSERT INTO network_content_deletions(
+                            id,team_id,resource_kind,resource_id,
+                            deleted_by_principal_id,deleted_at
+                        ) VALUES (?,?,'bulletin',?,?,?)
+                        """,
+                        (
+                            deletion_id,
+                            team_id,
+                            post_id,
+                            claims.principal_id,
+                            timestamp,
+                        ),
+                    )
+                response = {"deleted": True, "post_id": post_id}
+                self._idempotency_store(
+                    connection,
+                    team_id,
+                    claims.principal_id,
+                    "network.bulletin.delete",
+                    idempotency_key,
+                    fingerprint,
+                    "network_content_deletion",
+                    deletion_id,
+                    response,
+                    timestamp,
+                )
+                if inserted:
+                    self._audit(
+                        connection,
+                        team_id,
+                        claims.principal_id,
+                        "network.bulletin.delete",
+                        "network_bulletin_post",
+                        post_id,
+                        "succeeded",
+                        {},
+                        timestamp,
+                    )
+                    self._outbox(
+                        connection,
+                        team_id,
+                        "network_bulletin_post",
+                        post_id,
+                        "network.bulletin.deleted",
+                        timestamp,
+                    )
                 return response
         finally:
             connection.close()
@@ -11570,6 +11707,24 @@ class HubStore:
                 owned.append(("server", str(node["node_id"])))
         return owned
 
+    def _network_source_author_matches(
+        self,
+        connection: sqlite3.Connection,
+        claims: AccessClaims,
+        team_id: str,
+        *,
+        principal_id: str,
+        node_id: str | None,
+    ) -> bool:
+        """Match a human principal or an automation caller's stable server."""
+
+        if principal_id == claims.principal_id:
+            return True
+        if node_id is None or claims.auth_kind not in NETWORK_AUTOMATION_AUTH_KINDS:
+            return False
+        caller = self._caller_network_node(connection, claims, team_id)
+        return str(caller["node_id"]) == node_id
+
     @staticmethod
     def _team_can_write(claims: AccessClaims, membership_role: str | None) -> bool:
         if claims.auth_kind in NETWORK_AUTOMATION_AUTH_KINDS:
@@ -11742,6 +11897,28 @@ class HubStore:
 
     def _team_message_visible(
         self,
+        connection: sqlite3.Connection,
+        claims: AccessClaims,
+        row: sqlite3.Row,
+        owned: list[tuple[str, str]],
+    ) -> bool:
+        if connection.execute(
+            """
+            SELECT 1 FROM network_content_deletions
+            WHERE team_id=? AND resource_kind='message' AND resource_id=?
+            """,
+            (row["team_id"], row["id"]),
+        ).fetchone() is not None:
+            return False
+        return self._team_message_was_visible(
+            connection,
+            claims,
+            row,
+            owned,
+        )
+
+    @staticmethod
+    def _team_message_was_visible(
         connection: sqlite3.Connection,
         claims: AccessClaims,
         row: sqlite3.Row,
@@ -11923,10 +12100,31 @@ class HubStore:
                     resolved.append(("human", None, str(found["id"])))
                 if reply_to is not None:
                     parent = connection.execute(
-                        "SELECT id FROM team_messages WHERE team_id=? AND id=?",
+                        self._team_message_select()
+                        + """
+                        WHERE m.team_id=? AND m.id=?
+                          AND NOT EXISTS (
+                            SELECT 1
+                            FROM network_content_deletions AS deletion
+                            WHERE deletion.team_id=m.team_id
+                              AND deletion.resource_kind='message'
+                              AND deletion.resource_id=m.id
+                          )
+                        """,
                         (team_id, reply_to),
                     ).fetchone()
-                    if parent is None:
+                    parent_owned = self._team_owned_addresses(
+                        connection,
+                        claims,
+                        team_id,
+                        str(membership["role"]),
+                    )
+                    if parent is None or not self._team_message_was_visible(
+                        connection,
+                        claims,
+                        parent,
+                        parent_owned,
+                    ):
                         raise HubError("invalid_request", "Reply target is unavailable", 422)
                 attachment_rows: list[sqlite3.Row] = []
                 attachment_bytes = 0
@@ -12212,7 +12410,16 @@ class HubStore:
             owned = self._team_owned_addresses(
                 connection, claims, team_id, str(membership["role"])
             )
-            where = ["m.team_id=?", "m.queue_ordinal>?"]
+            where = [
+                "m.team_id=?",
+                "m.queue_ordinal>?",
+                """NOT EXISTS (
+                    SELECT 1 FROM network_content_deletions AS deletion
+                    WHERE deletion.team_id=m.team_id
+                      AND deletion.resource_kind='message'
+                      AND deletion.resource_id=m.id
+                )""",
+            ]
             params: list[Any] = [team_id, after_sequence]
             joins = ""
             if box == "feed":
@@ -12309,7 +12516,16 @@ class HubStore:
             connection.execute("BEGIN")
             membership = self._require_network_scope(connection, claims, team_id, write=False)
             row = connection.execute(
-                self._team_message_select() + " WHERE m.team_id=? AND m.id=?",
+                self._team_message_select()
+                + """
+                WHERE m.team_id=? AND m.id=?
+                  AND NOT EXISTS (
+                    SELECT 1 FROM network_content_deletions AS deletion
+                    WHERE deletion.team_id=m.team_id
+                      AND deletion.resource_kind='message'
+                      AND deletion.resource_id=m.id
+                  )
+                """,
                 (team_id, message_id),
             ).fetchone()
             if row is None:
@@ -12323,6 +12539,261 @@ class HubStore:
                 "message": self._team_message_public(
                     connection, row, include_body=True, owned=owned
                 )
+            }
+            connection.execute("COMMIT")
+            return response
+        except BaseException:
+            if connection.in_transaction:
+                connection.execute("ROLLBACK")
+            raise
+        finally:
+            connection.close()
+
+    def delete_team_message(
+        self,
+        claims: AccessClaims,
+        team_id: str,
+        message_id: str,
+        request: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Soft-delete one ordinary Team Message without mutating its source."""
+
+        timestamp = _now()
+        idempotency_key = self._team_idempotency_key(request)
+        fingerprint = canonical_fingerprint(
+            {"team_id": team_id, "message_id": message_id}
+        )
+        connection = self.connect()
+        try:
+            with _write_transaction(connection):
+                membership = self._require_network_scope(
+                    connection,
+                    claims,
+                    team_id,
+                    write=True,
+                )
+                cached = self._idempotency_lookup(
+                    connection,
+                    team_id,
+                    claims.principal_id,
+                    "team.message.delete",
+                    idempotency_key,
+                    fingerprint,
+                )
+                if cached is not None:
+                    return cached
+                row = connection.execute(
+                    self._team_message_select()
+                    + " WHERE m.team_id=? AND m.id=?",
+                    (team_id, message_id),
+                ).fetchone()
+                if row is None:
+                    raise HubError("not_found", "Resource not found", 404)
+                if (
+                    not self._network_source_author_matches(
+                        connection,
+                        claims,
+                        team_id,
+                        principal_id=str(row["sender_principal_id"]),
+                        node_id=(
+                            str(row["sender_node_id"])
+                            if row["sender_node_id"] is not None
+                            else None
+                        ),
+                    )
+                    and membership["role"] not in {"owner", "admin"}
+                ):
+                    raise HubError("forbidden", "Operation is not permitted", 403)
+                if row["kind"] != "message":
+                    raise HubError(
+                        "skill_archive_required",
+                        "Archive this skill in the Skills library instead",
+                        409,
+                    )
+                existing = connection.execute(
+                    """
+                    SELECT id FROM network_content_deletions
+                    WHERE team_id=? AND resource_kind='message' AND resource_id=?
+                    """,
+                    (team_id, message_id),
+                ).fetchone()
+                inserted = existing is None
+                deletion_id = (
+                    _id("deletion") if existing is None else str(existing["id"])
+                )
+                if inserted:
+                    connection.execute(
+                        """
+                        INSERT INTO network_content_deletions(
+                            id,team_id,resource_kind,resource_id,
+                            deleted_by_principal_id,deleted_at
+                        ) VALUES (?,?,'message',?,?,?)
+                        """,
+                        (
+                            deletion_id,
+                            team_id,
+                            message_id,
+                            claims.principal_id,
+                            timestamp,
+                        ),
+                    )
+                response = {"deleted": True, "message_id": message_id}
+                self._idempotency_store(
+                    connection,
+                    team_id,
+                    claims.principal_id,
+                    "team.message.delete",
+                    idempotency_key,
+                    fingerprint,
+                    "network_content_deletion",
+                    deletion_id,
+                    response,
+                    timestamp,
+                )
+                if inserted:
+                    self._audit(
+                        connection,
+                        team_id,
+                        claims.principal_id,
+                        "team.message.delete",
+                        "team_message",
+                        message_id,
+                        "succeeded",
+                        {"attachments": int(row["attachment_count"])},
+                        timestamp,
+                    )
+                    self._outbox(
+                        connection,
+                        team_id,
+                        "team_message",
+                        message_id,
+                        "team.message.deleted",
+                        timestamp,
+                    )
+                return response
+        finally:
+            connection.close()
+
+    def list_network_content_deletions(
+        self,
+        claims: AccessClaims,
+        team_id: str,
+        *,
+        after_sequence: int,
+        limit: int,
+    ) -> dict[str, Any]:
+        """Return a bounded, visibility-filtered deletion polling journal."""
+
+        if type(after_sequence) is not int or after_sequence < 0:
+            raise HubError("invalid_request", "Deletion page cursor is invalid", 422)
+        if type(limit) is not int or not 1 <= limit <= MAX_NETWORK_PAGE_ITEMS:
+            raise HubError("invalid_request", "Deletion page limit is invalid", 422)
+        connection = self.connect()
+        try:
+            connection.execute("BEGIN")
+            membership = self._require_network_scope(
+                connection,
+                claims,
+                team_id,
+                write=False,
+            )
+            owned = self._team_owned_addresses(
+                connection,
+                claims,
+                team_id,
+                str(membership["role"]),
+            )
+            owned_servers = sorted(
+                identity for kind, identity in owned if kind == "server"
+            )
+            owned_humans = sorted(
+                identity for kind, identity in owned if kind == "human"
+            )
+            sender_visibility = [
+                "(m.sender_kind='human' AND m.sender_principal_id=?)"
+            ]
+            visibility_parameters: list[Any] = [claims.principal_id]
+            if owned_servers:
+                placeholders = ",".join("?" for _ in owned_servers)
+                sender_visibility.append(
+                    f"(m.sender_kind='server' AND m.sender_node_id IN ({placeholders}))"
+                )
+                visibility_parameters.extend(owned_servers)
+            recipient_visibility = ["r.recipient_kind='all'"]
+            if owned_humans:
+                placeholders = ",".join("?" for _ in owned_humans)
+                recipient_visibility.append(
+                    f"(r.recipient_kind='human' "
+                    f"AND r.recipient_principal_id IN ({placeholders}))"
+                )
+                visibility_parameters.extend(owned_humans)
+            if owned_servers:
+                placeholders = ",".join("?" for _ in owned_servers)
+                recipient_visibility.append(
+                    f"(r.recipient_kind='server' "
+                    f"AND r.recipient_node_id IN ({placeholders}))"
+                )
+                visibility_parameters.extend(owned_servers)
+            message_visibility = f"""
+                d.resource_kind='message' AND EXISTS (
+                    SELECT 1 FROM team_messages AS m
+                    WHERE m.team_id=d.team_id AND m.id=d.resource_id
+                      AND m.kind='message'
+                      AND (
+                        {' OR '.join(sender_visibility)}
+                        OR EXISTS (
+                            SELECT 1 FROM team_message_recipients AS r
+                            WHERE r.team_id=m.team_id AND r.message_id=m.id
+                              AND ({' OR '.join(recipient_visibility)})
+                        )
+                      )
+                )
+            """
+            visible_kinds = [message_visibility]
+            board = connection.execute(
+                """
+                SELECT c.*
+                FROM network_boards AS b
+                JOIN channels AS c
+                  ON c.team_id=b.team_id AND c.id=b.channel_id
+                WHERE b.team_id=? AND c.archived_at IS NULL
+                """,
+                (team_id,),
+            ).fetchone()
+            if board is not None and self._channel_permission(
+                connection,
+                board,
+                claims.principal_id,
+                "read",
+            ):
+                visible_kinds.append("d.resource_kind='bulletin'")
+            rows = connection.execute(
+                f"""
+                SELECT d.* FROM network_content_deletions AS d
+                WHERE d.team_id=? AND d.sequence>?
+                  AND ({' OR '.join(visible_kinds)})
+                ORDER BY d.sequence ASC LIMIT ?
+                """,
+                [team_id, after_sequence, *visibility_parameters, limit + 1],
+            ).fetchall()
+            visible_rows = rows[:limit]
+            deletions = [
+                {
+                    "sequence": int(row["sequence"]),
+                    "kind": str(row["resource_kind"]),
+                    "id": str(row["resource_id"]),
+                    "deleted_at": _iso8601(row["deleted_at"]),
+                }
+                for row in visible_rows
+            ]
+            response = {
+                "deletions": deletions,
+                "next_after_sequence": (
+                    int(visible_rows[-1]["sequence"])
+                    if visible_rows
+                    else after_sequence
+                ),
+                "has_more": len(rows) > limit,
             }
             connection.execute("COMMIT")
             return response
@@ -12352,6 +12823,14 @@ class HubStore:
         try:
             with _write_transaction(connection):
                 membership = self._require_network_scope(connection, claims, team_id, write=False)
+                if connection.execute(
+                    """
+                    SELECT 1 FROM network_content_deletions
+                    WHERE team_id=? AND resource_kind='message' AND resource_id=?
+                    """,
+                    (team_id, message_id),
+                ).fetchone() is not None:
+                    raise HubError("not_found", "Resource not found", 404)
                 cached = self._idempotency_lookup(
                     connection,
                     team_id,
@@ -14035,6 +14514,12 @@ class HubStore:
                 """
                 SELECT * FROM messages
                 WHERE channel_id = ? AND channel_sequence < ? AND deleted_at IS NULL
+                  AND NOT EXISTS (
+                    SELECT 1 FROM network_content_deletions AS deletion
+                    WHERE deletion.team_id=messages.team_id
+                      AND deletion.resource_kind='bulletin'
+                      AND deletion.resource_id=messages.id
+                  )
                 ORDER BY channel_sequence DESC LIMIT ?
                 """,
                 (channel_id, cutoff, bounded_limit),
@@ -14139,6 +14624,13 @@ class HubStore:
                         SELECT id FROM messages
                         WHERE id = ? AND channel_id = ? AND deleted_at IS NULL
                           AND thread_root_message_id IS NULL AND parent_message_id IS NULL
+                          AND NOT EXISTS (
+                            SELECT 1
+                            FROM network_content_deletions AS deletion
+                            WHERE deletion.team_id=messages.team_id
+                              AND deletion.resource_kind='bulletin'
+                              AND deletion.resource_id=messages.id
+                          )
                         """,
                         (root_id, channel_id),
                     ).fetchone()
@@ -14149,6 +14641,13 @@ class HubStore:
                         """
                         SELECT id, thread_root_message_id FROM messages
                         WHERE id = ? AND channel_id = ? AND deleted_at IS NULL
+                          AND NOT EXISTS (
+                            SELECT 1
+                            FROM network_content_deletions AS deletion
+                            WHERE deletion.team_id=messages.team_id
+                              AND deletion.resource_kind='bulletin'
+                              AND deletion.resource_id=messages.id
+                          )
                         """,
                         (parent_id, channel_id),
                     ).fetchone()

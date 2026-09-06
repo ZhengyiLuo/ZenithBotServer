@@ -63069,6 +63069,7 @@ TEAM_HUB_SERVER_SESSION_ROUTE_RULES: tuple[tuple[str, re.Pattern[str]], ...] = (
     ("POST", re.compile(r"^/v1/teams/[^/]+/network/agents$")),
     ("GET", re.compile(r"^/v1/teams/[^/]+/network/bulletin$")),
     ("POST", re.compile(r"^/v1/teams/[^/]+/network/bulletin$")),
+    ("DELETE", re.compile(r"^/v1/teams/[^/]+/network/bulletin/[^/]+$")),
     ("GET", re.compile(r"^/v1/teams/[^/]+/network/mailbox$")),
     ("POST", re.compile(r"^/v1/teams/[^/]+/network/mailbox$")),
     ("GET", re.compile(r"^/v1/teams/[^/]+/network/items/[^/]+$")),
@@ -63085,7 +63086,9 @@ TEAM_HUB_SERVER_SESSION_ROUTE_RULES: tuple[tuple[str, re.Pattern[str]], ...] = (
     # Team Messages V2 JSON routes. Attachment content uses the binary lane.
     ("GET", re.compile(r"^/v1/teams/[^/]+/network/messages$")),
     ("POST", re.compile(r"^/v1/teams/[^/]+/network/messages$")),
+    ("GET", re.compile(r"^/v1/teams/[^/]+/network/deletions$")),
     ("GET", re.compile(r"^/v1/teams/[^/]+/network/messages/[^/]+$")),
+    ("DELETE", re.compile(r"^/v1/teams/[^/]+/network/messages/[^/]+$")),
     ("POST", re.compile(r"^/v1/teams/[^/]+/network/messages/[^/]+/receipts$")),
     ("POST", re.compile(r"^/v1/teams/[^/]+/network/attachments$")),
     ("GET", re.compile(r"^/v1/teams/[^/]+/network/attachments/[^/]+$")),
@@ -63874,7 +63877,7 @@ async def require_agent_token(request: Request, call_next):
                 {"detail": "attachment downloads do not accept a query"},
                 status_code=422,
             )
-        if request.method.upper() in {"POST", "PUT", "PATCH"}:
+        if request.method.upper() in {"POST", "PUT", "PATCH", "DELETE"}:
             transport_error = (
                 secure_peer_attachment_put_transport_error(request)
                 if (
@@ -63914,7 +63917,7 @@ async def require_agent_token(request: Request, call_next):
             )
         if not request_exact_secure_peer_control_authorized(request):
             return JSONResponse({"detail": "unauthorized"}, status_code=401)
-        if request.method.upper() in {"POST", "PUT", "PATCH"}:
+        if request.method.upper() in {"POST", "PUT", "PATCH", "DELETE"}:
             transport_error = (
                 secure_peer_attachment_put_transport_error(request)
                 if secure_peer_attachment_route and request.method.upper() == "PUT"
@@ -64629,11 +64632,12 @@ async def secure_peer_route_revoke_endpoint(
 
 @app.get("/api/team-hub-secure/{connection_id}/{hub_path:path}")
 @app.post("/api/team-hub-secure/{connection_id}/{hub_path:path}")
+@app.delete("/api/team-hub-secure/{connection_id}/{hub_path:path}")
 @app.put("/api/team-hub-secure/{connection_id}/{hub_path:path}")
 @app.head("/api/team-hub-secure/{connection_id}/{hub_path:path}")
 @app.api_route(
     "/api/team-hub-secure/{connection_id}/{hub_path:path}",
-    methods=["GET", "POST", "PUT", "HEAD"],
+    methods=["GET", "POST", "DELETE", "PUT", "HEAD"],
     include_in_schema=False,
 )
 async def secure_peer_hub_proxy_endpoint(
@@ -64740,7 +64744,7 @@ async def secure_peer_hub_proxy_endpoint(
     # Content-Length and stream an unbounded chunked body; GET has no body in
     # this proxy contract, so the ASGI receive channel is intentionally left
     # unread and the response closes the request.
-    if request.method not in {"GET", "POST"}:
+    if request.method not in {"GET", "POST", "DELETE"}:
         raise HTTPException(status_code=404, detail="Resource not found")
     body = b"" if request.method == "GET" else await request.body()
     # Forward only ordinary content negotiation. The core token and any Hub

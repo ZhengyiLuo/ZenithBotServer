@@ -3160,7 +3160,7 @@ class SecurePeerRuntime:
                 adapter, hub_store = self._adapter, self._hub_store
             if adapter is None or hub_store is None:
                 raise SecurePeerError("hub_unavailable", "Team Hub is unavailable", 503)
-            if request.method in {"POST", "PUT"}:
+            if request.method in {"POST", "PUT", "DELETE"}:
                 # Snapshot/fence creation takes this exact lock.  A write
                 # therefore either commits before the snapshot begins or sees
                 # the durable fence and fails before mutation.
@@ -5880,6 +5880,37 @@ class SecurePeerRuntime:
         )
         return self._decoded_proxy_json(response)
 
+    def _team_hub_delete(
+        self,
+        realm: dict[str, Any],
+        path: str,
+        body: dict[str, Any],
+    ) -> dict[str, Any]:
+        if realm["realm"] == "host":
+            return self._team_host_call(realm, "DELETE", path, {}, body)
+        if not realm.get("can_write"):
+            raise SecurePeerError(
+                "forbidden",
+                "This server's Team Network connection is read-only",
+                403,
+            )
+        response = self.proxy(
+            str(realm["connection_id"]),
+            "DELETE",
+            path,
+            query="",
+            headers={
+                "accept": "application/json",
+                "content-type": "application/json",
+            },
+            body=json.dumps(
+                body,
+                ensure_ascii=False,
+                separators=(",", ":"),
+            ).encode("utf-8"),
+        )
+        return self._decoded_proxy_json(response)
+
     def _team_host_call(
         self,
         realm: dict[str, Any],
@@ -5915,12 +5946,33 @@ class SecurePeerRuntime:
                 after_sequence=int(query.get("after_sequence", "0")),
                 limit=int(query.get("limit", "50")),
             )
+        if method == "GET" and pieces == ["deletions"]:
+            return store.list_network_content_deletions(
+                claims,
+                team_id,
+                after_sequence=int(query.get("after_sequence", "0")),
+                limit=int(query.get("limit", "50")),
+            )
         if method == "GET" and len(pieces) == 2 and pieces[0] == "messages":
             return store.get_team_message(claims, team_id, pieces[1])
         if method == "POST" and pieces == ["messages"]:
             return store.create_team_message(claims, team_id, dict(body or {}))
         if method == "POST" and len(pieces) == 3 and pieces[0] == "messages" and pieces[2] == "receipts":
             return store.record_team_message_receipt(claims, team_id, pieces[1], dict(body or {}))
+        if method == "DELETE" and len(pieces) == 2 and pieces[0] == "messages":
+            return store.delete_team_message(
+                claims,
+                team_id,
+                pieces[1],
+                dict(body or {}),
+            )
+        if method == "DELETE" and len(pieces) == 2 and pieces[0] == "bulletin":
+            return store.delete_network_bulletin_post(
+                claims,
+                team_id,
+                pieces[1],
+                dict(body or {}),
+            )
         if method == "GET" and pieces == ["skills"]:
             return store.list_team_skills(
                 claims, team_id, include_archived=flag("include_archived"), slug=query.get("slug")
@@ -5969,6 +6021,56 @@ class SecurePeerRuntime:
         )
         result["team_id"] = realm["team_id"]
         return result
+
+    def team_list_deletions(
+        self,
+        *,
+        team_id: str | None = None,
+        after_sequence: int = 0,
+        limit: int = 50,
+    ) -> dict[str, Any]:
+        realm = self.team_realm(team_id)
+        result = self._team_hub_get(
+            realm,
+            f"/v1/teams/{quote(realm['team_id'], safe='')}/network/deletions",
+            {"after_sequence": after_sequence, "limit": limit},
+        )
+        result["team_id"] = realm["team_id"]
+        return result
+
+    def team_delete_message(
+        self,
+        message_id: str,
+        idempotency_key: str,
+        *,
+        team_id: str | None = None,
+    ) -> dict[str, Any]:
+        realm = self.team_realm(team_id)
+        team_path = (
+            f"/v1/teams/{quote(realm['team_id'], safe='')}/network/messages"
+        )
+        return self._team_hub_delete(
+            realm,
+            f"{team_path}/{quote(message_id, safe='')}",
+            {"idempotency_key": idempotency_key},
+        )
+
+    def team_delete_bulletin_post(
+        self,
+        post_id: str,
+        idempotency_key: str,
+        *,
+        team_id: str | None = None,
+    ) -> dict[str, Any]:
+        realm = self.team_realm(team_id)
+        team_path = (
+            f"/v1/teams/{quote(realm['team_id'], safe='')}/network/bulletin"
+        )
+        return self._team_hub_delete(
+            realm,
+            f"{team_path}/{quote(post_id, safe='')}",
+            {"idempotency_key": idempotency_key},
+        )
 
     def team_list_skills(self, *, include_archived: bool = False, team_id: str | None = None) -> dict[str, Any]:
         realm = self.team_realm(team_id)

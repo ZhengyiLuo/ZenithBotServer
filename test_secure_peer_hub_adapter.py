@@ -210,6 +210,321 @@ class SecurePeerHubAdapterTests(unittest.TestCase):
         )
         self.assertEqual(malformed.status, 422)
 
+    def test_server_author_can_delete_through_adapter_but_unrelated_peer_cannot(self) -> None:
+        created = self.request(
+            "POST",
+            f"/v1/teams/{self.team_id}/network/messages",
+            body={
+                "kind": "message",
+                "body": "server-authored deletion",
+                "body_format": "plain",
+                "recipients": [{"kind": "all"}],
+                "idempotency_key": "adapter-message-create-001",
+            },
+        )
+        self.assertEqual(created.status, 200, created.body)
+        message = json.loads(created.body)["message"]
+        self.assertEqual(message["sender"]["kind"], "server")
+
+        malformed = self.request(
+            "DELETE",
+            f"/v1/teams/{self.team_id}/network/messages/{message['id']}",
+            body={
+                "idempotency_key": "adapter-message-delete-bad",
+                "force": True,
+            },
+        )
+        self.assertEqual(malformed.status, 422, malformed.body)
+
+        deleted = self.request(
+            "DELETE",
+            f"/v1/teams/{self.team_id}/network/messages/{message['id']}",
+            body={"idempotency_key": "adapter-message-delete-001"},
+        )
+        self.assertEqual(deleted.status, 200, deleted.body)
+        self.assertEqual(
+            json.loads(deleted.body),
+            {"deleted": True, "message_id": message["id"]},
+        )
+        detail = self.request(
+            "GET",
+            f"/v1/teams/{self.team_id}/network/messages/{message['id']}",
+        )
+        self.assertEqual(detail.status, 404, detail.body)
+
+        bulletin = self.request(
+            "POST",
+            f"/v1/teams/{self.team_id}/network/bulletin",
+            body={
+                "body": "server-authored bulletin deletion",
+                "body_format": "plain",
+                "idempotency_key": "adapter-bulletin-create-001",
+            },
+        )
+        self.assertEqual(bulletin.status, 200, bulletin.body)
+        post_id = json.loads(bulletin.body)["post"]["id"]
+        deleted_bulletin = self.request(
+            "DELETE",
+            f"/v1/teams/{self.team_id}/network/bulletin/{post_id}",
+            body={"idempotency_key": "adapter-bulletin-delete-001"},
+        )
+        self.assertEqual(deleted_bulletin.status, 200, deleted_bulletin.body)
+        self.assertEqual(
+            json.loads(deleted_bulletin.body),
+            {"deleted": True, "post_id": post_id},
+        )
+
+        journal = self.request(
+            "GET",
+            f"/v1/teams/{self.team_id}/network/deletions",
+            query="after_sequence=0&limit=10",
+        )
+        self.assertEqual(journal.status, 200, journal.body)
+        journal_value = json.loads(journal.body)
+        self.assertEqual(
+            set(journal_value),
+            {"deletions", "next_after_sequence", "has_more"},
+        )
+        self.assertEqual(
+            [(item["kind"], item["id"]) for item in journal_value["deletions"]],
+            [("message", message["id"]), ("bulletin", post_id)],
+        )
+
+        owner_message = self.store.create_team_message(
+            self.owner,
+            self.team_id,
+            {
+                "kind": "message",
+                "body": "human-owned message",
+                "body_format": "plain",
+                "recipients": [{"kind": "all"}],
+                "idempotency_key": "adapter-owner-message-001",
+            },
+        )["message"]
+        forbidden = self.request(
+            "DELETE",
+            f"/v1/teams/{self.team_id}/network/messages/{owner_message['id']}",
+            body={"idempotency_key": "adapter-owner-delete-denied"},
+        )
+        self.assertEqual(forbidden.status, 403, forbidden.body)
+        self.assertEqual(json.loads(forbidden.body)["error"]["code"], "forbidden")
+
+    def test_repaired_peer_can_delete_message_authored_by_same_server_node(self) -> None:
+        created = self.request(
+            "POST",
+            f"/v1/teams/{self.team_id}/network/messages",
+            body={
+                "kind": "message",
+                "body": "survives peer credential rotation",
+                "body_format": "plain",
+                "recipients": [{"kind": "all"}],
+                "idempotency_key": "adapter-before-repair-create-1",
+            },
+        )
+        self.assertEqual(created.status, 200, created.body)
+        message = json.loads(created.body)["message"]
+        connection = self.store.connect()
+        try:
+            source = connection.execute(
+                "SELECT * FROM team_messages WHERE id=?",
+                (message["id"],),
+            ).fetchone()
+            self.assertIsNotNone(source)
+            source_before = dict(source)
+            old_principal_id = str(source["sender_principal_id"])
+            authoritative_node_id = str(source["sender_node_id"])
+        finally:
+            connection.close()
+
+        # A human member can address/read the managed host's Inbox, but that
+        # convenience must never turn into server authorship for deletion.
+        issued = self.store.issue_invite(
+            self.owner,
+            self.team_id,
+            "managed-address-member@example.com",
+            "member",
+            3_600,
+        )
+        human_bundle = self.store.redeem_invite(
+            issued["token"],
+            "managed-address-member@example.com",
+            "Managed address member",
+            "Member Mac",
+        )
+        human_claims = self.store.verify_access(human_bundle["access_token"])
+        self.store.managed_host_identity = self.peer.peer_server_identity
+        connection = self.store.connect()
+        try:
+            self.assertIn(
+                ("server", authoritative_node_id),
+                self.store._team_owned_addresses(
+                    connection,
+                    human_claims,
+                    self.team_id,
+                    "member",
+                ),
+            )
+        finally:
+            connection.close()
+        with self.assertRaises(HubError) as human_denied:
+            self.store.delete_team_message(
+                human_claims,
+                self.team_id,
+                message["id"],
+                {"idempotency_key": "human-managed-node-delete-denied"},
+            )
+        self.assertEqual(human_denied.exception.code, "forbidden")
+
+        # Another valid peer binding controls a different authoritative node
+        # and cannot claim this source. Swapping its signed identity snapshot
+        # to the source identity fails the exact binding check as well.
+        other_peer_id = str(uuid.uuid4())
+        other_peer = PeerAuthorization(
+            other_peer_id,
+            str(uuid.uuid4()),
+            "different-peer-server-identity",
+            self.team_id,
+            frozenset({"teamspace.read", "teamspace.write"}),
+            "sha256:" + "d" * 64,
+            int(time.time()) + 600,
+            "Different paired server",
+        )
+        self.adapter.provision_peer(
+            {
+                "peer_id": other_peer_id,
+                "peer_server_identity": other_peer.peer_server_identity,
+                "team_id": self.team_id,
+            },
+            display_name=other_peer.peer_display_name,
+        )
+        self.adapter.record_peer_heartbeat(other_peer_id, self.team_id)
+        other_denied = self.adapter.forward(
+            ProxyRequest(
+                "DELETE",
+                f"/v1/teams/{self.team_id}/network/messages/{message['id']}",
+                "",
+                (),
+                b'{"idempotency_key":"other-node-delete-denied"}',
+                other_peer,
+            )
+        )
+        self.assertEqual(other_denied.status, 403, other_denied.body)
+        forged_peer = PeerAuthorization(
+            other_peer.peer_id,
+            other_peer.pairing_id,
+            self.peer.peer_server_identity,
+            other_peer.team_id,
+            other_peer.scopes,
+            other_peer.certificate_fingerprint,
+            other_peer.certificate_expires_at,
+            other_peer.peer_display_name,
+        )
+        forged_denied = self.adapter.forward(
+            ProxyRequest(
+                "DELETE",
+                f"/v1/teams/{self.team_id}/network/messages/{message['id']}",
+                "",
+                (),
+                b'{"idempotency_key":"forged-node-delete-denied"}',
+                forged_peer,
+            )
+        )
+        self.assertEqual(forged_denied.status, 403, forged_denied.body)
+        self.assertEqual(
+            json.loads(forged_denied.body)["error"]["code"],
+            "forbidden",
+        )
+
+        self.adapter.revoke_peer(peer_id=self.peer_id, team_id=self.team_id)
+        repaired_peer_id = str(uuid.uuid4())
+        repaired_peer = PeerAuthorization(
+            repaired_peer_id,
+            str(uuid.uuid4()),
+            self.peer.peer_server_identity,
+            self.team_id,
+            frozenset({"teamspace.read", "teamspace.write"}),
+            "sha256:" + "c" * 64,
+            int(time.time()) + 600,
+            "Repaired paired server",
+        )
+        repaired_principal_id = self.adapter.provision_peer(
+            {
+                "peer_id": repaired_peer_id,
+                "peer_server_identity": repaired_peer.peer_server_identity,
+                "team_id": self.team_id,
+            },
+            display_name=repaired_peer.peer_display_name,
+        )
+        self.adapter.record_peer_heartbeat(repaired_peer_id, self.team_id)
+        self.assertNotEqual(repaired_principal_id, old_principal_id)
+        connection = self.store.connect()
+        try:
+            rebound = connection.execute(
+                "SELECT node_id,service_principal_id FROM network_peer_bindings "
+                "WHERE peer_id=? AND status='active'",
+                (repaired_peer_id,),
+            ).fetchone()
+            self.assertIsNotNone(rebound)
+            self.assertEqual(rebound["node_id"], authoritative_node_id)
+            self.assertEqual(rebound["service_principal_id"], repaired_principal_id)
+        finally:
+            connection.close()
+
+        deleted = self.adapter.forward(
+            ProxyRequest(
+                "DELETE",
+                f"/v1/teams/{self.team_id}/network/messages/{message['id']}",
+                "",
+                (),
+                json.dumps(
+                    {"idempotency_key": "adapter-after-repair-delete-1"}
+                ).encode(),
+                repaired_peer,
+            )
+        )
+        self.assertEqual(deleted.status, 200, deleted.body)
+        self.assertEqual(
+            json.loads(deleted.body),
+            {"deleted": True, "message_id": message["id"]},
+        )
+        replay = self.adapter.forward(
+            ProxyRequest(
+                "DELETE",
+                f"/v1/teams/{self.team_id}/network/messages/{message['id']}",
+                "",
+                (),
+                json.dumps(
+                    {"idempotency_key": "adapter-after-repair-delete-1"}
+                ).encode(),
+                repaired_peer,
+            )
+        )
+        self.assertEqual(replay.status, 200, replay.body)
+        self.assertEqual(replay.body, deleted.body)
+        connection = self.store.connect()
+        try:
+            self.assertEqual(
+                dict(
+                    connection.execute(
+                        "SELECT * FROM team_messages WHERE id=?",
+                        (message["id"],),
+                    ).fetchone()
+                ),
+                source_before,
+            )
+            tombstone = connection.execute(
+                "SELECT deleted_by_principal_id FROM network_content_deletions "
+                "WHERE resource_kind='message' AND resource_id=?",
+                (message["id"],),
+            ).fetchall()
+            self.assertEqual(len(tombstone), 1)
+            self.assertEqual(
+                tombstone[0]["deleted_by_principal_id"],
+                repaired_principal_id,
+            )
+        finally:
+            connection.close()
+
     def test_revocation_is_checked_again_for_every_request(self) -> None:
         self.adapter.revoke_peer(peer_id=self.peer_id, team_id=self.team_id)
         denied = self.request("GET", "/v1/teams")

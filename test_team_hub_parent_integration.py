@@ -698,6 +698,82 @@ class TeamHubParentIntegrationTests(unittest.TestCase):
                     )
 
                     team_id = first.json()["teams"][0]["id"]
+                    message = client.post(
+                        f"/api/team-hub-server/v1/teams/{team_id}/network/messages",
+                        headers=headers,
+                        json={
+                            "kind": "message",
+                            "body": "server-session deletion",
+                            "body_format": "plain",
+                            "recipients": [{"kind": "all"}],
+                            "idempotency_key": "server-session-message-create-1",
+                        },
+                    )
+                    self.assertEqual(message.status_code, 200, message.text)
+                    message_id = message.json()["message"]["id"]
+                    deleted_message = client.request(
+                        "DELETE",
+                        f"/api/team-hub-server/v1/teams/{team_id}/network/messages/{message_id}",
+                        headers=headers,
+                        json={"idempotency_key": "server-session-message-delete-1"},
+                    )
+                    self.assertEqual(
+                        deleted_message.status_code,
+                        200,
+                        deleted_message.text,
+                    )
+                    self.assertEqual(
+                        deleted_message.json(),
+                        {"deleted": True, "message_id": message_id},
+                    )
+                    bulletin = client.post(
+                        f"/api/team-hub-server/v1/teams/{team_id}/network/bulletin",
+                        headers=headers,
+                        json={
+                            "body": "server-session bulletin deletion",
+                            "body_format": "plain",
+                            "idempotency_key": "server-session-bulletin-create-1",
+                        },
+                    )
+                    self.assertEqual(bulletin.status_code, 200, bulletin.text)
+                    post_id = bulletin.json()["post"]["id"]
+                    deleted_bulletin = client.request(
+                        "DELETE",
+                        f"/api/team-hub-server/v1/teams/{team_id}/network/bulletin/{post_id}",
+                        headers=headers,
+                        json={"idempotency_key": "server-session-bulletin-delete-1"},
+                    )
+                    self.assertEqual(
+                        deleted_bulletin.status_code,
+                        200,
+                        deleted_bulletin.text,
+                    )
+                    self.assertEqual(
+                        deleted_bulletin.json(),
+                        {"deleted": True, "post_id": post_id},
+                    )
+                    journal = client.get(
+                        f"/api/team-hub-server/v1/teams/{team_id}/network/deletions"
+                        "?after_sequence=0&limit=10",
+                        headers=headers,
+                    )
+                    self.assertEqual(journal.status_code, 200, journal.text)
+                    self.assertEqual(
+                        [(item["kind"], item["id"]) for item in journal.json()["deletions"]],
+                        [("message", message_id), ("bulletin", post_id)],
+                    )
+                    disallowed_delete = client.request(
+                        "DELETE",
+                        f"/api/team-hub-server/v1/teams/{team_id}/network/messages",
+                        headers=headers,
+                        json={"idempotency_key": "server-session-wrong-route-1"},
+                    )
+                    self.assertEqual(
+                        disallowed_delete.status_code,
+                        404,
+                        disallowed_delete.text,
+                    )
+
                     attachment_bytes = b"server-session attachment"
                     attachment = client.post(
                         f"/api/team-hub-server/v1/teams/{team_id}/network/attachments",

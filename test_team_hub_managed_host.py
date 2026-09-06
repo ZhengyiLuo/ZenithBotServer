@@ -722,6 +722,7 @@ sys.exit(10)
             ):
                 connection.execute(f"DROP INDEX {index}")
             for table in (
+                "network_content_deletions",
                 "human_admin_page_entries",
                 "team_attachment_cleanup_queue",
                 "team_skill_versions",
@@ -773,6 +774,7 @@ sys.exit(10)
             ):
                 connection.execute(f"DROP INDEX {index}")
             for table in (
+                "network_content_deletions",
                 "human_admin_page_entries",
                 "team_attachment_cleanup_queue",
                 "team_skill_versions",
@@ -2035,7 +2037,7 @@ sys.exit(10)
             self.assertEqual(migrated.bootstrap_proof_path.read_bytes(), expected_proof)
             connection = migrated.connect()
             try:
-                self.assertEqual(connection.execute("PRAGMA user_version").fetchone()[0], 11)
+                self.assertEqual(connection.execute("PRAGMA user_version").fetchone()[0], 12)
                 self.assertEqual(
                     connection.execute(
                         "SELECT count(*) FROM bootstrap_delegations"
@@ -2129,7 +2131,7 @@ sys.exit(10)
                 try:
                     self.assertEqual(
                         connection.execute("PRAGMA user_version").fetchone()[0],
-                        11,
+                        12,
                     )
                     preserved = connection.execute(
                         "SELECT * FROM channels WHERE id=?", (old_board_id,)
