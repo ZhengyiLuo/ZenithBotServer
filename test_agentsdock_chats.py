@@ -440,25 +440,16 @@ class AgentsDockChatsCLITests(unittest.TestCase):
         self.assertIn("lease_id=lease_", wait_path)
         self.assertEqual(get.call_args.kwargs["timeout"], 90)
 
-    def test_ask_reports_timeout_fallback_as_accepted_async_delivery(self) -> None:
+    def test_route_ask_returns_after_durable_acceptance_without_live_wait(self) -> None:
         route = "route_" + "a" * 32
-        post = Mock(return_value={
+        receipt = {
             "ok": True,
             "route_id": route,
             "action": "request_reply",
             "accepted": True,
-            "exchange_id": "exchange_deferred",
-            "inbound_leg_id": "leg_question",
-            "live_response_lease_id": "lease_" + "b" * 32,
-        })
-        get = Mock(return_value={
-            "ok": True,
-            "exchange_id": "exchange_deferred",
-            "inbound_leg_id": "leg_question",
-            "deferred": True,
-            "delivery": "asynchronous",
-            "message": "The answer will be delivered asynchronously.",
-        })
+        }
+        post = Mock(return_value=receipt)
+        get = Mock()
         args = argparse.Namespace(
             authority_file="authority.json",
             route=route,
@@ -475,12 +466,13 @@ class AgentsDockChatsCLITests(unittest.TestCase):
         ):
             result = agentsdock_chats.ask(args)
 
-        self.assertTrue(result["accepted"])
-        self.assertTrue(result["deferred"])
-        self.assertEqual(result["delivery"], "asynchronous")
-        self.assertNotIn("body", result)
+        self.assertEqual(result, receipt)
+        payload = post.call_args.args[1]
+        self.assertNotIn("wait_for_response", payload)
+        self.assertNotIn("response_timeout_seconds", payload)
+        get.assert_not_called()
 
-    def test_ask_rejects_server_without_live_wait_support(self) -> None:
+    def test_route_ask_accepts_minimal_async_receipt(self) -> None:
         args = argparse.Namespace(
             authority_file="authority.json",
             route="route_" + "a" * 32,
@@ -489,24 +481,21 @@ class AgentsDockChatsCLITests(unittest.TestCase):
             idempotency_key=None,
             timeout_seconds=75,
         )
+        receipt = {
+            "ok": True,
+            "route_id": args.route,
+            "action": "request_reply",
+            "accepted": True,
+        }
         with (
             patch.object(agentsdock_chats, "authority", return_value="capability"),
             patch.object(
                 agentsdock_chats,
                 "post_json",
-                return_value={
-                    "ok": True,
-                    "route_id": args.route,
-                    "action": "request_reply",
-                    "accepted": True,
-                },
+                return_value=receipt,
             ),
         ):
-            with self.assertRaisesRegex(
-                agentsdock_chats.ChatsCLIError,
-                "does not support a live response",
-            ):
-                agentsdock_chats.ask(args)
+            self.assertEqual(agentsdock_chats.ask(args), receipt)
 
     def test_secure_peer_ask_can_explicitly_use_async_response_delivery(self) -> None:
         args = argparse.Namespace(

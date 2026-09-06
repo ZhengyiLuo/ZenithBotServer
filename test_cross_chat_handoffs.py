@@ -5055,14 +5055,14 @@ class CrossChatStoreTests(unittest.IsolatedAsyncioTestCase):
             if lock.locked():
                 lock.release()
 
-    def test_exchange_capability_v10_default_deny_contract_is_exact(self) -> None:
+    def test_exchange_capability_v11_default_deny_contract_is_exact(self) -> None:
         with (
             patch.object(agent_server, "CODEX_TRANSPORT", agent_server.CODEX_TRANSPORT_APP_SERVER),
             patch.object(agent_server, "CLAUDE_TRANSPORT", agent_server.CLAUDE_TRANSPORT_AGENT_SDK),
         ):
             capability = agent_server.cross_chat_handoffs_capability()
         self.assertTrue(capability["available"])
-        self.assertEqual(capability["version"], 10)
+        self.assertEqual(capability["version"], 11)
         self.assertEqual(
             capability["actions"],
             [
@@ -5080,6 +5080,9 @@ class CrossChatStoreTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(capability["features"]["route_hint_mentions"])
         self.assertTrue(capability["features"]["durable_route_grants"])
         self.assertTrue(capability["features"]["agent_cross_chat_routes"])
+        self.assertTrue(
+            capability["features"]["configured_route_async_request_reply"]
+        )
         self.assertTrue(
             capability["features"]["live_same_server_request_reply"]
         )
@@ -5116,6 +5119,7 @@ class CrossChatStoreTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(capability["agent_routes"]["max_routes_per_chat"], 16)
         self.assertFalse(capability["agent_routes"]["transcript_access"])
         self.assertEqual(capability["agent_routes"]["policy"], "default_deny")
+        self.assertTrue(capability["agent_routes"]["same_server_only"])
         self.assertTrue(capability["agent_routes"]["durable"])
         self.assertTrue(capability["agent_routes"]["directional"])
         self.assertTrue(

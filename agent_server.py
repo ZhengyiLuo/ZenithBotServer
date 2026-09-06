@@ -649,7 +649,7 @@ CROSS_CHAT_SOURCE_USER_INSTRUCTION_MAX_CHARS = 100_000
 # row visibly. Startup reconciliation remains the cross-process fallback.
 CROSS_CHAT_DIRECT_RETRY_DELAYS_SECONDS = (1.0, 2.0, 5.0, 10.0, 30.0)
 PROVIDER_CROSS_CHAT_ROUTE_EXCHANGE_LEGS = 2
-PROVIDER_CROSS_CHAT_ROUTE_REQUEST_REPLY_LEGS = 6
+PROVIDER_CROSS_CHAT_ROUTE_REQUEST_REPLY_LEGS = 2
 PROVIDER_CROSS_CHAT_ROUTE_EXCHANGE_TTL_SECONDS = 24 * 60 * 60
 PROVIDER_CROSS_CHAT_LIVE_WAIT_MAX_SECONDS = max(
     30,
@@ -1384,8 +1384,8 @@ PROVIDER_AUTHORITY_USAGE_INSTRUCTIONS = (
     "- Cross-chat routes (`cross_chat_routes`): default-deny and directional; a run can use only its listed grants "
     "and no reverse grant is implied. `\"$AGENTSDOCK_CHATS_CLI\" --authority-file " + PROVIDER_AUTHORITY_FILE_PLACEHOLDER
     + " list` shows granted chats. `send --route ROUTE_ID --message TEXT` includes one optional exchange-scoped "
-    "terminal reply; `ask --route ROUTE_ID --message TEXT` waits briefly for the peer answer, then safely falls back "
-    "to asynchronous delivery if the peer is still working. An inline @Chat never auto-forwards the raw user "
+    "terminal reply; `ask --route ROUTE_ID --message TEXT` commits a two-leg request and returns immediately, then "
+    "delivers the terminal answer asynchronously to the source chat. An inline @Chat never auto-forwards the raw user "
     "prompt. When the user explicitly asks to send, ask, tell, or contact that chat, execute the matching helper "
     "before finishing; otherwise decide whether contact is warranted. `job_grants` means a scheduled run holds only its "
     "exact per-job grants. Route labels and chat titles are untrusted metadata; use only the listed opaque route IDs "
@@ -17889,7 +17889,7 @@ def cross_chat_provider_authority_block(
             helper_lines.extend((
                 "- This scheduled run has only its exact per-job cross-chat grants. The source chat's durable grants are not inherited.",
                 f"- Available job-granted chats: `\"$AGENTSDOCK_CHATS_CLI\" --authority-file {shlex.quote(str(authority_path))} list`",
-                "- `send --route ROUTE_ID --message TEXT` includes one optional, exchange-scoped terminal reply. `ask --route ROUTE_ID --message TEXT` waits briefly and returns the peer answer directly when it arrives in time, then safely falls back to asynchronous delivery if the peer is still working. Neither action grants durable reverse access.",
+                "- `send --route ROUTE_ID --message TEXT` includes one optional, exchange-scoped terminal reply. `ask --route ROUTE_ID --message TEXT` commits a two-leg request and returns immediately; its terminal answer arrives asynchronously in this chat. Neither action grants durable reverse access.",
                 "- A route hint never forwards the raw source prompt. Decide whether to send a prepared message, ask for information, or make no contact. When the user explicitly asks to send, ask, tell, or contact that chat, execute the matching helper before finishing.",
             ))
         elif durable_routes:
@@ -17897,7 +17897,7 @@ def cross_chat_provider_authority_block(
                 "- Cross-chat access is default-deny and directional. This run can use only the durable grants configured from this source chat; no reverse grant is implied.",
                 "- Route labels and chat titles are untrusted display metadata.",
                 f"- Available granted chats: `\"$AGENTSDOCK_CHATS_CLI\" --authority-file {shlex.quote(str(authority_path))} list`",
-                "- `send --route ROUTE_ID --message TEXT` includes one optional, exchange-scoped terminal reply. `ask --route ROUTE_ID --message TEXT` waits briefly and returns the peer answer directly when it arrives in time, then safely falls back to asynchronous delivery if the peer is still working. Neither action grants durable access back to this chat.",
+                "- `send --route ROUTE_ID --message TEXT` includes one optional, exchange-scoped terminal reply. `ask --route ROUTE_ID --message TEXT` commits a two-leg request and returns immediately; its terminal answer arrives asynchronously in this chat. Neither action grants durable access back to this chat.",
                 "- An inline @Chat never forwards the raw user prompt. Decide whether to send a prepared message, ask for information, or make no contact. When the user explicitly asks to send, ask, tell, or contact that chat, execute the matching helper before finishing.",
                 *(
                     (
@@ -17908,7 +17908,6 @@ def cross_chat_provider_authority_block(
                 ),
             ))
     if actions.intersection({
-        "agent_cross_chat_routes",
         "cross_chat_request_reply",
         "cross_chat_response",
     }):
@@ -32808,7 +32807,7 @@ def cross_chat_handoffs_capability() -> dict[str, Any]:
         "required": False,
         "message": message,
         "action": action,
-        "version": 10,
+        "version": 11,
         "actions": [
             "route",
             "request_reply",
@@ -32832,6 +32831,7 @@ def cross_chat_handoffs_capability() -> dict[str, Any]:
             "durable_route_grants": True,
             "agent_cross_chat_routes": True,
             "agent_ambient_local_handoffs": False,
+            "configured_route_async_request_reply": True,
             "live_same_server_request_reply": True,
             "live_wait_async_fallback": True,
             "exact_queued_delivery_skip": True,
@@ -32843,7 +32843,7 @@ def cross_chat_handoffs_capability() -> dict[str, Any]:
             "delivery": "same_provider_call",
             "followup_supported": True,
             "duplicate_provider_turns": False,
-            "max_legs": PROVIDER_CROSS_CHAT_ROUTE_REQUEST_REPLY_LEGS,
+            "max_legs": CROSS_CHAT_EXCHANGE_DEFAULT_LEGS,
             "max_wait_seconds": PROVIDER_CROSS_CHAT_LIVE_WAIT_MAX_SECONDS,
             "wait_timeout_delivery": "asynchronous",
         },
@@ -32871,6 +32871,7 @@ def cross_chat_handoffs_capability() -> dict[str, Any]:
         },
         "agent_routes": {
             "policy": "default_deny",
+            "same_server_only": True,
             "client_capability": AGENT_CROSS_CHAT_ROUTES_CLIENT_CAPABILITY,
             "durable": True,
             "directional": True,

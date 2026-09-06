@@ -905,7 +905,7 @@ represent second 60.
 
 ## Cross-chat handoffs
 
-### Current route-hint contract (API contract 27, capability v10)
+### Current route-hint contract (API contract 27, capability v11)
 
 An inline structured `@Chat` is an optional target hint. It never forwards the
 raw user prompt. On successful ordinary-turn admission, an exact local
@@ -918,9 +918,17 @@ mentions remain optional. Every accepted configured-route Send carries one optio
 reply path back to its immutable source; it creates no reply obligation, never
 automatically relays the target's ordinary final answer, cannot request a
 follow-up, and grants no durable reverse route. Ask explicitly requests one
-terminal answer over the same exchange-scoped return mechanism: it waits
-briefly for a direct response, then atomically falls back to durable
-asynchronous delivery without cancelling the recipient's work.
+terminal answer over the same exchange-scoped return mechanism. It commits
+immediately as a durable two-leg agent message; the answer returns later as a
+normal queued delivery in the source chat, without holding either provider
+call open.
+
+Active agent messaging is strictly same-server: Studio chats can address only
+Studio chats, and Sonic chats can address only Sonic chats. Communication
+between servers uses passive Team Network Inbox messages (`server`, `human`,
+or `all` recipients); it never wakes an agent or creates an active cross-chat
+exchange.
+
 `/chat` is a composer alias for selecting the same structured hint.
 
 Scheduled runs never inherit the source chat's grants. Each job stores its own
@@ -928,10 +936,11 @@ exact route selection, authorized by route ID in the job editor/helper flow,
 and revalidates its target, revision, and action on every firing. Its prompt
 contains the corresponding exact single `@Chat` marker for display and
 binding; no `@@` authoring syntax is required. The health surface advertises
-cross-chat version 10, `durable_route_grants`, configured-route
+cross-chat version 11, `durable_route_grants`, configured-route
 `instruction_reply_once`, `live_wait_async_fallback`,
 `agent_ambient_local_handoffs: false`, scheduled Jobs version 5, and global
-API contract 27.
+API contract 27. Capability v11 additionally advertises
+`configured_route_async_request_reply`.
 
 Capability v10 retains this reply-once behavior for existing
 configured `instruction` grants as well as newly created ones. The return path
@@ -969,10 +978,8 @@ message. Send creates a correlated two-leg exchange with one optional terminal
 reply capability available only to its exact delivery run. If the target does
 not deliberately use that capability, its ordinary final stays local and the
 exchange closes without sending anything back. Ask creates the same bounded
-exchange, initially returns the answer directly when it is ready within the
-wait window, retains that exact result briefly for safe GET replay, and
-otherwise returns an accepted/deferred receipt while the answer or failure
-status is delivered asynchronously to the source chat.
+two-leg exchange, returns an accepted receipt immediately, and delivers the
+answer or failure status asynchronously to the source chat.
 
 ### Historical action-specific grants (v1-v2)
 

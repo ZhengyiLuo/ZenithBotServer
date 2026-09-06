@@ -324,8 +324,13 @@ def send_action(args: argparse.Namespace, action: str) -> dict[str, Any]:
     if bool(route) == bool(target):
         raise ChatsCLIError("provide exactly one of --route or --target")
     destination = route if route else target
+    # Current durable --route asks are agent messages, not an interactive
+    # provider-to-provider RPC. Commit them immediately and let the correlated
+    # answer return through the source chat's normal FIFO. Historical one-use
+    # --target request/reply handles retain their live-call compatibility.
     live_wait = (
         action == "request_reply"
+        and not route
         and not bool(getattr(args, "async_response", False))
     )
     stable_key = "cli_" + hashlib.sha256(

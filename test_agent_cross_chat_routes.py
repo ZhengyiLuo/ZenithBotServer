@@ -2012,7 +2012,7 @@ class AgentCrossChatRouteTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn(source_instruction, reply_prompt)
         self.assertIn("[Agent-prepared handoff message]", initial_prompt)
         self.assertIn("[Agent-prepared reply/result]", reply_prompt)
-        self.assertIn("kind=reply leg=2/6", reply_prompt)
+        self.assertIn("kind=reply leg=2/2", reply_prompt)
         instructions = agent_server.CROSS_CHAT_DELIVERY_INSTRUCTIONS
         self.assertIn("result content for continuing that task", instructions)
         self.assertIn("not a second task addressed wholesale", instructions)
@@ -2600,7 +2600,7 @@ class AgentCrossChatRouteTests(unittest.IsolatedAsyncioTestCase):
             request.prompt,
         )
 
-    async def test_route_ask_is_atomic_and_bounded_with_followup_copy(self) -> None:
+    async def test_route_ask_is_atomic_async_and_terminal_reply_only(self) -> None:
         route = self.route("a", actions=["request_reply"])
         agent_server.STORE.sessions["source"]["provider_cross_chat_routes"] = [route]
         _token, request = await self.issue("run_ask", [route])
@@ -2630,18 +2630,18 @@ class AgentCrossChatRouteTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(exchanges), 1)
         exchange = exchanges[0]
         legs = await agent_server.CROSS_CHAT.exchange_legs(exchange["id"])
-        self.assertEqual(exchange["max_legs"], 6)
+        self.assertEqual(exchange["max_legs"], 2)
         self.assertEqual(exchange["authorization_kind"], "configured_route")
         self.assertEqual(exchange["authorization_route_id"], route["route_id"])
         self.assertEqual(len(legs), 1)
         prompt = agent_server.cross_chat_exchange_delivery_prompt(exchange, legs[0])
-        self.assertIn("if a reply or follow-up is needed", prompt)
+        self.assertIn("exactly one terminal response remains", prompt)
         self.assertNotIn(exchange["id"], prompt)
         self.assertNotIn(legs[0]["id"], prompt)
         self.assertNotIn(route["route_id"], prompt)
         self.assertNotIn("Source chat ID:", prompt)
         self.assertIn(
-            "[AgentsDock delivery kind=request leg=1/6 origin=route from=Source]",
+            "[AgentsDock delivery kind=request leg=1/2 origin=route from=Source]",
             prompt,
         )
         response_prompt = agent_server.cross_chat_exchange_delivery_prompt(
@@ -2656,7 +2656,7 @@ class AgentCrossChatRouteTests(unittest.IsolatedAsyncioTestCase):
             },
         )
         self.assertIn(
-            "[AgentsDock delivery kind=reply leg=2/6 origin=route from=Target]",
+            "[AgentsDock delivery kind=reply leg=2/2 origin=route from=Target]",
             response_prompt,
         )
         for private_value in (
@@ -2680,13 +2680,10 @@ class AgentCrossChatRouteTests(unittest.IsolatedAsyncioTestCase):
             provider_route_snapshot=[route],
         )
         self.assertIn("exchange-scoped terminal reply", source_copy)
-        self.assertIn("returns the peer answer directly", source_copy)
+        self.assertIn("returns immediately", source_copy)
+        self.assertIn("arrives asynchronously", source_copy)
         self.assertIn("Neither action grants durable access", source_copy)
-        self.assertIn(
-            "--exchange EXCHANGE_ID --inbound-leg INBOUND_LEG_ID",
-            source_copy,
-        )
-        self.assertIn("exact opaque values returned", source_copy)
+        self.assertNotIn("--exchange EXCHANGE_ID", source_copy)
         await agent_server.CROSS_CHAT.update_exchange_leg(
             legs[0]["id"],
             expected={"registered"},
@@ -2699,16 +2696,19 @@ class AgentCrossChatRouteTests(unittest.IsolatedAsyncioTestCase):
                 inbound_leg_id=legs[0]["id"],
                 source_session_id="target",
                 source_run_id="run_route_target",
-                body="One bounded follow-up",
-                request_response=True,
-                idempotency_key="route-followup-key",
+                body="The terminal answer",
+                request_response=False,
+                idempotency_key="route-terminal-key",
                 automatic=False,
             )
         )
         self.assertTrue(created)
-        self.assertEqual(continued["max_legs"], 6)
+        self.assertEqual(continued["max_legs"], 2)
         self.assertEqual(continued["used_legs"], 2)
-        self.assertTrue(bool(followup["expects_reply"]))
+        # The exchange closes when the terminal leg is delivered, not merely
+        # registered, so recovery can still account for that queued work.
+        self.assertEqual(continued["status"], "active")
+        self.assertFalse(bool(followup["expects_reply"]))
 
     async def test_configured_route_response_receipt_is_strictly_minimal(self) -> None:
         route = self.route("a", actions=["request_reply"])
