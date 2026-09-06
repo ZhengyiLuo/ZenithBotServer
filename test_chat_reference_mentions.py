@@ -87,6 +87,7 @@ class ChatReferenceMentionTests(unittest.IsolatedAsyncioTestCase):
             target_route_revision="rev_" + "d" * 32,
         )
         with (
+            patch.object(agent_server, "AGENT_TOKEN", "token"),
             patch.object(agent_server, "SECURE_PEER_AGENT_RELAY_ENABLED", False),
             patch.object(agent_server.STORE, "sessions", self.sessions),
             patch.object(
@@ -167,6 +168,7 @@ class ChatReferenceMentionTests(unittest.IsolatedAsyncioTestCase):
         }
         submit = Mock()
         with (
+            patch.object(agent_server, "AGENT_TOKEN", "token"),
             patch.object(agent_server, "SECURE_PEER_AGENT_RELAY_ENABLED", False),
             patch.object(
                 agent_server,
