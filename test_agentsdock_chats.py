@@ -370,7 +370,7 @@ class AgentsDockChatsCLITests(unittest.TestCase):
         self.assertIs(opener.requests[0][0], opener.requests[1][0])
         sleep.assert_called_once_with(0.1)
 
-    def test_live_post_socket_timeout_outlives_server_lease(self) -> None:
+    def test_live_post_returns_lease_on_bounded_transport_timeout(self) -> None:
         class FakeResponse:
             def __enter__(self):
                 return self
@@ -401,7 +401,7 @@ class AgentsDockChatsCLITests(unittest.TestCase):
                 },
                 "capability",
             )
-        self.assertEqual(opener.timeout, 135.0)
+        self.assertEqual(opener.timeout, 30)
 
     def test_ask_posts_then_long_polls_exact_live_lease(self) -> None:
         post = Mock(return_value={
@@ -438,18 +438,29 @@ class AgentsDockChatsCLITests(unittest.TestCase):
         wait_path = get.call_args.args[0]
         self.assertIn("exchange_live/legs/leg_question/live-response?", wait_path)
         self.assertIn("lease_id=lease_", wait_path)
-        self.assertEqual(get.call_args.kwargs["timeout"], 90)
+        self.assertEqual(get.call_args.kwargs["timeout"], 75)
+        self.assertTrue(get.call_args.kwargs["retry_forever"])
+        self.assertIn("timeout_seconds=60", wait_path)
 
-    def test_route_ask_returns_after_durable_acceptance_without_live_wait(self) -> None:
+    def test_route_ask_waits_on_the_exact_live_lease(self) -> None:
         route = "route_" + "a" * 32
         receipt = {
             "ok": True,
             "route_id": route,
             "action": "request_reply",
             "accepted": True,
+            "exchange_id": "exchange_route_live",
+            "inbound_leg_id": "leg_route_question",
+            "live_response_lease_id": "lease_" + "b" * 32,
         }
         post = Mock(return_value=receipt)
-        get = Mock()
+        get = Mock(return_value={
+            "ok": True,
+            "exchange_id": "exchange_route_live",
+            "inbound_leg_id": "leg_route_answer",
+            "body": "Route answer",
+            "request_response": False,
+        })
         args = argparse.Namespace(
             authority_file="authority.json",
             route=route,
@@ -466,13 +477,13 @@ class AgentsDockChatsCLITests(unittest.TestCase):
         ):
             result = agentsdock_chats.ask(args)
 
-        self.assertEqual(result, receipt)
+        self.assertEqual(result["body"], "Route answer")
         payload = post.call_args.args[1]
-        self.assertNotIn("wait_for_response", payload)
-        self.assertNotIn("response_timeout_seconds", payload)
-        get.assert_not_called()
+        self.assertTrue(payload["wait_for_response"])
+        self.assertEqual(payload["response_timeout_seconds"], 75)
+        get.assert_called_once()
 
-    def test_route_ask_accepts_minimal_async_receipt(self) -> None:
+    def test_route_ask_accepts_minimal_receipt_only_in_explicit_async_mode(self) -> None:
         args = argparse.Namespace(
             authority_file="authority.json",
             route="route_" + "a" * 32,
@@ -480,6 +491,7 @@ class AgentsDockChatsCLITests(unittest.TestCase):
             message="Question",
             idempotency_key=None,
             timeout_seconds=75,
+            async_response=True,
         )
         receipt = {
             "ok": True,
@@ -496,6 +508,301 @@ class AgentsDockChatsCLITests(unittest.TestCase):
             ),
         ):
             self.assertEqual(agentsdock_chats.ask(args), receipt)
+
+    def test_live_wait_repeats_pending_heartbeats_until_the_answer(self) -> None:
+        receipt = {
+            "exchange_id": "exchange_heartbeat",
+            "inbound_leg_id": "leg_question",
+            "live_response_lease_id": "lease_" + "d" * 32,
+        }
+        pending = {
+            "ok": True,
+            "exchange_id": "exchange_heartbeat",
+            "inbound_leg_id": "leg_question",
+            "pending": True,
+        }
+        answer = {
+            "ok": True,
+            "exchange_id": "exchange_heartbeat",
+            "inbound_leg_id": "leg_answer",
+            "body": "Eventually answered",
+            "request_response": False,
+        }
+        # Four complete 20-second heartbeat windows model a response arriving
+        # after the old 75-second semantic timeout without making the unit
+        # test sleep in real time.
+        get = Mock(side_effect=[pending, pending, pending, pending, answer])
+        with patch.object(agentsdock_chats, "get_json", get):
+            result = agentsdock_chats.await_live_response(
+                receipt,
+                "capability",
+                20,
+            )
+
+        self.assertEqual(result, answer)
+        self.assertEqual(get.call_count, 5)
+        self.assertEqual({call.args[0] for call in get.call_args_list}, {
+            get.call_args_list[0].args[0],
+        })
+        self.assertTrue(all(
+            call.kwargs["retry_forever"] for call in get.call_args_list
+        ))
+
+    def test_cli_timeout_one_waits_past_old_limit_until_eventual_answer(self) -> None:
+        route = "route_" + "e" * 32
+        post = Mock(return_value={
+            "ok": True,
+            "route_id": route,
+            "action": "request_reply",
+            "accepted": True,
+            "exchange_id": "exchange_cli_heartbeat",
+            "inbound_leg_id": "leg_cli_question",
+            "live_response_lease_id": "lease_" + "f" * 32,
+        })
+        pending = {
+            "ok": True,
+            "exchange_id": "exchange_cli_heartbeat",
+            "inbound_leg_id": "leg_cli_question",
+            "pending": True,
+        }
+        answer = {
+            "ok": True,
+            "exchange_id": "exchange_cli_heartbeat",
+            "inbound_leg_id": "leg_cli_answer",
+            "body": "Answer after more than the old timeout",
+            "request_response": False,
+        }
+        # The legacy value is now a one-second heartbeat request, not a total
+        # deadline. Seventy-six pending responses cross the old 75-second
+        # semantic cap before the same lease eventually returns its answer.
+        get = Mock(side_effect=[pending] * 76 + [answer])
+        stdout = io.StringIO()
+        with (
+            patch.object(agentsdock_chats, "authority", return_value="capability"),
+            patch.object(agentsdock_chats, "post_json", post),
+            patch.object(agentsdock_chats, "get_json", get),
+            patch.object(agentsdock_chats.sys, "stdout", stdout),
+        ):
+            exit_code = agentsdock_chats.main([
+                "--authority-file",
+                "authority.json",
+                "ask",
+                "--route",
+                route,
+                "--message",
+                "Wait as long as necessary",
+                "--timeout-seconds",
+                "1",
+            ])
+
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(json.loads(stdout.getvalue())["body"], answer["body"])
+        self.assertEqual(post.call_args.args[1]["response_timeout_seconds"], 1)
+        self.assertEqual(get.call_count, 77)
+        self.assertEqual(
+            {call.args[0] for call in get.call_args_list},
+            {get.call_args_list[0].args[0]},
+        )
+        self.assertTrue(all(
+            "timeout_seconds=1" in call.args[0]
+            and call.kwargs["timeout"] == 16
+            and call.kwargs["retry_forever"] is True
+            for call in get.call_args_list
+        ))
+
+    def test_cli_explicit_410_cancel_is_terminal(self) -> None:
+        route = "route_" + "a" * 32
+        post = Mock(return_value={
+            "ok": True,
+            "route_id": route,
+            "action": "request_reply",
+            "accepted": True,
+            "exchange_id": "exchange_cli_cancel",
+            "inbound_leg_id": "leg_cli_cancel",
+            "live_response_lease_id": "lease_" + "b" * 32,
+        })
+        get = Mock(side_effect=agentsdock_chats.ChatsCLIError(
+            "server rejected request (410): cancelled_by_user"
+        ))
+        stderr = io.StringIO()
+        with (
+            patch.object(agentsdock_chats, "authority", return_value="capability"),
+            patch.object(agentsdock_chats, "post_json", post),
+            patch.object(agentsdock_chats, "get_json", get),
+            patch.object(agentsdock_chats.sys, "stderr", stderr),
+        ):
+            exit_code = agentsdock_chats.main([
+                "--authority-file",
+                "authority.json",
+                "ask",
+                "--route",
+                route,
+                "--message",
+                "Wait until cancel",
+                "--timeout-seconds",
+                "1",
+            ])
+
+        self.assertEqual(exit_code, 2)
+        self.assertIn("cancelled_by_user", stderr.getvalue())
+        get.assert_called_once()
+
+    def test_live_get_retries_transport_gateway_and_disconnect_failures(self) -> None:
+        class FakeResponse:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return None
+
+            def read(self):
+                return json.dumps({"ok": True, "pending": True}).encode("utf-8")
+
+        class FakeOpener:
+            def __init__(self) -> None:
+                self.requests = []
+
+            def open(self, request, timeout):
+                self.requests.append((request, timeout))
+                if len(self.requests) == 1:
+                    raise urllib.error.URLError(
+                        ConnectionResetError("proxy reset")
+                    )
+                if len(self.requests) == 2:
+                    raise urllib.error.HTTPError(
+                        request.full_url,
+                        503,
+                        "Service Unavailable",
+                        {},
+                        io.BytesIO(b'{"detail":"restarting"}'),
+                    )
+                if len(self.requests) == 3:
+                    raise urllib.error.HTTPError(
+                        request.full_url,
+                        499,
+                        "Client Closed Request",
+                        {},
+                        io.BytesIO(b'{"detail":"observer disconnected"}'),
+                    )
+                return FakeResponse()
+
+        opener = FakeOpener()
+        with (
+            patch.object(
+                agentsdock_chats,
+                "environment",
+                return_value="http://127.0.0.1:7850",
+            ),
+            patch.object(
+                agentsdock_chats.urllib.request,
+                "build_opener",
+                return_value=opener,
+            ),
+            patch.object(agentsdock_chats.time, "sleep") as sleep,
+        ):
+            result = agentsdock_chats.get_json(
+                "/api/agent/cross-chat/exchanges/ex/legs/leg/live-response",
+                "capability",
+                retry_forever=True,
+            )
+
+        self.assertEqual(result, {"ok": True, "pending": True})
+        self.assertEqual(len(opener.requests), 4)
+        self.assertIs(opener.requests[0][0], opener.requests[1][0])
+        self.assertIs(opener.requests[1][0], opener.requests[2][0])
+        self.assertIs(opener.requests[2][0], opener.requests[3][0])
+        self.assertEqual(
+            [call.args[0] for call in sleep.call_args_list],
+            [0.1, 0.2, 0.4],
+        )
+
+    def test_live_get_treats_explicit_cancel_as_terminal(self) -> None:
+        class FakeOpener:
+            def __init__(self) -> None:
+                self.calls = 0
+
+            def open(self, request, timeout):
+                self.calls += 1
+                raise urllib.error.HTTPError(
+                    request.full_url,
+                    410,
+                    "Gone",
+                    {},
+                    io.BytesIO(b'{"detail":"cancelled_by_user"}'),
+                )
+
+        opener = FakeOpener()
+        with (
+            patch.object(
+                agentsdock_chats,
+                "environment",
+                return_value="http://127.0.0.1:7850",
+            ),
+            patch.object(
+                agentsdock_chats.urllib.request,
+                "build_opener",
+                return_value=opener,
+            ),
+            patch.object(agentsdock_chats.time, "sleep") as sleep,
+        ):
+            with self.assertRaisesRegex(
+                agentsdock_chats.ChatsCLIError,
+                r"\(410\): cancelled_by_user",
+            ):
+                agentsdock_chats.get_json(
+                    "/api/agent/cross-chat/exchanges/ex/legs/leg/live-response",
+                    "capability",
+                    retry_forever=True,
+                )
+
+        self.assertEqual(opener.calls, 1)
+        sleep.assert_not_called()
+
+    def test_live_get_does_not_retry_malformed_success_forever(self) -> None:
+        class FakeResponse:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return None
+
+            def read(self):
+                return b'{"ok":'
+
+        class FakeOpener:
+            def __init__(self) -> None:
+                self.calls = 0
+
+            def open(self, _request, timeout):
+                self.calls += 1
+                return FakeResponse()
+
+        opener = FakeOpener()
+        with (
+            patch.object(
+                agentsdock_chats,
+                "environment",
+                return_value="http://127.0.0.1:7850",
+            ),
+            patch.object(
+                agentsdock_chats.urllib.request,
+                "build_opener",
+                return_value=opener,
+            ),
+            patch.object(agentsdock_chats.time, "sleep") as sleep,
+        ):
+            with self.assertRaisesRegex(
+                agentsdock_chats.ChatsCLIError,
+                "invalid live-response body",
+            ):
+                agentsdock_chats.get_json(
+                    "/api/agent/cross-chat/exchanges/ex/legs/leg/live-response",
+                    "capability",
+                    retry_forever=True,
+                )
+
+        self.assertEqual(opener.calls, 3)
+        self.assertEqual(sleep.call_count, 2)
 
     def test_secure_peer_ask_can_explicitly_use_async_response_delivery(self) -> None:
         args = argparse.Namespace(
@@ -573,7 +880,7 @@ class AgentsDockChatsCLITests(unittest.TestCase):
         self.assertEqual(calls[0][1]["body"], "investigate this")
         self.assertEqual(calls[0][1]["target_session_id"], handle)
         self.assertTrue(calls[0][1]["wait_for_response"])
-        self.assertEqual(calls[0][1]["response_timeout_seconds"], 75)
+        self.assertEqual(calls[0][1]["response_timeout_seconds"], 20)
         self.assertEqual(calls[0][1]["idempotency_key"], calls[1][1]["idempotency_key"])
 
     def test_direct_send_rejects_receipt_with_internal_identifiers(self) -> None:
@@ -632,7 +939,7 @@ class AgentsDockChatsCLITests(unittest.TestCase):
         self.assertFalse(payloads[0]["request_response"])
         self.assertTrue(payloads[1]["request_response"])
         self.assertTrue(payloads[1]["wait_for_response"])
-        self.assertEqual(payloads[1]["response_timeout_seconds"], 75)
+        self.assertEqual(payloads[1]["response_timeout_seconds"], 20)
         self.assertNotEqual(payloads[0]["idempotency_key"], payloads[1]["idempotency_key"])
 
     def test_respond_accepts_only_strict_configured_route_receipt(self) -> None:
@@ -662,7 +969,7 @@ class AgentsDockChatsCLITests(unittest.TestCase):
             with self.assertRaises(agentsdock_chats.ChatsCLIError):
                 agentsdock_chats.respond(args)
 
-    def test_followup_reports_timeout_fallback_as_accepted_async_delivery(self) -> None:
+    def test_followup_accepts_legacy_async_recovery_receipt(self) -> None:
         args = argparse.Namespace(
             authority_file="authority.json",
             exchange="exchange_deferred",

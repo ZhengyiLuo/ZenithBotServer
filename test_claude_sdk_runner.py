@@ -788,6 +788,7 @@ class ClaudeSDKRunnerTests(unittest.IsolatedAsyncioTestCase):
         turn_timeout: float,
         idle_warn: float,
         idle_timeout: float,
+        project_result: dict[str, Any] | None = None,
     ) -> tuple[FakeClaudeManager, AsyncMock, AsyncMock, Mock]:
         manager = FakeClaudeManager(handle)
         append_event = AsyncMock(return_value={})
@@ -838,7 +839,7 @@ class ClaudeSDKRunnerTests(unittest.IsolatedAsyncioTestCase):
             stack.enter_context(patch.object(
                 agent_server,
                 "project_claude_sdk_message",
-                AsyncMock(return_value=None),
+                AsyncMock(return_value=project_result),
             ))
             for name in (
                 "mark_provider_turn_ready",
@@ -4574,6 +4575,57 @@ class ClaudeSDKRunnerTests(unittest.IsolatedAsyncioTestCase):
             for call in append_event.await_args_list
         ))
         runtime_failure.assert_called_once()
+
+    async def test_pending_live_cross_chat_wait_pauses_sdk_watchdogs(self) -> None:
+        class DelayedTerminalClaudeRun(FakeClaudeRun):
+            def __init__(self) -> None:
+                super().__init__()
+                self.delivered = False
+
+            async def __anext__(self) -> object:
+                if self.delivered:
+                    await asyncio.Event().wait()
+                self.delivered = True
+                await asyncio.sleep(0.06)
+                return {
+                    "type": "result",
+                    "result": "Peer answered after the old deadline",
+                    "session_id": "provider",
+                    "terminal_reason": "end_turn",
+                }
+
+        with patch.object(
+            agent_server,
+            "provider_run_owns_pending_cross_chat_live_wait",
+            return_value=True,
+        ):
+            _manager, append_event, append_finished, runtime_failure = (
+                await self._run_sdk_timeout_case(
+                    DelayedTerminalClaudeRun(),
+                    pre_ack_timeout=0.01,
+                    post_ack_timeout=0.01,
+                    turn_timeout=0.01,
+                    idle_warn=0.005,
+                    idle_timeout=0.01,
+                    project_result={
+                        "session_id": "provider",
+                        "result_text": "Peer answered after the old deadline",
+                        "is_error": False,
+                        "error": "",
+                        "subtype": "success",
+                        "terminal_reason": "end_turn",
+                        "aborted": False,
+                    },
+                )
+            )
+
+        terminal = append_finished.await_args.args[1]
+        self.assertEqual(terminal["exit_code"], 0)
+        self.assertFalse(any(
+            call.args[1] in {"error", "idle_warning"}
+            for call in append_event.await_args_list
+        ))
+        runtime_failure.assert_not_called()
 
     async def test_delivery_uncertain_stream_retires_without_empty_success(self) -> None:
         handle = FailingClaudeRun(ClaudeSDKQueryError("replay ACK missing"))

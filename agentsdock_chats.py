@@ -17,10 +17,13 @@ import urllib.request
 from pathlib import Path
 from typing import Any
 
-# Keep the default below provider shell-tool deadlines (Claude's default is
-# commonly 120 seconds). The server still enforces its own configurable cap.
-LIVE_RESPONSE_TIMEOUT_SECONDS = 75
+# The legacy ``response_timeout_seconds`` wire field is now only a requested
+# heartbeat interval.  There is deliberately no client response-deadline
+# constant: an authenticated live lease is replayed until terminal state.
+LIVE_RESPONSE_HEARTBEAT_SECONDS = 20
+LIVE_RESPONSE_MAX_HEARTBEAT_SECONDS = 60
 LIVE_RESPONSE_SOCKET_GRACE_SECONDS = 15
+LIVE_RESPONSE_RETRY_MAX_DELAY_SECONDS = 5.0
 IDEMPOTENT_POST_RETRY_DELAYS_SECONDS = (0.1, 0.5)
 IDEMPOTENT_GET_RETRY_DELAYS_SECONDS = (0.1, 0.5)
 
@@ -108,12 +111,9 @@ def post_json(
     transport_retry = 0
     while True:
         try:
-            socket_timeout = (
-                float(payload.get("response_timeout_seconds") or 0)
-                + LIVE_RESPONSE_SOCKET_GRACE_SECONDS
-                if payload.get("wait_for_response") is True
-                else 30
-            )
+            # The POST commits and returns a lease; response waiting happens
+            # through bounded GET heartbeats below.
+            socket_timeout = 30
             with opener.open(request, timeout=socket_timeout) as response:
                 result = json.loads(response.read().decode("utf-8"))
             break
@@ -193,6 +193,7 @@ def get_json(
     capability: str,
     *,
     timeout: float = 30,
+    retry_forever: bool = False,
 ) -> dict[str, Any]:
     server_url = environment()
     request = urllib.request.Request(
@@ -205,6 +206,15 @@ def get_json(
         NoRedirectHandler(),
     )
     transport_retry = 0
+
+    def retry_delay(*, persistent: bool) -> float:
+        if persistent:
+            return min(
+                LIVE_RESPONSE_RETRY_MAX_DELAY_SECONDS,
+                0.1 * (2 ** min(transport_retry, 6)),
+            )
+        return IDEMPOTENT_GET_RETRY_DELAYS_SECONDS[transport_retry]
+
     while True:
         try:
             with opener.open(request, timeout=timeout) as response:
@@ -214,10 +224,11 @@ def get_json(
             try:
                 raw = exc.read().decode("utf-8", errors="replace")
             except (OSError, http.client.IncompleteRead) as read_exc:
-                if transport_retry < len(IDEMPOTENT_GET_RETRY_DELAYS_SECONDS):
-                    delay = IDEMPOTENT_GET_RETRY_DELAYS_SECONDS[
-                        transport_retry
-                    ]
+                if (
+                    retry_forever
+                    or transport_retry < len(IDEMPOTENT_GET_RETRY_DELAYS_SECONDS)
+                ):
+                    delay = retry_delay(persistent=retry_forever)
                     transport_retry += 1
                     time.sleep(delay)
                     continue
@@ -229,6 +240,14 @@ def get_json(
                 detail = json.loads(raw).get("detail") or raw
             except json.JSONDecodeError:
                 detail = raw
+            if retry_forever and (
+                exc.code in {408, 425, 429, 499}
+                or 500 <= exc.code <= 599
+            ):
+                delay = retry_delay(persistent=True)
+                transport_retry += 1
+                time.sleep(delay)
+                continue
             raise ChatsCLIError(
                 f"server rejected request ({exc.code}): {detail or exc.reason}"
             ) from exc
@@ -237,19 +256,33 @@ def get_json(
             TimeoutError,
             OSError,
             http.client.IncompleteRead,
-            UnicodeDecodeError,
-            json.JSONDecodeError,
         ) as exc:
-            if transport_retry < len(IDEMPOTENT_GET_RETRY_DELAYS_SECONDS):
-                delay = IDEMPOTENT_GET_RETRY_DELAYS_SECONDS[transport_retry]
+            if (
+                retry_forever
+                or transport_retry < len(IDEMPOTENT_GET_RETRY_DELAYS_SECONDS)
+            ):
+                delay = retry_delay(persistent=retry_forever)
                 transport_retry += 1
                 # GET is side-effect free and the live-response URL contains
-                # the same exact lease on every attempt. The server retains a
-                # completed result briefly for this replay window.
+                # the same exact lease on every attempt. The server retains
+                # the result for this exact live provider-run owner.
                 time.sleep(delay)
                 continue
             raise ChatsCLIError(
                 f"could not reach AgentsServer: {getattr(exc, 'reason', exc)}"
+            ) from exc
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            # A malformed HTTP success body is a protocol error, not evidence
+            # that a busy peer still has work queued.  Replay the side-effect
+            # free GET only through the small ambiguity window, then fail
+            # instead of spinning forever on a corrupt/incompatible server.
+            if transport_retry < len(IDEMPOTENT_GET_RETRY_DELAYS_SECONDS):
+                delay = retry_delay(persistent=False)
+                transport_retry += 1
+                time.sleep(delay)
+                continue
+            raise ChatsCLIError(
+                "AgentsServer returned an invalid live-response body"
             ) from exc
     if not isinstance(result, dict):
         raise ChatsCLIError("AgentsServer returned an invalid response")
@@ -264,16 +297,23 @@ def await_live_response(
     exchange_id = str(receipt.get("exchange_id") or "")
     inbound_leg_id = str(receipt.get("inbound_leg_id") or "")
     lease_id = str(receipt.get("live_response_lease_id") or "")
+    heartbeat_seconds = max(
+        1,
+        min(
+            int(timeout_seconds),
+            LIVE_RESPONSE_MAX_HEARTBEAT_SECONDS,
+        ),
+    )
     query = urllib.parse.urlencode({
         "lease_id": lease_id,
-        "timeout_seconds": timeout_seconds,
+        # Compatibility query name: the server treats it as a bounded
+        # transport heartbeat, never a total response deadline.
+        "timeout_seconds": heartbeat_seconds,
     })
-    result = get_json(
+    path = (
         "/api/agent/cross-chat/exchanges/"
         f"{urllib.parse.quote(exchange_id, safe='')}/legs/"
-        f"{urllib.parse.quote(inbound_leg_id, safe='')}/live-response?{query}",
-        capability,
-        timeout=timeout_seconds + LIVE_RESPONSE_SOCKET_GRACE_SECONDS,
+        f"{urllib.parse.quote(inbound_leg_id, safe='')}/live-response?{query}"
     )
     answer_keys = {
         "ok", "exchange_id", "inbound_leg_id", "body", "request_response",
@@ -282,25 +322,43 @@ def await_live_response(
         "ok", "exchange_id", "inbound_leg_id", "deferred", "delivery",
         "message",
     }
-    valid_answer = (
-        set(result) == answer_keys
-        and isinstance(result.get("body"), str)
-        and isinstance(result.get("request_response"), bool)
-    )
-    valid_deferred = (
-        set(result) == deferred_keys
-        and result.get("deferred") is True
-        and result.get("delivery") == "asynchronous"
-        and isinstance(result.get("message"), str)
-    )
-    if (
-        not (valid_answer or valid_deferred)
-        or result.get("ok") is not True
-        or result.get("exchange_id") != exchange_id
-        or not isinstance(result.get("inbound_leg_id"), str)
-    ):
-        raise ChatsCLIError("AgentsServer returned an invalid live response")
-    return result
+    pending_keys = {"ok", "exchange_id", "inbound_leg_id", "pending"}
+    while True:
+        result = get_json(
+            path,
+            capability,
+            timeout=(
+                heartbeat_seconds
+                + LIVE_RESPONSE_SOCKET_GRACE_SECONDS
+            ),
+            retry_forever=True,
+        )
+        valid_answer = (
+            set(result) == answer_keys
+            and isinstance(result.get("body"), str)
+            and isinstance(result.get("request_response"), bool)
+        )
+        valid_deferred = (
+            set(result) == deferred_keys
+            and result.get("deferred") is True
+            and result.get("delivery") == "asynchronous"
+            and isinstance(result.get("message"), str)
+        )
+        valid_pending = (
+            set(result) == pending_keys
+            and result.get("pending") is True
+            and result.get("inbound_leg_id") == inbound_leg_id
+        )
+        if (
+            not (valid_answer or valid_deferred or valid_pending)
+            or result.get("ok") is not True
+            or result.get("exchange_id") != exchange_id
+            or not isinstance(result.get("inbound_leg_id"), str)
+        ):
+            raise ChatsCLIError("AgentsServer returned an invalid live response")
+        if valid_pending:
+            continue
+        return result
 
 
 def list_routes(args: argparse.Namespace) -> dict[str, Any]:
@@ -324,13 +382,8 @@ def send_action(args: argparse.Namespace, action: str) -> dict[str, Any]:
     if bool(route) == bool(target):
         raise ChatsCLIError("provide exactly one of --route or --target")
     destination = route if route else target
-    # Current durable --route asks are agent messages, not an interactive
-    # provider-to-provider RPC. Commit them immediately and let the correlated
-    # answer return through the source chat's normal FIFO. Historical one-use
-    # --target request/reply handles retain their live-call compatibility.
     live_wait = (
         action == "request_reply"
-        and not route
         and not bool(getattr(args, "async_response", False))
     )
     stable_key = "cli_" + hashlib.sha256(
@@ -349,7 +402,7 @@ def send_action(args: argparse.Namespace, action: str) -> dict[str, Any]:
     if live_wait:
         payload["wait_for_response"] = True
         payload["response_timeout_seconds"] = int(
-            getattr(args, "timeout_seconds", LIVE_RESPONSE_TIMEOUT_SECONDS)
+            getattr(args, "timeout_seconds", LIVE_RESPONSE_HEARTBEAT_SECONDS)
         )
     if route:
         path = (
@@ -481,7 +534,7 @@ def respond(args: argparse.Namespace) -> dict[str, Any]:
     if live_wait:
         payload["wait_for_response"] = True
         payload["response_timeout_seconds"] = int(
-            getattr(args, "timeout_seconds", LIVE_RESPONSE_TIMEOUT_SECONDS)
+            getattr(args, "timeout_seconds", LIVE_RESPONSE_HEARTBEAT_SECONDS)
         )
     result = post_json(
         f"/api/agent/cross-chat/exchanges/{urllib.parse.quote(args.exchange, safe='')}/responses",
@@ -569,7 +622,10 @@ def parser() -> argparse.ArgumentParser:
     command.add_argument("--message", required=True)
     command.add_argument("--idempotency-key")
     command.set_defaults(handler=send)
-    ask_command = commands.add_parser("ask", help="start one bounded request/reply exchange")
+    ask_command = commands.add_parser(
+        "ask",
+        help="ask a same-server agent and wait until it answers or is stopped",
+    )
     ask_destination = ask_command.add_mutually_exclusive_group(required=True)
     ask_destination.add_argument("--route")
     ask_destination.add_argument("--target")
@@ -587,7 +643,11 @@ def parser() -> argparse.ArgumentParser:
         "--timeout-seconds",
         type=int,
         choices=range(1, 3601),
-        default=LIVE_RESPONSE_TIMEOUT_SECONDS,
+        default=LIVE_RESPONSE_HEARTBEAT_SECONDS,
+        help=(
+            "deprecated compatibility value; live same-server waits have no "
+            "response deadline"
+        ),
     )
     ask_command.set_defaults(handler=ask)
     response_command = commands.add_parser("respond", help="respond to the exact inbound exchange leg")
@@ -608,7 +668,11 @@ def parser() -> argparse.ArgumentParser:
         "--timeout-seconds",
         type=int,
         choices=range(1, 3601),
-        default=LIVE_RESPONSE_TIMEOUT_SECONDS,
+        default=LIVE_RESPONSE_HEARTBEAT_SECONDS,
+        help=(
+            "deprecated compatibility value; live same-server waits have no "
+            "response deadline"
+        ),
     )
     response_command.set_defaults(handler=respond)
     return root
