@@ -62142,9 +62142,7 @@ def server_update_is_active(status: dict[str, Any]) -> bool:
     if probe.returncode != 0:
         return False
     pane_dead = str(probe.stdout or "").strip()
-    if pane_dead == "1":
-        return False
-    return True
+    return pane_dead == "0"
 
 
 def server_update_status_age_seconds(status: dict[str, Any]) -> float:
