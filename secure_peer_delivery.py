@@ -1200,6 +1200,28 @@ class SecurePeerDeliveryLedger:
             finally:
                 connection.close()
 
+    def recoverable_outbound(self, *, limit: int = 50) -> list[dict[str, Any]]:
+        """Return every nonterminal outbound intent, including future retries."""
+
+        if type(limit) is not int or not 1 <= limit <= 50:
+            raise ValueError("secure peer outbound recovery limit is invalid")
+        with self._lock:
+            connection = self._connect()
+            try:
+                rows = connection.execute(
+                    """SELECT * FROM secure_peer_outbound_intents
+                    WHERE state='pending'
+                    ORDER BY created_at,request_id LIMIT ?""",
+                    (limit,),
+                ).fetchall()
+                return [
+                    self._public_outbound(row)
+                    for row in rows
+                    if row is not None
+                ]
+            finally:
+                connection.close()
+
     def prune(self, *, retain_seconds: int = 30 * 24 * 60 * 60) -> int:
         cutoff = int(time.time()) - retain_seconds
         with self._transaction() as connection:

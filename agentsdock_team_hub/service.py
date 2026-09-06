@@ -218,7 +218,9 @@ class MessageRequest(StrictModel):
 
 
 class NetworkAddress(StrictModel):
-    kind: Literal["server", "agent"]
+    # Cross-server delivery terminates at the remote server Inbox. Agent
+    # identities remain directory/read metadata, never writable addresses.
+    kind: Literal["server"]
     id: str = Field(min_length=1, max_length=240)
 
 
@@ -238,7 +240,7 @@ class NetworkBulletinRequest(StrictModel):
 
 class NetworkMailboxRequest(StrictModel):
     to: NetworkAddress
-    from_agent_id: str | None = Field(default=None, min_length=1, max_length=240)
+    from_agent_id: None = None
     body: str = Field(min_length=1, max_length=MAX_NETWORK_BODY_BYTES)
     body_format: Literal["plain", "markdown"] = "markdown"
     idempotency_key: str = Field(min_length=8, max_length=240)
@@ -249,7 +251,7 @@ class NetworkPassiveRequest(NetworkMailboxRequest):
 
 
 class NetworkReplyRequest(StrictModel):
-    from_agent_id: str | None = Field(default=None, min_length=1, max_length=240)
+    from_agent_id: None = None
     body: str = Field(min_length=1, max_length=MAX_NETWORK_BODY_BYTES)
     body_format: Literal["plain", "markdown"] = "markdown"
     idempotency_key: str = Field(min_length=8, max_length=240)
@@ -638,6 +640,7 @@ def create_app(
     allowed_origins: set[str] | None = None,
     managed_host_identity: str | None = None,
     managed_server_instance_id: str | None = None,
+    managed_host_display_name: str = "Team Hub host",
     managed_transport: str | None = None,
     managed_hub_url: str | None = None,
     managed_routes: dict[str, str] | None = None,
@@ -655,6 +658,7 @@ def create_app(
         Path(data_dir),
         managed_host_identity=managed_host_identity,
         managed_server_instance_id=managed_server_instance_id,
+        managed_host_display_name=managed_host_display_name,
         managed_reactivation_hub_id=managed_reactivation_hub_id,
         managed_reactivation_operation_id=managed_reactivation_operation_id,
         managed_reactivation_snapshot=managed_reactivation_snapshot,

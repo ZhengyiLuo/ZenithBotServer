@@ -61,6 +61,30 @@ class ParseConfigEnvFileTests(unittest.TestCase):
         self.assertEqual(parsed, {"GOOD": "1"})
 
 
+class ServerDisplayNameTests(unittest.TestCase):
+    def test_normalizes_configured_name_and_uses_fallback_when_empty(self) -> None:
+        self.assertEqual(
+            agent_server.canonical_server_display_name("  Zen's Studio  "),
+            "Zen's Studio",
+        )
+        self.assertEqual(
+            agent_server.canonical_server_display_name("   ", fallback="Sonic"),
+            "Sonic",
+        )
+
+    def test_enforces_secure_peer_utf8_byte_limit_before_runtime_start(self) -> None:
+        self.assertEqual(
+            agent_server.canonical_server_display_name("界" * 53),
+            "界" * 53,
+        )
+        for value in ("界" * 54, "S" * 161, "Sonic\nInjected"):
+            with self.subTest(value=value), self.assertRaisesRegex(
+                RuntimeError,
+                "at most 160 UTF-8 bytes",
+            ):
+                agent_server.canonical_server_display_name(value)
+
+
 class LoadConfigEnvFileTests(unittest.TestCase):
     def setUp(self) -> None:
         self.tempdir = tempfile.TemporaryDirectory()

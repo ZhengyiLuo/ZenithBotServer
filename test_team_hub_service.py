@@ -70,6 +70,42 @@ class TeamHubServiceTests(unittest.TestCase):
         self.assertEqual(redeemed.status_code, 200, redeemed.text)
         return redeemed.json()
 
+    def test_network_write_models_reject_agent_addresses_and_authorship(self) -> None:
+        owner = self.bootstrap()
+        team_id = owner["teams"][0]["id"]
+        headers = self.auth(owner)
+        attempts = (
+            (
+                f"/v1/teams/{team_id}/network/mailbox",
+                {
+                    "to": {"kind": "agent", "id": "agent-legacy"},
+                    "body": "retired target",
+                    "idempotency_key": "retired-agent-target-1",
+                },
+            ),
+            (
+                f"/v1/teams/{team_id}/network/requests",
+                {
+                    "to": {"kind": "server", "id": "server-target"},
+                    "from_agent_id": "agent-legacy",
+                    "body": "retired author",
+                    "idempotency_key": "retired-agent-author-1",
+                },
+            ),
+            (
+                f"/v1/teams/{team_id}/network/requests/request-legacy/replies",
+                {
+                    "from_agent_id": "agent-legacy",
+                    "body": "retired reply author",
+                    "idempotency_key": "retired-agent-reply-1",
+                },
+            ),
+        )
+        for path, body in attempts:
+            with self.subTest(path=path):
+                response = self.client.post(path, headers=headers, json=body)
+            self.assertEqual(response.status_code, 422, response.text)
+
     def test_health_has_stable_hub_identity_and_no_bootstrap_secret(self) -> None:
         first = self.client.get("/v1/health").json()
         self.assertTrue(first["bootstrap_required"])

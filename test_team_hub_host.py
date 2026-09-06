@@ -185,6 +185,32 @@ class ManagedTeamHubHostTests(unittest.IsolatedAsyncioTestCase):
             self.assertTrue(runtime.server_session_available())
             await runtime.shutdown()
 
+    async def test_managed_host_display_name_reaches_hub_projection(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            runtime = host(
+                Path(temporary) / "hub",
+                managed_host_display_name="Sonic",
+            )
+            runtime.initialize()
+            try:
+                store = runtime.store
+                self.assertIsNotNone(store)
+                proof = store.bootstrap_proof_path.read_text().strip()
+                bundle = store.bootstrap(
+                    proof,
+                    "owner@example.com",
+                    "Owner",
+                    "Owner Mac",
+                )
+                team_id = bundle["teams"][0]["id"]
+                network = store.get_network(store.managed_server_claims(), team_id)
+                managed = next(
+                    server for server in network["servers"] if server["is_host"]
+                )
+                self.assertEqual(managed["display_name"], "Sonic")
+            finally:
+                await runtime.shutdown()
+
     async def test_server_session_availability_rejects_legacy_multi_team_store(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary) / "hub"
@@ -1622,10 +1648,10 @@ class VendoredTeamHubParityTests(unittest.TestCase):
             "migrations/0011_human_admin_paging.sql": "29d165f8397f13451422a63ce948c67de49774de6fbb77b70fdca09647bb46f5",
             "migrations/__init__.py": "aaf340c45c8d39c2939814977ba4cef8eb6b3bd0671b0f7542ebe06f5431d6ec",
             "security.py": "0c1895c7443e7be07a2f53c7e4c4228e3ee04c65d6cd36f039b7bbba1813e4fa",
-            "secure_peer.py": "f7a1c9ca7296abbf218b6c30f928cc1c0eb7cc4f030334eef61644c0104db3da",
-            "secure_peer_hub.py": "81b2cf0284bc21589f141a42506fe4cfc2eccc5f750558e34608692649cc3100",
-            "service.py": "550ae9675fa64d285e9299f44359531eb2ac88e895d18365377abe38e34114a6",
-            "store.py": "a3568fe51a1ef39751d47c34fb45a2650f350c36138f48f3335400fd07b05145",
+            "secure_peer.py": "5ff4d75e87d56f49118166b3802b17b2c087765978b3bdc26d1c7fdecb9ce79f",
+            "secure_peer_hub.py": "249d6550cc9f8dceacdd9fdb914b518017b6ac04f0713170bacdcd27ad6cf407",
+            "service.py": "9a1a4b97f37317b89412342bdb5dbbbe2416b58c804f5f335f4fb6b0a0fafc72",
+            "store.py": "440bfbc3cc833b04886c7bd12475d09b00baf76f790eacbae71c1af82008349a",
         }
         entries = list(vendored.rglob("*"))
         for path in entries:

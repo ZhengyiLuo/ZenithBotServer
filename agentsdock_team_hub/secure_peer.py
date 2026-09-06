@@ -3092,6 +3092,49 @@ class SecurePeerStore:
         finally:
             connection.close()
 
+    def retire_agent_routes_locally(self) -> int:
+        """Atomically retire host routes and every nonterminal relay record."""
+
+        timestamp = self._timestamp()
+        with self._guard:
+            connection = self._connect()
+            try:
+                connection.execute("BEGIN IMMEDIATE")
+                active_route_ids = [
+                    str(row["id"])
+                    for row in connection.execute(
+                        "SELECT id FROM peer_routes WHERE status='active' ORDER BY id"
+                    ).fetchall()
+                ]
+                for route_id in active_route_ids:
+                    connection.execute(
+                        """UPDATE peer_routes SET status='revoked',revision=?,
+                        revoked_at=?,updated_at=? WHERE id=? AND status='active'""",
+                        (
+                            "rev_" + uuid.uuid4().hex,
+                            timestamp,
+                            timestamp,
+                            route_id,
+                        ),
+                    )
+                connection.execute(
+                    """UPDATE relay_envelopes SET status='expired',
+                    lease_owner=NULL,lease_token_hash=NULL,lease_expires_at=NULL
+                    WHERE status IN ('queued','claimed')"""
+                )
+                connection.execute(
+                    """UPDATE relay_exchanges SET status='expired'
+                    WHERE status='open'"""
+                )
+                connection.execute("COMMIT")
+                return len(active_route_ids)
+            except BaseException:
+                if connection.in_transaction:
+                    connection.execute("ROLLBACK")
+                raise
+            finally:
+                connection.close()
+
     def list_remote_routes_for_peer(
         self,
         peer_id: str,
@@ -4839,8 +4882,11 @@ def sanitize_proxy_request(
         ) is None:
             raise SecurePeerError("invalid_request", "Proxy query is invalid", 422)
         messages_route = path.endswith("/network/messages")
+        mailbox_route = path.endswith("/network/mailbox")
         if "address_kind" in values and values["address_kind"] not in (
-            {"server", "human"} if messages_route else {"server", "agent"}
+            {"server"}
+            if mailbox_route
+            else ({"server", "human"} if messages_route else {"server", "agent"})
         ):
             raise SecurePeerError("invalid_request", "Proxy query is invalid", 422)
         for identifier_key in ("address_id", "from_id"):
@@ -5949,6 +5995,11 @@ class SecurePeerClient:
         timeout_seconds: float = 10.0,
         pairing_capacity_lock: threading.RLock | None = None,
         external_actionable_pairing_count: Callable[[], int] | None = None,
+        pairing_capabilities: Iterable[str] = (
+            "cert_renewal",
+            "cross_chat",
+            "teamspace",
+        ),
     ) -> None:
         self.data_dir = Path(data_dir)
         ensure_private_directory(self.data_dir)
@@ -5956,6 +6007,13 @@ class SecurePeerClient:
         ensure_private_directory(self.keys_dir)
         self.server_identity = _identifier(server_identity, "peer server identity")
         self.display_name = _bounded_text(display_name, "peer display name", 1, 160)
+        canonical_capabilities = tuple(sorted(pairing_capabilities))
+        if (
+            len(canonical_capabilities) != len(set(canonical_capabilities))
+            or not set(canonical_capabilities).issubset(CAPABILITIES)
+        ):
+            raise ValueError("pairing capabilities are invalid")
+        self._pairing_capabilities = canonical_capabilities
         self._clock = clock
         self.timeout_seconds = max(1.0, min(float(timeout_seconds), 30.0))
         self._route_guard = threading.RLock()
@@ -5966,6 +6024,39 @@ class SecurePeerClient:
         )
         self.db_path = self.data_dir / "secure-peer-client.sqlite3"
         self._initialize_database()
+
+    def _pairing_request_matches_configured_policy(
+        self,
+        request: Mapping[str, Any],
+    ) -> bool:
+        """Reject replay of signed requests from a wider pre-upgrade policy."""
+
+        capabilities = request.get("capabilities")
+        try:
+            requested_scopes = SecurePeerStore._canonical_scopes(
+                request.get("requested_scopes")
+            )
+        except (SecurePeerError, TypeError, ValueError):
+            return False
+        return (
+            isinstance(capabilities, list)
+            and capabilities == list(self._pairing_capabilities)
+            and (
+                "cross_chat" in self._pairing_capabilities
+                or not any(scope.startswith("cross_chat.") for scope in requested_scopes)
+            )
+        )
+
+    def _require_pairing_scopes_allowed(self, requested_scopes: Iterable[str]) -> None:
+        if (
+            "cross_chat" not in self._pairing_capabilities
+            and any(str(scope).startswith("cross_chat.") for scope in requested_scopes)
+        ):
+            raise SecurePeerError(
+                "pairing_capability_unavailable",
+                "Cross-server agent pairing scopes are retired",
+                409,
+            )
 
     def _timestamp(self) -> int:
         return _now(self._clock())
@@ -6452,6 +6543,7 @@ class SecurePeerClient:
             host = canonical_peer_ipv4(host_ip)
             canonical_port = canonical_peer_port(port)
             requested_values = SecurePeerStore._canonical_scopes(requested_scopes)
+            self._require_pairing_scopes_allowed(requested_values)
             selected_display_name = (
                 self.display_name
                 if display_name is None
@@ -6492,6 +6584,8 @@ class SecurePeerClient:
     ) -> dict[str, Any]:
         host = canonical_peer_ipv4(host_ip)
         canonical_port = canonical_peer_port(port)
+        requested_values = SecurePeerStore._canonical_scopes(requested_scopes)
+        self._require_pairing_scopes_allowed(requested_values)
         if expected_ca_fingerprint is not None and _HEX_FP_RE.fullmatch(expected_ca_fingerprint) is None:
             raise ValueError("expected CA fingerprint is invalid")
         context = self._unverified_context()
@@ -6525,7 +6619,6 @@ class SecurePeerClient:
         canonical_request_id = (
             str(uuid.uuid4()) if request_id is None else _uuid(request_id, "request_id")
         )
-        requested_values = SecurePeerStore._canonical_scopes(requested_scopes)
         selected_display_name = (
             self.display_name
             if display_name is None
@@ -6585,6 +6678,9 @@ class SecurePeerClient:
                     != selected_display_name
                     or persisted_request.get("host_ca_fingerprint") != observed_fp
                     or persisted_request.get("requested_scopes") != requested_values
+                    or not self._pairing_request_matches_configured_policy(
+                        persisted_request
+                    )
                     or completed["requested_scopes_json"]
                     != canonical_json(requested_values).decode("utf-8")
                 ):
@@ -6609,6 +6705,7 @@ class SecurePeerClient:
                 host_ca_fingerprint=observed_fp,
                 request_id=canonical_request_id,
                 created_at=timestamp,
+                capabilities=self._pairing_capabilities,
                 requested_scopes=requested_values,
             )
             connection_id = str(uuid.uuid4())
@@ -6684,6 +6781,7 @@ class SecurePeerClient:
                 or attempt["hub_id"] != health["hub_id"]
                 or request.get("requested_scopes") != expected_scopes
                 or request.get("peer_display_name") != selected_display_name
+                or not self._pairing_request_matches_configured_policy(request)
             ):
                 raise SecurePeerError(
                     "idempotency_conflict",
@@ -6878,6 +6976,8 @@ class SecurePeerClient:
                     continue
                 try:
                     request = json.loads(row["request_json"])
+                    if not isinstance(request, dict):
+                        raise PermissionError("persisted pairing request is invalid")
                     requested = SecurePeerStore._canonical_scopes(
                         request.get("requested_scopes")
                     )
@@ -6892,8 +6992,12 @@ class SecurePeerClient:
                         or request.get("peer_server_identity") != self.server_identity
                         or request.get("host_ca_fingerprint")
                         != row["observed_ca_fingerprint"]
+                        or not self._pairing_request_matches_configured_policy(
+                            request
+                        )
                     ):
-                        raise PermissionError("persisted pairing request is invalid")
+                        retired += int(self._retire_pairing_attempt(row))
+                        continue
                     attempted += 1
                     result = self._begin_pairing_locked(
                         str(row["host_ip"]),
@@ -8513,6 +8617,44 @@ class SecurePeerClient:
             ]
         finally:
             connection.close()
+
+    def retire_agent_routes_locally(self) -> int:
+        """Tombstone client routes and wider legacy pairing attempts offline."""
+
+        with self._route_guard:
+            connection = self._connect()
+            try:
+                connection.execute("BEGIN IMMEDIATE")
+                changed = int(connection.execute(
+                    """UPDATE client_routes SET status='revoked',revoke_pending=0,
+                    revoke_expected_revision=NULL,revoke_idempotency_key=NULL,
+                    updated_at=?
+                    WHERE status IN ('publishing','active')
+                    OR (status='revoked' AND revoke_pending=1)""",
+                    (self._timestamp(),),
+                ).rowcount or 0)
+                incompatible_attempts = []
+                for row in connection.execute(
+                    "SELECT * FROM client_pairing_attempts ORDER BY created_at,request_id"
+                ).fetchall():
+                    try:
+                        request = json.loads(row["request_json"])
+                    except (TypeError, json.JSONDecodeError):
+                        request = None
+                    if not isinstance(request, dict) or not (
+                        self._pairing_request_matches_configured_policy(request)
+                    ):
+                        incompatible_attempts.append(row)
+                connection.execute("COMMIT")
+            except BaseException:
+                if connection.in_transaction:
+                    connection.execute("ROLLBACK")
+                raise
+            finally:
+                connection.close()
+            for attempt in incompatible_attempts:
+                changed += int(self._retire_pairing_attempt(attempt))
+            return changed
 
     def revoke_published_route(
         self,

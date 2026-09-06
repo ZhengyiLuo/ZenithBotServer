@@ -525,7 +525,7 @@ class SecurePeerHubAdapterTests(unittest.TestCase):
             f"/v1/teams/{self.team_id}/network/mailbox",
             body={
                 "to": {"kind": "server", "id": server_id},
-                "from_agent_id": agent_id,
+                "from_agent_id": None,
                 "body": "Passive mail",
                 "body_format": "plain",
                 "idempotency_key": "network-mail-send-1",
@@ -533,6 +533,8 @@ class SecurePeerHubAdapterTests(unittest.TestCase):
         )
         self.assertEqual(sent.status, 200, sent.body)
         sent_value = json.loads(sent.body)
+        self.assertEqual(sent_value["item"]["from"]["kind"], "server")
+        self.assertEqual(sent_value["item"]["from"]["id"], server_id)
         delivery_id = sent_value["delivery"]["id"]
         inbox = self.request(
             "GET",
@@ -575,7 +577,7 @@ class SecurePeerHubAdapterTests(unittest.TestCase):
             "POST",
             f"/v1/teams/{self.team_id}/network/requests",
             body={
-                "to": {"kind": "agent", "id": agent_id},
+                "to": {"kind": "server", "id": server_id},
                 "body": "Can you inspect this?",
                 "idempotency_key": "network-request-create-1",
             },
@@ -596,7 +598,7 @@ class SecurePeerHubAdapterTests(unittest.TestCase):
             "POST",
             f"/v1/teams/{self.team_id}/network/requests/{request_id}/replies",
             body={
-                "from_agent_id": agent_id,
+                "from_agent_id": None,
                 "body": "Reviewed; no turn was started.",
                 "idempotency_key": "network-request-reply-1",
             },
@@ -623,7 +625,7 @@ class SecurePeerHubAdapterTests(unittest.TestCase):
             "POST",
             f"/v1/teams/{self.team_id}/network/requests/{request_id}/replies",
             body={
-                "from_agent_id": agent_id,
+                "from_agent_id": None,
                 "body": "A second reply is forbidden.",
                 "idempotency_key": "network-request-reply-2",
             },
@@ -649,6 +651,119 @@ class SecurePeerHubAdapterTests(unittest.TestCase):
             },
         )
         self.assertEqual(attachment_rejected.status, 422)
+
+    def test_legacy_peer_mail_rejects_agent_targeting_and_impersonation(self) -> None:
+        network = json.loads(
+            self.request("GET", f"/v1/teams/{self.team_id}/network").body
+        )
+        server_id = network["servers"][0]["id"]
+        registered = self.request(
+            "POST",
+            f"/v1/teams/{self.team_id}/network/agents",
+            body={
+                "external_agent_id": "legacy-boundary-agent",
+                "backend": "codex",
+                "display_name": "Legacy boundary agent",
+                "idempotency_key": "legacy-boundary-register-1",
+            },
+        )
+        agent_id = json.loads(registered.body)["agent"]["id"]
+
+        denied_bodies = (
+            (
+                "mailbox",
+                {
+                    "to": {"kind": "agent", "id": agent_id},
+                    "body": "Agent target is retired",
+                    "idempotency_key": "legacy-agent-target-mail-1",
+                },
+            ),
+            (
+                "mailbox",
+                {
+                    "to": {"kind": "server", "id": server_id},
+                    "from_agent_id": agent_id,
+                    "body": "Agent authorship is retired",
+                    "idempotency_key": "legacy-agent-author-mail-1",
+                },
+            ),
+            (
+                "requests",
+                {
+                    "to": {"kind": "agent", "id": agent_id},
+                    "body": "Agent request target is retired",
+                    "idempotency_key": "legacy-agent-target-request-1",
+                },
+            ),
+            (
+                "requests",
+                {
+                    "to": {"kind": "server", "id": server_id},
+                    "from_agent_id": agent_id,
+                    "body": "Agent request authorship is retired",
+                    "idempotency_key": "legacy-agent-author-request-1",
+                },
+            ),
+        )
+        for route, body in denied_bodies:
+            with self.subTest(route=route, body=body["body"]):
+                denied = self.request(
+                    "POST",
+                    f"/v1/teams/{self.team_id}/network/{route}",
+                    body=body,
+                )
+                self.assertEqual(denied.status, 422, denied.body)
+                self.assertEqual(
+                    json.loads(denied.body)["error"]["code"],
+                    "invalid_request",
+                )
+
+        agent_mailbox = self.request(
+            "GET",
+            f"/v1/teams/{self.team_id}/network/mailbox",
+            query=(
+                f"address_kind=agent&address_id={agent_id}"
+                "&after_sequence=0&limit=10"
+            ),
+        )
+        self.assertEqual(agent_mailbox.status, 422, agent_mailbox.body)
+        self.assertEqual(
+            json.loads(agent_mailbox.body)["error"]["code"],
+            "invalid_request",
+        )
+
+        created = self.request(
+            "POST",
+            f"/v1/teams/{self.team_id}/network/requests",
+            body={
+                "to": {"kind": "server", "id": server_id},
+                "from_agent_id": None,
+                "body": "Server-level passive request",
+                "idempotency_key": "legacy-server-request-1",
+            },
+        )
+        self.assertEqual(created.status, 200, created.body)
+        request_id = json.loads(created.body)["request"]["id"]
+        forged_reply = self.request(
+            "POST",
+            f"/v1/teams/{self.team_id}/network/requests/{request_id}/replies",
+            body={
+                "from_agent_id": agent_id,
+                "body": "Forged agent reply",
+                "idempotency_key": "legacy-agent-reply-1",
+            },
+        )
+        self.assertEqual(forged_reply.status, 422, forged_reply.body)
+        self.assertEqual(
+            json.loads(forged_reply.body)["error"]["code"],
+            "invalid_request",
+        )
+        unchanged = self.request(
+            "GET",
+            f"/v1/teams/{self.team_id}/network/requests/{request_id}",
+        )
+        self.assertEqual(json.loads(unchanged.body)["request"]["status"], "open")
+        self.assertIsNone(json.loads(unchanged.body)["reply"])
 
     def test_authenticated_peer_rate_and_concurrency_limits_fail_closed(self) -> None:
         now = time.monotonic()
@@ -1326,7 +1441,7 @@ class SecurePeerHubAdapterTests(unittest.TestCase):
         )
         self.assertEqual(denied.status, 404, denied.body)
 
-    def test_passive_reply_fails_cleanly_when_requester_agent_is_inactive(self) -> None:
+    def test_legacy_agent_request_is_readable_but_peer_reply_is_retired(self) -> None:
         network = json.loads(
             self.request("GET", f"/v1/teams/{self.team_id}/network").body
         )
@@ -1342,25 +1457,39 @@ class SecurePeerHubAdapterTests(unittest.TestCase):
             },
         )
         agent_id = json.loads(registered.body)["agent"]["id"]
-        created = self.request(
-            "POST",
-            f"/v1/teams/{self.team_id}/network/requests",
-            body={
-                "to": {"kind": "server", "id": server_id},
-                "from_agent_id": agent_id,
-                "body": "Reply after I go offline",
-                "idempotency_key": "inactive-requester-request-1",
-            },
+        # Seed through the retained Hub compatibility API.  The secure-peer
+        # adapter no longer permits a peer to claim this agent authorship, but
+        # pre-existing agent-authored requests must remain safely readable.
+        claims = self.store.secure_peer_claims(
+            peer_id=self.peer.peer_id,
+            peer_server_identity=self.peer.peer_server_identity,
+            team_id=self.peer.team_id,
+            scopes=self.peer.scopes,
+            expires_at=self.peer.certificate_expires_at,
+            display_name=self.peer.peer_display_name,
         )
-        request_id = json.loads(created.body)["request"]["id"]
-        connection = self.store.connect()
-        try:
-            connection.execute(
-                "UPDATE agents SET status='suspended',updated_at=updated_at+1 WHERE id=?",
-                (agent_id,),
+        with mock.patch.object(
+            self.store,
+            "_require_server_inbox_write",
+        ):
+            created = self.store.create_network_request(
+                claims,
+                self.team_id,
+                {
+                    "to": {"kind": "server", "id": server_id},
+                    "from_agent_id": agent_id,
+                    "body": "Reply after I go offline",
+                    "body_format": "markdown",
+                    "idempotency_key": "inactive-requester-request-1",
+                },
             )
-        finally:
-            connection.close()
+        request_id = created["request"]["id"]
+        readable = self.request(
+            "GET",
+            f"/v1/teams/{self.team_id}/network/requests/{request_id}",
+        )
+        self.assertEqual(readable.status, 200, readable.body)
+        self.assertEqual(json.loads(readable.body)["request"]["status"], "open")
         reply = self.request(
             "POST",
             f"/v1/teams/{self.team_id}/network/requests/{request_id}/replies",
@@ -1369,10 +1498,17 @@ class SecurePeerHubAdapterTests(unittest.TestCase):
                 "idempotency_key": "inactive-requester-reply-1",
             },
         )
-        self.assertEqual(reply.status, 409, reply.body)
+        self.assertEqual(reply.status, 422, reply.body)
         self.assertEqual(
-            json.loads(reply.body)["error"]["code"], "request_unavailable"
+            json.loads(reply.body)["error"]["code"], "invalid_request"
         )
+        unchanged = self.store.get_network_request(
+            claims,
+            self.team_id,
+            request_id,
+        )
+        self.assertEqual(unchanged["request"]["status"], "open")
+        self.assertIsNone(unchanged["reply"])
 
     def test_network_agent_registry_has_durable_server_boundary(self) -> None:
         network = self.request("GET", f"/v1/teams/{self.team_id}/network")

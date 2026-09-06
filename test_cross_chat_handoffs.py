@@ -24,6 +24,9 @@ class CrossChatStoreTests(unittest.IsolatedAsyncioTestCase):
         self.original_current_turns = agent_server.CURRENT_TURNS
         self.original_queued_turns = agent_server.QUEUED_TURNS
         self.original_agent_token = agent_server.AGENT_TOKEN
+        self.original_agent_relay_enabled = (
+            agent_server.SECURE_PEER_AGENT_RELAY_ENABLED
+        )
         self.original_busy_sessions = set(agent_server.BUSY_SESSIONS)
         self.original_run_now_turns = agent_server.RUN_NOW_TURNS
         self.original_queue_start_tasks = agent_server.QUEUE_START_TASKS
@@ -65,6 +68,9 @@ class CrossChatStoreTests(unittest.IsolatedAsyncioTestCase):
         )
         self.original_live_response_waiters = agent_server.CROSS_CHAT_LIVE_RESPONSE_WAITERS
         agent_server.AGENT_TOKEN = "test-admin-token"
+        # Retain explicit coverage of the legacy relay protocol while normal
+        # AgentsServer production keeps it disabled.
+        agent_server.SECURE_PEER_AGENT_RELAY_ENABLED = True
         agent_server.CROSS_CHAT = agent_server.CrossChatStore(self.root / "cross-chat.sqlite3")
         await agent_server.CROSS_CHAT.initialize()
         agent_server.CROSS_CHAT_AUTHORITY_ROOT = self.root / "authority"
@@ -143,6 +149,9 @@ class CrossChatStoreTests(unittest.IsolatedAsyncioTestCase):
         agent_server.BUSY_SESSIONS.clear()
         agent_server.BUSY_SESSIONS.update(self.original_busy_sessions)
         agent_server.AGENT_TOKEN = self.original_agent_token
+        agent_server.SECURE_PEER_AGENT_RELAY_ENABLED = (
+            self.original_agent_relay_enabled
+        )
         self.temporary.cleanup()
 
     async def create_exchange(
@@ -5055,14 +5064,14 @@ class CrossChatStoreTests(unittest.IsolatedAsyncioTestCase):
             if lock.locked():
                 lock.release()
 
-    def test_exchange_capability_v11_default_deny_contract_is_exact(self) -> None:
+    def test_exchange_capability_v12_default_deny_contract_is_exact(self) -> None:
         with (
             patch.object(agent_server, "CODEX_TRANSPORT", agent_server.CODEX_TRANSPORT_APP_SERVER),
             patch.object(agent_server, "CLAUDE_TRANSPORT", agent_server.CLAUDE_TRANSPORT_AGENT_SDK),
         ):
             capability = agent_server.cross_chat_handoffs_capability()
         self.assertTrue(capability["available"])
-        self.assertEqual(capability["version"], 11)
+        self.assertEqual(capability["version"], 12)
         self.assertEqual(
             capability["actions"],
             [
@@ -5092,8 +5101,11 @@ class CrossChatStoreTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(
             capability["features"]["exact_queued_delivery_skip"]
         )
-        self.assertTrue(
-            capability["features"]["secure_peer_fifo_barriers"]
+        self.assertFalse(capability["features"]["secure_peer_fifo_barriers"])
+        self.assertFalse(capability["features"]["secure_peer_agent_relay"])
+        self.assertEqual(
+            capability["features"]["cross_server_delivery"],
+            "team_network_inbox_only",
         )
         self.assertFalse(
             capability["features"]["agent_ambient_local_handoffs"]

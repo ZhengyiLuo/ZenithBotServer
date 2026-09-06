@@ -377,6 +377,7 @@ class HubStore:
         now: int | None = None,
         managed_host_identity: str | None = None,
         managed_server_instance_id: str | None = None,
+        managed_host_display_name: str = "Team Hub host",
         allow_bound_control: bool = False,
         maintenance_control_locked: bool = False,
         managed_reactivation_hub_id: str | None = None,
@@ -414,6 +415,12 @@ class HubStore:
             _identity(managed_server_instance_id)
             if managed_server_instance_id is not None
             else None
+        )
+        self.managed_host_display_name = _bounded_text(
+            managed_host_display_name,
+            "managed_host_display_name",
+            1,
+            160,
         )
         ensure_private_directory(self.data_dir)
         self.reactivation_fenced_start = False
@@ -5982,8 +5989,10 @@ class HubStore:
             return None
         row = connection.execute(
             """
-            SELECT n.id,n.team_id,n.principal_id,n.status,
-                   p.kind AS principal_kind,p.scope_team_id,p.status AS principal_status
+            SELECT n.id,n.team_id,n.principal_id,n.display_name AS node_display_name,
+                   n.status,p.kind AS principal_kind,p.scope_team_id,
+                   p.display_name AS principal_display_name,
+                   p.status AS principal_status
             FROM nodes AS n JOIN principals AS p ON p.id=n.principal_id
             WHERE n.server_identity=?
             """,
@@ -6002,15 +6011,25 @@ class HubStore:
                     "Managed server identity conflicts with Team Hub state",
                     409,
                 )
-            if row["status"] != "active":
+            label = self.managed_host_display_name
+            if row["status"] != "active" or row["node_display_name"] != label:
                 connection.execute(
-                    "UPDATE nodes SET status='active',last_seen_at=? WHERE id=?",
-                    (timestamp, row["id"]),
+                    """
+                    UPDATE nodes
+                    SET display_name=?,status='active',last_seen_at=?
+                    WHERE id=?
+                    """,
+                    (label, timestamp, row["id"]),
+                )
+            if row["principal_display_name"] != label:
+                connection.execute(
+                    "UPDATE principals SET display_name=?,updated_at=? WHERE id=?",
+                    (label, timestamp, row["principal_id"]),
                 )
             return str(row["id"])
         principal_id = _id("node_principal")
         node_id = _id("node")
-        label = "Team Hub host"
+        label = self.managed_host_display_name
         connection.execute(
             """
             INSERT INTO principals(
@@ -10038,6 +10057,28 @@ class HubStore:
         }
 
     @staticmethod
+    def _require_server_inbox_write(
+        request: dict[str, Any],
+        *,
+        destination_required: bool,
+    ) -> None:
+        """Keep agent records readable while retiring them as mail parties."""
+
+        destination = request.get("to")
+        if request.get("from_agent_id") is not None or (
+            destination_required
+            and (
+                not isinstance(destination, dict)
+                or destination.get("kind") != "server"
+            )
+        ):
+            raise HubError(
+                "invalid_request",
+                "Team Network mail accepts server inboxes only",
+                422,
+            )
+
+    @staticmethod
     def _network_recipient(
         connection: sqlite3.Connection,
         team_id: str,
@@ -10216,6 +10257,7 @@ class HubStore:
         team_id: str,
         request: dict[str, Any],
     ) -> dict[str, Any]:
+        self._require_server_inbox_write(request, destination_required=True)
         timestamp = _now()
         body, body_format, body_bytes = self._network_body(request)
         fingerprint = canonical_fingerprint(
@@ -10611,6 +10653,7 @@ class HubStore:
         team_id: str,
         request: dict[str, Any],
     ) -> dict[str, Any]:
+        self._require_server_inbox_write(request, destination_required=True)
         timestamp = _now()
         body, body_format, body_bytes = self._network_body(request)
         ttl = int(request.get("expires_in_seconds", 86_400))
@@ -10865,6 +10908,7 @@ class HubStore:
         request_id: str,
         request: dict[str, Any],
     ) -> dict[str, Any]:
+        self._require_server_inbox_write(request, destination_required=False)
         clean_id = _identity(request_id)
         timestamp = _now()
         body, body_format, body_bytes = self._network_body(request)
@@ -10892,6 +10936,17 @@ class HubStore:
                 ).fetchone()
                 if request_item is None:
                     raise HubError("not_found", "Resource not found", 404)
+                if (
+                    request_item["sender_kind"] == "agent"
+                    or request_item["recipient_kind"] == "agent"
+                ):
+                    # Retain legacy agent-addressed request history, but never
+                    # append a new cross-server agent-authored/directed reply.
+                    raise HubError(
+                        "invalid_request",
+                        "Agent-addressed Team Network requests are retired",
+                        422,
+                    )
                 cached = self._idempotency_lookup(
                     connection,
                     team_id,

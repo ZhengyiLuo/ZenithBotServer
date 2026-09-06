@@ -359,6 +359,109 @@ sys.exit(10)
                 self.assertEqual(health.status_code, 200, health.text)
                 self.assertFalse(health.json()["server_session_available"])
 
+    def test_managed_host_display_name_migrates_node_and_principal_idempotently(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            data_dir = Path(temporary) / "hub"
+            legacy = HubStore(
+                data_dir,
+                managed_host_identity=HOST_A,
+                managed_server_instance_id="managed-instance-a",
+            )
+            proof = legacy.bootstrap_proof_path.read_text().strip()
+            bundle = legacy.bootstrap(
+                proof,
+                "owner@example.com",
+                "Owner",
+                "Owner Mac",
+            )
+            team_id = bundle["teams"][0]["id"]
+
+            connection = legacy.connect()
+            try:
+                original = connection.execute(
+                    """
+                    SELECT n.id,n.principal_id,n.display_name,n.last_seen_at,
+                           p.display_name AS principal_display_name,p.updated_at
+                    FROM nodes AS n
+                    JOIN principals AS p ON p.id=n.principal_id
+                    WHERE n.server_identity=?
+                    """,
+                    (HOST_A,),
+                ).fetchone()
+            finally:
+                connection.close()
+            self.assertIsNotNone(original)
+            self.assertEqual(original["display_name"], "Team Hub host")
+            self.assertEqual(original["principal_display_name"], "Team Hub host")
+
+            migration_timestamp = 2_000_000_000
+            migrated = HubStore(
+                data_dir,
+                now=migration_timestamp,
+                managed_host_identity=HOST_A,
+                managed_server_instance_id="managed-instance-a",
+                managed_host_display_name="  Sonic  ",
+            )
+            claims = migrated.managed_server_claims()
+            projection = migrated.get_network(claims, team_id)
+            host = next(server for server in projection["servers"] if server["is_host"])
+            self.assertEqual(host["display_name"], "Sonic")
+            self.assertEqual(
+                migrated.get_network_server(claims, team_id, host["id"])["server"],
+                host,
+            )
+
+            connection = migrated.connect()
+            try:
+                first = connection.execute(
+                    """
+                    SELECT n.id,n.principal_id,n.display_name,n.last_seen_at,
+                           p.display_name AS principal_display_name,p.updated_at
+                    FROM nodes AS n
+                    JOIN principals AS p ON p.id=n.principal_id
+                    WHERE n.server_identity=?
+                    """,
+                    (HOST_A,),
+                ).fetchone()
+            finally:
+                connection.close()
+            self.assertEqual(first["id"], original["id"])
+            self.assertEqual(first["principal_id"], original["principal_id"])
+            self.assertEqual(first["display_name"], "Sonic")
+            self.assertEqual(first["principal_display_name"], "Sonic")
+            self.assertEqual(first["last_seen_at"], migration_timestamp)
+            self.assertEqual(first["updated_at"], migration_timestamp)
+
+            HubStore(
+                data_dir,
+                now=migration_timestamp + 1,
+                managed_host_identity=HOST_A,
+                managed_server_instance_id="managed-instance-a",
+                managed_host_display_name="Sonic",
+            )
+            connection = migrated.connect()
+            try:
+                second = connection.execute(
+                    """
+                    SELECT n.display_name,n.last_seen_at,
+                           p.display_name AS principal_display_name,p.updated_at
+                    FROM nodes AS n
+                    JOIN principals AS p ON p.id=n.principal_id
+                    WHERE n.server_identity=?
+                    """,
+                    (HOST_A,),
+                ).fetchone()
+            finally:
+                connection.close()
+            self.assertEqual(dict(second), {
+                "display_name": "Sonic",
+                "last_seen_at": migration_timestamp,
+                "principal_display_name": "Sonic",
+                "updated_at": migration_timestamp,
+            })
+
     def test_managed_server_session_is_distinct_host_bound_and_write_capable(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             data_dir = Path(temporary) / "hub"
@@ -411,19 +514,19 @@ sys.exit(10)
                     "idempotency_key": "managed-server-agent-register-0001",
                 },
             )["agent"]
-            sent = store.create_network_mailbox_item(
-                claims,
-                team_id,
-                {
-                    "to": {"kind": "server", "id": host["id"]},
-                    "from_agent_id": agent["id"],
-                    "body": "Managed server mailbox write",
-                    "body_format": "plain",
-                    "idempotency_key": "managed-server-mailbox-0001",
-                },
-            )
-            self.assertEqual(sent["item"]["from"]["kind"], "agent")
-            self.assertEqual(sent["item"]["from"]["id"], agent["id"])
+            with self.assertRaises(HubError) as retired_agent_author:
+                store.create_network_mailbox_item(
+                    claims,
+                    team_id,
+                    {
+                        "to": {"kind": "server", "id": host["id"]},
+                        "from_agent_id": agent["id"],
+                        "body": "Managed server mailbox write",
+                        "body_format": "plain",
+                        "idempotency_key": "managed-server-mailbox-0001",
+                    },
+                )
+            self.assertEqual(retired_agent_author.exception.code, "invalid_request")
 
             bulletin = store.create_network_bulletin_post(
                 claims,

@@ -15,7 +15,7 @@ import stat
 import threading
 import time
 from typing import Any, Callable, Mapping
-from urllib.parse import quote, urlencode
+from urllib.parse import parse_qsl, quote, urlencode
 import uuid
 
 from agentsdock_team_hub.secure_peer import (
@@ -80,6 +80,14 @@ class _UnavailableSecurePeerClient:
 
     def list_connections(self) -> list[dict[str, Any]]:
         return []
+
+    def retire_agent_routes_locally(self) -> int:
+        """Keep local chat lifecycle available when peer state is quarantined."""
+
+        # A quarantined client has no trusted route store to mutate.  Relay is
+        # disabled, so archive/delete must remain a local operation rather than
+        # failing through ``__getattr__`` with an unrelated peer-state error.
+        return 0
 
     def __getattr__(self, _name: str):
         def unavailable(*_args: Any, **_kwargs: Any) -> Any:
@@ -152,6 +160,7 @@ class SecurePeerRuntime:
         display_name: str | None = None,
         logger: Any = None,
         team_cache_max_bytes: int | None = None,
+        agent_relay_enabled: bool = False,
     ) -> None:
         self.data_dir = Path(data_dir)
         self.server_identity = str(server_identity)
@@ -212,15 +221,12 @@ class SecurePeerRuntime:
         self._client_error: str | None = None
         self._client_failure_counts: dict[str, int] = {}
         self._initialization_error: str | None = None
-        # Cross-server chat authority is deliberately opened only after the
-        # connector, both route-revision CAS boundaries, and the durable local
-        # delivery ledger are attached.  Pairing/Teamspace never implicitly
-        # grants this later capability.
-        # This release ships the complete route/relay connector together with
-        # its durable consent epoch. Pairing never grants chat authority by
-        # itself: the requested cross_chat scopes, host approval, and two
-        # explicit published route revisions are all still required.
-        self._relay_enabled = True
+        # Teamspace transport and cross-server agent execution are separate
+        # capabilities. AgentsServer production keeps the latter disabled so
+        # paired servers exchange passive Team Network inbox records only.
+        # The explicit constructor flag remains for isolated protocol tests
+        # and migration tooling; pairing alone can never widen this value.
+        self._relay_enabled = bool(agent_relay_enabled)
         self._remote_routes_cache: dict[str, list[dict[str, Any]]] = {}
         self._remote_routes_refreshed_at: dict[str, int] = {}
         self._delivery_target_validator: Any = None
@@ -236,8 +242,20 @@ class SecurePeerRuntime:
                     external_actionable_pairing_count=(
                         self._host_actionable_pairing_count
                     ),
+                    pairing_capabilities=(
+                        ("cert_renewal", "cross_chat", "teamspace")
+                        if self._relay_enabled
+                        else ("cert_renewal", "teamspace")
+                    ),
                 )
             )
+            # Retire the client-side route outbox before this runtime can be
+            # published to the HTTP handlers or background maintenance
+            # loops.  Deferring this migration to the async connector leaves
+            # a startup window where an old pending route revocation can make
+            # one last cross-server agent RPC.
+            if not self._relay_enabled:
+                self.client.retire_agent_routes_locally()
             self.delivery_ledger: SecurePeerDeliveryLedger | None = (
                 SecurePeerDeliveryLedger(self.data_dir / "deliveries.sqlite3")
             )
@@ -417,7 +435,7 @@ class SecurePeerRuntime:
                 ),
             )
             consent = host_store.cross_chat_consent_status()
-            if int(consent.get("consent_epoch") or 0) == 0:
+            if self._relay_enabled and int(consent.get("consent_epoch") or 0) == 0:
                 seed = bytearray(hashlib.sha256(
                     (
                         "AgentsDock secure peer consent v1\0"
@@ -433,6 +451,8 @@ class SecurePeerRuntime:
                     idempotency_key=str(uuid.UUID(bytes=bytes(seed))),
                     activated_by="agentsserver-runtime-v1",
                 )
+            if not self._relay_enabled:
+                host_store.retire_agent_routes_locally()
             adapter = SecurePeerHubAdapter(hub_store)
             initial_peers = host_store.list_peers(team_id=None)
             preferred_peer_ids: set[str] = set()
@@ -968,6 +988,22 @@ class SecurePeerRuntime:
             return "reconnecting"
         return "offline"
 
+    def _displayed_scopes(self, value: Any) -> list[str]:
+        """Project only authority that this runtime can currently exercise."""
+
+        scopes = [
+            str(scope)
+            for scope in (value or [])
+            if isinstance(scope, str)
+        ]
+        if self._relay_enabled:
+            return scopes
+        return [
+            scope
+            for scope in scopes
+            if scope in {"teamspace.read", "teamspace.write"}
+        ]
+
     def _incoming_pairing(self, item: Mapping[str, Any]) -> dict[str, Any]:
         endpoint = str(item.get("source_endpoint") or item.get("remote_endpoint") or "")
         public_fp = item.get("peer_public_key_fingerprint") or _fingerprint_public_key_pem(
@@ -994,8 +1030,10 @@ class SecurePeerRuntime:
             "peer_public_key_fingerprint": public_fp,
             "transcript_hash": item.get("transcript_hash"),
             "sas_words": item.get("sas_words") or [],
-            "requested_scopes": item.get("requested_scopes") or [],
-            "granted_scopes": item.get("scopes") or [],
+            "requested_scopes": self._displayed_scopes(
+                item.get("requested_scopes")
+            ),
+            "granted_scopes": self._displayed_scopes(item.get("scopes")),
             "team_id": item.get("team_id"),
             "team_display_name": item.get("team_display_name"),
             "hub_id": self._host_store.hub_id if self._host_store else None,
@@ -1034,8 +1072,10 @@ class SecurePeerRuntime:
             "peer_public_key_fingerprint": item.get("peer_public_key_fingerprint"),
             "transcript_hash": item.get("transcript_hash"),
             "sas_words": item.get("sas_words") or [],
-            "requested_scopes": item.get("requested_scopes") or [],
-            "granted_scopes": item.get("scopes") or [],
+            "requested_scopes": self._displayed_scopes(
+                item.get("requested_scopes")
+            ),
+            "granted_scopes": self._displayed_scopes(item.get("scopes")),
             "team_id": item.get("team_id"),
             "team_display_name": item.get("team_display_name"),
             "hub_id": item.get("hub_id"),
@@ -1414,6 +1454,13 @@ class SecurePeerRuntime:
         expected_revision: str,
         idempotency_key: str,
     ) -> dict[str, Any]:
+        if not self._relay_enabled:
+            self.retire_agent_routes_locally()
+            raise SecurePeerError(
+                "remote_route_delivery_unavailable",
+                "Cross-server agent routes are retired; use Team Network Inbox",
+                409,
+            )
         with self._outbound_guard:
             self._require_route_outbound_quiescent(
                 expected_connection_id,
@@ -1537,6 +1584,11 @@ class SecurePeerRuntime:
         canonical_chat = str(chat_id or "")
         if not canonical_chat:
             raise SecurePeerError("invalid_request", "Chat id is invalid", 422)
+        if not self._relay_enabled:
+            # Agent routes are globally retired, so a chat archive/delete has
+            # no remote CAS to perform.  Reapply the local tombstone in case
+            # legacy state was restored after constructor migration.
+            return self.retire_agent_routes_locally()
         with self._outbound_guard:
             if self.delivery_ledger is None:
                 raise SecurePeerError(
@@ -1750,6 +1802,21 @@ class SecurePeerRuntime:
             if self._initialization_error is None
             else "secure_peer_state_unavailable"
         )
+
+    def retire_agent_routes_locally(self) -> int:
+        """Tombstone legacy agent routes while preserving Teamspace pairing."""
+
+        retired = 0
+        retire_client = getattr(self.client, "retire_agent_routes_locally", None)
+        if callable(retire_client):
+            retired += int(retire_client() or 0)
+        with self._guard:
+            store = self._host_store
+            self._remote_routes_cache.clear()
+            self._remote_routes_refreshed_at.clear()
+        if store is not None:
+            retired += int(store.retire_agent_routes_locally() or 0)
+        return retired
 
     def _retire_remote_revoked_active_connection(
         self,
@@ -1984,23 +2051,24 @@ class SecurePeerRuntime:
         self._client_failure_counts.pop(connection_id, None)
         retired_routes = 0
         ancillary_error = renewal_error
-        try:
-            retired_routes = (
-                self.client.flush_pending_route_revocations_for_connection(
-                    connection_id,
-                    limit=8,
+        if self._relay_enabled:
+            try:
+                retired_routes = (
+                    self.client.flush_pending_route_revocations_for_connection(
+                        connection_id,
+                        limit=8,
+                    )
                 )
-            )
-        except Exception as exc:
-            ancillary_error = ancillary_error or exc
-            if (
-                self._is_unconfirmed_peer_revocation(exc)
-                and self._remote_revocation_confirmed(connection_id) is True
-            ):
-                return self._retire_remote_revoked_active_connection(
-                    revocation_observation,
-                    pairing_recovery,
-                )
+            except Exception as exc:
+                ancillary_error = ancillary_error or exc
+                if (
+                    self._is_unconfirmed_peer_revocation(exc)
+                    and self._remote_revocation_confirmed(connection_id) is True
+                ):
+                    return self._retire_remote_revoked_active_connection(
+                        revocation_observation,
+                        pairing_recovery,
+                    )
 
         scope_values = (
             revocation_observation.get("scopes")
@@ -3006,6 +3074,17 @@ class SecurePeerRuntime:
             else []
         )
 
+    def recoverable_outbound_handoffs(
+        self,
+        *,
+        limit: int = 50,
+    ) -> list[dict[str, Any]]:
+        return (
+            self.delivery_ledger.recoverable_outbound(limit=limit)
+            if self.delivery_ledger is not None
+            else []
+        )
+
     def finish_delivery(
         self,
         envelope_id: str,
@@ -3211,6 +3290,12 @@ class SecurePeerRuntime:
         headers: Mapping[str, str] | None,
         body: bytes | None,
     ):
+        reply_parent_path = self._enforce_inbox_only_outbound_proxy(
+            method,
+            path,
+            query=query,
+            body=body,
+        )
         with self._outbound_guard:
             active = next(
                 (
@@ -3227,6 +3312,34 @@ class SecurePeerRuntime:
                     404,
                 )
             try:
+                if reply_parent_path is not None:
+                    parent_response = self.client.proxy(
+                        connection_id,
+                        "GET",
+                        reply_parent_path,
+                        query="",
+                        headers={"accept": "application/json"},
+                        body=None,
+                    )
+                    parent = self._decoded_proxy_json(
+                        parent_response,
+                        preserve_not_found=True,
+                    )
+                    item = parent.get("item")
+                    sender = item.get("from") if isinstance(item, Mapping) else None
+                    recipient = item.get("to") if isinstance(item, Mapping) else None
+                    allowed_participant_kinds = {"server", "human"}
+                    if (
+                        not isinstance(sender, Mapping)
+                        or not isinstance(recipient, Mapping)
+                        or sender.get("kind") not in allowed_participant_kinds
+                        or recipient.get("kind") not in allowed_participant_kinds
+                    ):
+                        raise SecurePeerError(
+                            "invalid_request",
+                            "Agent-addressed peer replies are retired",
+                            422,
+                        )
                 return self.client.proxy(
                     connection_id,
                     method,
@@ -3251,29 +3364,128 @@ class SecurePeerRuntime:
                 raise
 
     @staticmethod
+    def _enforce_inbox_only_outbound_proxy(
+        method: str,
+        path: str,
+        *,
+        query: str,
+        body: bytes | Mapping[str, Any] | None,
+    ) -> str | None:
+        """Fence agent-addressed Team Network traffic before peer I/O.
+
+        Hosts can run an older compatible build, so the client must enforce
+        the server-inbox boundary instead of relying only on the receiver.
+        The returned path identifies an immutable request that must be read
+        before a reply can be posted.
+        """
+
+        normalized_method = str(method).upper()
+        pieces = path.split("/")
+        if not (
+            len(pieces) >= 6
+            and pieces[:3] == ["", "v1", "teams"]
+            and pieces[4] == "network"
+        ):
+            return None
+
+        def invalid() -> None:
+            raise SecurePeerError(
+                "invalid_request",
+                "Cross-server Team Network mail accepts server inboxes only",
+                422,
+            )
+
+        resource = pieces[5:]
+        if normalized_method == "GET" and resource == ["mailbox"]:
+            try:
+                pairs = parse_qsl(query, keep_blank_values=True, strict_parsing=True)
+            except ValueError:
+                invalid()
+            address_kinds = [value for key, value in pairs if key == "address_kind"]
+            if address_kinds != ["server"]:
+                invalid()
+            return None
+        if normalized_method == "GET" and resource == ["messages"]:
+            try:
+                pairs = parse_qsl(query, keep_blank_values=True, strict_parsing=True)
+            except ValueError:
+                invalid()
+            for key, value in pairs:
+                if key in {"address_kind", "from_kind"} and value not in {
+                    "server",
+                    "human",
+                }:
+                    invalid()
+            return None
+        if normalized_method != "POST":
+            return None
+
+        mode: str | None = None
+        reply_parent: str | None = None
+        if resource == ["mailbox"]:
+            mode = "mailbox"
+        elif resource == ["requests"]:
+            mode = "request"
+        elif len(resource) == 3 and resource[0] == "requests" and resource[2] == "replies":
+            mode = "reply"
+            reply_parent = "/".join(pieces[:-1])
+        elif resource == ["messages"]:
+            mode = "messages"
+        else:
+            return None
+
+        if isinstance(body, Mapping):
+            value = dict(body)
+        else:
+            try:
+                value = json.loads(body) if isinstance(body, bytes) else None
+            except (UnicodeDecodeError, json.JSONDecodeError):
+                invalid()
+        if not isinstance(value, dict):
+            invalid()
+        if mode in {"mailbox", "request"}:
+            destination = value.get("to")
+            if (
+                not isinstance(destination, Mapping)
+                or destination.get("kind") != "server"
+                or not isinstance(destination.get("id"), str)
+                or not destination.get("id")
+                or value.get("from_agent_id") is not None
+            ):
+                invalid()
+        elif mode == "reply":
+            if value.get("from_agent_id") is not None:
+                invalid()
+        else:
+            recipients = value.get("recipients")
+            if (
+                not isinstance(recipients, list)
+                or not recipients
+                or any(
+                    not isinstance(recipient, Mapping)
+                    or recipient.get("kind") not in {"server", "human", "all"}
+                    for recipient in recipients
+                )
+            ):
+                invalid()
+        return reply_parent
+
+    @staticmethod
     def _agent_mail_destinations(
         projection: Mapping[str, Any],
         *,
         realm: Mapping[str, Any],
+        current_server_identity: str | None = None,
     ) -> list[dict[str, Any]]:
         servers = [
             dict(item)
             for item in projection.get("servers", [])
             if isinstance(item, Mapping)
         ]
-        agents = [
-            dict(item)
-            for item in projection.get("agents", [])
-            if isinstance(item, Mapping)
-        ]
         owned_server_ids = {
             str(item.get("id") or "")
             for item in servers
             if item.get("owned_by_caller") is True
-        }
-        labels = {
-            str(item.get("id") or ""): str(item.get("display_name") or "Server")
-            for item in servers
         }
         network = projection.get("network")
         network_display_name = (
@@ -3284,10 +3496,16 @@ class SecurePeerRuntime:
         destinations: list[dict[str, Any]] = []
         for server in servers:
             server_id = str(server.get("id") or "")
+            server_identity = str(server.get("server_identity") or "")
             if (
                 not server_id
                 or server_id in owned_server_ids
                 or server.get("status") != "active"
+                or server.get("owned_by_caller") is not False
+                or (
+                    current_server_identity is not None
+                    and server_identity == current_server_identity
+                )
             ):
                 continue
             destinations.append({
@@ -3296,26 +3514,6 @@ class SecurePeerRuntime:
                 "destination_id": server_id,
                 "display_name": str(server.get("display_name") or "Server")[:160],
                 "backend": None,
-                "network_display_name": network_display_name,
-            })
-        for agent in agents:
-            agent_id = str(agent.get("id") or "")
-            server_id = str(agent.get("server_id") or "")
-            if (
-                not agent_id
-                or not server_id
-                or server_id in owned_server_ids
-                or agent.get("status") != "active"
-            ):
-                continue
-            agent_name = str(agent.get("display_name") or "Agent")[:160]
-            server_name = labels.get(server_id, "Server")[:160]
-            destinations.append({
-                **dict(realm),
-                "destination_kind": "agent",
-                "destination_id": agent_id,
-                "display_name": f"{agent_name} — {server_name}"[:321],
-                "backend": str(agent.get("backend") or "other")[:32],
                 "network_display_name": network_display_name,
             })
         return destinations
@@ -3432,6 +3630,7 @@ class SecurePeerRuntime:
                                 "hub_id": host_store.hub_id,
                                 "server_identity": self.server_identity,
                             },
+                            current_server_identity=self.server_identity,
                         ))
                         if len(profiles) + len(team_profiles) > maximum_destinations:
                             raise HubError(
@@ -3500,6 +3699,7 @@ class SecurePeerRuntime:
                 profiles.extend(self._agent_mail_destinations(
                     projection,
                     realm=realm,
+                    current_server_identity=self.server_identity,
                 ))
                 if len(profiles) > maximum_destinations:
                     raise SecurePeerError(
@@ -3541,7 +3741,7 @@ class SecurePeerRuntime:
         team_id = str(profile.get("team_id") or "")
         target_kind = str(profile.get("destination_kind") or "")
         target_id = str(profile.get("destination_id") or "")
-        if target_kind not in {"server", "agent"} or not target_id or not team_id:
+        if target_kind != "server" or not target_id or not team_id:
             raise SecurePeerError(
                 "team_mail_route_changed",
                 "Team Network mail route is no longer available",

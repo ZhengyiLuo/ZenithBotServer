@@ -37,6 +37,7 @@ LAUNCHCTL_BOOTSTRAP_ATTEMPTS=3
 NON_INTERACTIVE="false"
 PORT_EXPLICIT="false"
 BIND_EXPLICIT="false"
+SERVER_NAME=""
 PORT_FALLBACK="auto"
 PORT_FALLBACK_ATTEMPTS=5
 TEAM_HUB_MODE_OVERRIDE=""
@@ -965,6 +966,72 @@ env_file_has_key() {
   printf '%s\n' "$contents" | grep -q "^${name}="
 }
 
+decode_server_name_env_value() {
+  local value="$1"
+  local python_path=""
+  python_path="$(safe_config_python)" || return 1
+  "$python_path" - "$value" <<'PY'
+import json
+import sys
+
+raw = sys.argv[1]
+if raw.startswith('"'):
+    try:
+        value = json.loads(raw)
+    except (TypeError, ValueError):
+        raise SystemExit(1)
+    if not isinstance(value, str):
+        raise SystemExit(1)
+else:
+    value = raw
+sys.stdout.write(value)
+PY
+}
+
+canonical_server_name() {
+  local value="$1"
+  local python_path=""
+  python_path="$(safe_config_python)" || return 1
+  "$python_path" - "$value" <<'PY'
+import sys
+import unicodedata
+
+value = sys.argv[1]
+if any(unicodedata.category(character) == "Cc" for character in value):
+    raise SystemExit(1)
+value = value.strip()
+try:
+    encoded = value.encode("utf-8")
+except UnicodeEncodeError:
+    raise SystemExit(1)
+if value and len(encoded) > 160:
+    raise SystemExit(1)
+sys.stdout.write(value)
+PY
+}
+
+runtime_env_server_name() {
+  local python_path=""
+  python_path="$(safe_config_python)" || return 1
+  "$python_path" - "$1" <<'PY'
+import json
+import sys
+
+sys.stdout.write(json.dumps(sys.argv[1], ensure_ascii=False))
+PY
+}
+
+xml_server_name() {
+  local python_path=""
+  python_path="$(safe_config_python)" || return 1
+  "$python_path" - "$1" <<'PY'
+import sys
+from xml.sax.saxutils import escape
+
+sys.stdout.write(escape(sys.argv[1], {'"': "&quot;", "'": "&apos;"}))
+PY
+}
+
 read_persisted_team_hub_config() {
   RESOLVED_TEAM_HUB_MODE=""
   if env_file_has_key "$ENV_FILE" AGENTSDOCK_TEAM_HUB_MODE; then
@@ -1195,7 +1262,13 @@ EXISTING_ENV_TEAM_HUB_URL_SET="false"
 EXISTING_ENV_TEAM_HUB_URL_VALUE=""
 EXISTING_ENV_TEAM_HUB_DIRECT_IP_URL_SET="false"
 EXISTING_ENV_TEAM_HUB_DIRECT_IP_URL_VALUE=""
+EXISTING_ENV_SERVER_NAME_SET="false"
+EXISTING_ENV_SERVER_NAME_VALUE=""
 if [[ -f "$ENV_FILE" && ! -L "$ENV_FILE" ]]; then
+  if env_file_has_key "$ENV_FILE" AGENTSDOCK_SERVER_NAME; then
+    EXISTING_ENV_SERVER_NAME_SET="true"
+    EXISTING_ENV_SERVER_NAME_VALUE="$(read_env_value "$ENV_FILE" AGENTSDOCK_SERVER_NAME)"
+  fi
   if env_file_has_key "$ENV_FILE" AGENTSDOCK_TEAM_HUB_MODE; then
     EXISTING_ENV_TEAM_HUB_MODE_SET="true"
     EXISTING_ENV_TEAM_HUB_MODE_VALUE="$(read_env_value "$ENV_FILE" AGENTSDOCK_TEAM_HUB_MODE)"
@@ -1213,6 +1286,23 @@ if [[ -f "$ENV_FILE" && ! -L "$ENV_FILE" ]]; then
     EXISTING_ENV_TEAM_HUB_DIRECT_IP_URL_VALUE="$(read_env_value "$ENV_FILE" AGENTSDOCK_TEAM_HUB_DIRECT_IP_URL)"
   fi
 fi
+
+raw_server_name=""
+if [[ "$EXISTING_ENV_SERVER_NAME_SET" == "true" ]]; then
+  raw_server_name="$EXISTING_ENV_SERVER_NAME_VALUE"
+elif env_file_has_key "$LEGACY_ENV_FILE" AGENTSDOCK_SERVER_NAME; then
+  raw_server_name="$(read_env_value "$LEGACY_ENV_FILE" AGENTSDOCK_SERVER_NAME)"
+elif [[ "${AGENTSDOCK_SERVER_NAME+x}" == "x" ]]; then
+  raw_server_name="$AGENTSDOCK_SERVER_NAME"
+fi
+decoded_server_name="$(decode_server_name_env_value "$raw_server_name")" || {
+  echo "AGENTSDOCK_SERVER_NAME has invalid persisted quoting." >&2
+  exit 2
+}
+SERVER_NAME="$(canonical_server_name "$decoded_server_name")" || {
+  echo "AGENTSDOCK_SERVER_NAME must be empty or at most 160 UTF-8 bytes and contain no control characters." >&2
+  exit 2
+}
 
 read_persisted_team_hub_config
 EXISTING_TEAM_HUB_MODE="$RESOLVED_TEAM_HUB_MODE"
@@ -2275,6 +2365,13 @@ assert_env_backup_team_hub_config() {
       && [[ "$(read_env_value "$ENV_CONFIG_BACKUP" AGENTSDOCK_TEAM_HUB_DIRECT_IP_URL)" != "$EXISTING_ENV_TEAM_HUB_DIRECT_IP_URL_VALUE" ]]; }; then
     mismatch="true"
   fi
+  actual_set="false"
+  env_file_has_key "$ENV_CONFIG_BACKUP" AGENTSDOCK_SERVER_NAME && actual_set="true"
+  if [[ "$actual_set" != "$EXISTING_ENV_SERVER_NAME_SET" ]] \
+    || { [[ "$actual_set" == "true" ]] \
+      && [[ "$(read_env_value "$ENV_CONFIG_BACKUP" AGENTSDOCK_SERVER_NAME)" != "$EXISTING_ENV_SERVER_NAME_VALUE" ]]; }; then
+    mismatch="true"
+  fi
   if [[ "$mismatch" == "true" ]]; then
     echo "The captured rollback configuration does not match the verified Team Hub configuration." >&2
     return 1
@@ -3242,7 +3339,7 @@ write_runtime_env() {
     local filter_status=0
     preserved_contents="$(read_owned_config_file "$PRESERVE_SOURCE")" || return 1
     if printf '%s\n' "$preserved_contents" \
-      | grep -Ev '^(AGENTSDOCK_(STATE_DIR|AGENT_CWD|AGENT_BIND|AGENT_PORT|AGENT_TOKEN|TEAM_HUB_MODE|TEAM_HUB_TRANSPORT|TEAM_HUB_URL|TEAM_HUB_DIRECT_IP_URL|TEAM_HUB_REACTIVATION_HUB_ID|TEAM_HUB_REACTIVATION_OPERATION_ID|TEAM_HUB_REACTIVATION_SNAPSHOT|TEAM_HUB_UPDATE_HUB_ID|TEAM_HUB_UPDATE_OPERATION_ID|TEAM_HUB_UPDATE_SNAPSHOT)|AGENTS_SERVER_(STATE_DIR|INSTALL_DIR)|ZENITHBOT_AGENT_(DIR|CWD|BIND|PORT|TOKEN)|ZENITHDOCK_AGENT_TOKEN|PATH)=' \
+      | grep -Ev '^(AGENTSDOCK_(STATE_DIR|AGENT_CWD|AGENT_BIND|AGENT_PORT|AGENT_TOKEN|SERVER_NAME|TEAM_HUB_MODE|TEAM_HUB_TRANSPORT|TEAM_HUB_URL|TEAM_HUB_DIRECT_IP_URL|TEAM_HUB_REACTIVATION_HUB_ID|TEAM_HUB_REACTIVATION_OPERATION_ID|TEAM_HUB_REACTIVATION_SNAPSHOT|TEAM_HUB_UPDATE_HUB_ID|TEAM_HUB_UPDATE_OPERATION_ID|TEAM_HUB_UPDATE_SNAPSHOT)|AGENTS_SERVER_(STATE_DIR|INSTALL_DIR)|ZENITHBOT_AGENT_(DIR|CWD|BIND|PORT|TOKEN)|ZENITHDOCK_AGENT_TOKEN|PATH)=' \
       > "$env_temp"; then
       :
     else
@@ -3251,6 +3348,11 @@ write_runtime_env() {
     fi
   else
     : > "$env_temp"
+  fi
+  if [[ -n "$SERVER_NAME" ]]; then
+    local encoded_server_name=""
+    encoded_server_name="$(runtime_env_server_name "$SERVER_NAME")" || return 1
+    printf 'AGENTSDOCK_SERVER_NAME=%s\n' "$encoded_server_name" >> "$env_temp"
   fi
   cat >> "$env_temp" <<EOF
 AGENTSDOCK_STATE_DIR=$STATE_ROOT
@@ -3929,6 +4031,12 @@ EOF
     service_temp="$LAUNCH_AGENTS/.com.agentsdock.server.plist.activation-$ACTIVATION_TRANSACTION_ID-service.source"
     (umask 077; set -o noclobber; : > "$service_temp") 2>/dev/null || return 1
     chmod 600 "$service_temp" || return 1
+    local launchd_server_name_entry=""
+    if [[ -n "$SERVER_NAME" ]]; then
+      local escaped_server_name=""
+      escaped_server_name="$(xml_server_name "$SERVER_NAME")" || return 1
+      launchd_server_name_entry="    <key>AGENTSDOCK_SERVER_NAME</key><string>$escaped_server_name</string>"
+    fi
     cat > "$service_temp" <<EOF
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -3947,6 +4055,7 @@ EOF
     <key>AGENTSDOCK_AGENT_BIND</key><string>$BIND_ADDRESS</string>
     <key>AGENTSDOCK_AGENT_PORT</key><string>$PORT</string>
     <key>AGENTSDOCK_AGENT_TOKEN</key><string>$TOKEN</string>
+$launchd_server_name_entry
     <key>AGENTSDOCK_TEAM_HUB_MODE</key><string>$TEAM_HUB_MODE</string>
     <key>AGENTSDOCK_TEAM_HUB_TRANSPORT</key><string>$TEAM_HUB_TRANSPORT</string>
     <key>AGENTSDOCK_TEAM_HUB_URL</key><string>$TEAM_HUB_URL</string>
@@ -5609,6 +5718,14 @@ load_pending_activation_transaction() {
   fi
   loaded_value="$(read_env_value "$ENV_FILE" AGENTSDOCK_AGENT_TOKEN 2>/dev/null || true)"
   [[ -z "$loaded_value" ]] || TOKEN="$loaded_value"
+  if env_file_has_key "$ENV_FILE" AGENTSDOCK_SERVER_NAME; then
+    loaded_value="$(read_env_value "$ENV_FILE" AGENTSDOCK_SERVER_NAME 2>/dev/null)" \
+      || return 1
+    loaded_value="$(decode_server_name_env_value "$loaded_value")" || return 1
+    SERVER_NAME="$(canonical_server_name "$loaded_value")" || return 1
+  else
+    SERVER_NAME=""
+  fi
   loaded_value="$(read_env_value "$ENV_FILE" AGENTSDOCK_TEAM_HUB_MODE 2>/dev/null || true)"
   [[ -z "$loaded_value" ]] || TEAM_HUB_MODE="$loaded_value"
   loaded_value="$(read_env_value "$ENV_FILE" AGENTSDOCK_TEAM_HUB_TRANSPORT 2>/dev/null || true)"

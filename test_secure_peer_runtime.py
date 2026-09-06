@@ -13,6 +13,7 @@ from unittest import mock
 from agentsdock_team_hub.secure_peer import (
     AttachmentFileLease,
     PAIRING_STATUS_LIMIT,
+    ProxyResponse,
     SecurePeerError,
     SecurePeerStore,
 )
@@ -152,6 +153,69 @@ class SecurePeerRuntimeTests(unittest.TestCase):
             finally:
                 runtime.shutdown()
 
+    def test_server_mention_requires_authoritative_display_name_snapshot(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            runtime = SecurePeerRuntime(
+                Path(temporary) / "secure-peers",
+                server_identity="source_server",
+                server_instance_id="source_instance",
+                display_name="Source",
+            )
+            realm = {
+                "realm": "secure_peer",
+                "team_id": "team_1",
+                "hub_id": "hub_1",
+                "connection_id": "connection_12345678",
+            }
+            target_id = "node_sonic_12345678"
+            canonical = {
+                "server": {
+                    "id": target_id,
+                    "server_identity": "sonic_server_identity",
+                    "display_name": "Sonic",
+                    "status": "active",
+                    "is_host": True,
+                    "owned_by_caller": False,
+                }
+            }
+
+            def remote_get(_realm, path, query, *, preserve_not_found=False):
+                self.assertEqual(_realm, realm)
+                self.assertEqual(
+                    path,
+                    f"/v1/teams/team_1/network/servers/{target_id}",
+                )
+                self.assertEqual(query, {})
+                self.assertTrue(preserve_not_found)
+                return canonical
+
+            reference = {
+                "team_id": "team_1",
+                "recipient_kind": "server",
+                "target_id": target_id,
+                "display_name_snapshot": "Sonic",
+            }
+            try:
+                with mock.patch.object(
+                    runtime, "team_realms", return_value=[realm]
+                ), mock.patch.object(
+                    runtime, "_team_hub_get", side_effect=remote_get
+                ):
+                    self.assertEqual(
+                        runtime.resolve_team_references([reference]),
+                        [reference],
+                    )
+                    with self.assertRaises(SecurePeerError) as stale:
+                        runtime.resolve_team_references([
+                            {
+                                **reference,
+                                "display_name_snapshot": "Visible local alias",
+                            }
+                        ])
+                self.assertEqual(stale.exception.code, "team_reference_invalid")
+            finally:
+                runtime.shutdown()
+
     def test_agent_mail_receipt_rejects_remote_mismatch(self) -> None:
         valid = {
             "item": {
@@ -191,6 +255,122 @@ class SecurePeerRuntimeTests(unittest.TestCase):
                     target_id="node_1",
                     message="prepared body",
                 )
+
+    def test_agent_mail_destinations_project_active_remote_servers_only(self) -> None:
+        destinations = SecurePeerRuntime._agent_mail_destinations(
+            {
+                "network": {"display_name": "Private Team"},
+                "servers": [
+                    {
+                        "id": "node_owned_12345678",
+                        "display_name": "Owned",
+                        "status": "active",
+                        "owned_by_caller": True,
+                    },
+                    {
+                        "id": "node_remote_12345678",
+                        "display_name": "Remote",
+                        "status": "active",
+                        "owned_by_caller": False,
+                        "server_identity": "remote_identity",
+                        "is_host": False,
+                    },
+                    {
+                        "id": "node_host_12345678",
+                        "display_name": "Sonic",
+                        "status": "active",
+                        "owned_by_caller": False,
+                        "server_identity": "host_identity",
+                        "is_host": True,
+                    },
+                    {
+                        "id": "node_current_malformed_12345678",
+                        "display_name": "Current duplicate",
+                        "status": "active",
+                        "owned_by_caller": False,
+                        "server_identity": "current_identity",
+                        "is_host": False,
+                    },
+                    {
+                        "id": "node_offline_12345678",
+                        "display_name": "Offline",
+                        "status": "offline",
+                        "owned_by_caller": False,
+                    },
+                    {
+                        "id": "node_ownership_missing_12345678",
+                        "display_name": "Malformed",
+                        "status": "active",
+                    },
+                ],
+                "agents": [
+                    {
+                        "id": "agent_remote_12345678",
+                        "server_id": "node_remote_12345678",
+                        "display_name": "Remote agent",
+                        "backend": "codex",
+                        "status": "active",
+                    }
+                ],
+            },
+            realm={"realm": "secure_peer", "team_id": "team_1"},
+            current_server_identity="current_identity",
+        )
+        self.assertEqual(
+            [
+                (
+                    item["destination_kind"],
+                    item["destination_id"],
+                    item["display_name"],
+                    item["backend"],
+                )
+                for item in destinations
+            ],
+            [
+                ("server", "node_remote_12345678", "Remote", None),
+                ("server", "node_host_12345678", "Sonic", None),
+            ],
+        )
+        self.assertNotIn(
+            "agent_remote_12345678",
+            {item["destination_id"] for item in destinations},
+        )
+        self.assertNotIn(
+            "node_current_malformed_12345678",
+            {item["destination_id"] for item in destinations},
+        )
+
+    def test_agent_mail_send_rejects_agent_profile_without_network_io(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            runtime = SecurePeerRuntime(
+                Path(temporary) / "secure-peers",
+                server_identity="source_server",
+                server_instance_id="source_instance",
+                display_name="Source",
+            )
+            try:
+                with (
+                    mock.patch.object(runtime, "proxy") as proxy,
+                    mock.patch.object(runtime.client, "list_connections") as listed,
+                ):
+                    with self.assertRaises(SecurePeerError) as rejected:
+                        runtime.send_agent_mail(
+                            {
+                                "realm": "secure_peer",
+                                "team_id": "team_1",
+                                "destination_kind": "agent",
+                                "destination_id": "agent_remote_12345678",
+                            },
+                            kind="message",
+                            message="must remain passive",
+                            idempotency_key="server-only-mail-1",
+                        )
+                self.assertEqual(rejected.exception.code, "team_mail_route_changed")
+                self.assertEqual(rejected.exception.status_code, 409)
+                listed.assert_not_called()
+                proxy.assert_not_called()
+            finally:
+                runtime.shutdown()
 
     def test_agent_mail_send_rejects_stale_connection_certificate(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -353,6 +533,197 @@ class SecurePeerRuntimeTests(unittest.TestCase):
                 "secure_peer_host_unavailable",
             )
             self.assertTrue(runtime.status()["host"]["action"])
+            runtime.shutdown()
+
+    def test_default_inbox_only_runtime_attaches_team_hub_without_relay(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            runtime = SecurePeerRuntime(
+                root / "secure-peers",
+                server_identity="server_identity_test",
+                server_instance_id="server_instance_test",
+                display_name="Test server",
+            )
+            hub_store = HubStore(root / "hub")
+            try:
+                runtime.attach_host_hub(
+                    hub_id=hub_store.hub_id,
+                    hub_data_dir=root / "hub",
+                    hub_store=hub_store,
+                )
+                status = runtime.status()
+                self.assertTrue(status["host"]["available"])
+                self.assertFalse(status["remote_route_delivery_available"])
+                self.assertEqual(status["remote_routes"], [])
+                self.assertEqual(status["published_routes"], [])
+                self.assertEqual(
+                    runtime._host_store.cross_chat_consent_status()[
+                        "consent_epoch"
+                    ],
+                    0,
+                )
+            finally:
+                runtime.shutdown()
+
+    def test_default_inbox_only_runtime_synchronously_retires_client_routes(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            data_dir = root / "secure-peers"
+            legacy = SecurePeerRuntime(
+                data_dir,
+                server_identity="server_identity_test",
+                server_instance_id="server_instance_legacy",
+                display_name="Test server",
+                agent_relay_enabled=True,
+            )
+            active_route_id = str(uuid.uuid4())
+            pending_route_id = str(uuid.uuid4())
+            connection = legacy.client._connect()
+            try:
+                for route_id, status, pending in (
+                    (active_route_id, "active", 0),
+                    (pending_route_id, "revoked", 1),
+                ):
+                    connection.execute(
+                        """INSERT INTO client_routes(
+                        route_id,connection_id,revision,alias,display_title,
+                        actions_json,chat_id,status,revoke_pending,
+                        revoke_expected_revision,revoke_idempotency_key,
+                        created_at,updated_at
+                        ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                        (
+                            route_id,
+                            str(uuid.uuid4()),
+                            "rev_" + "a" * 32,
+                            f"route-{route_id[-8:]}",
+                            "Legacy route",
+                            '["instruction"]',
+                            f"chat-{route_id}",
+                            status,
+                            pending,
+                            "rev_" + "a" * 32 if pending else None,
+                            str(uuid.uuid4()) if pending else None,
+                            123,
+                            123,
+                        ),
+                    )
+            finally:
+                connection.close()
+                legacy.shutdown()
+
+            runtime = SecurePeerRuntime(
+                data_dir,
+                server_identity="server_identity_test",
+                server_instance_id="server_instance_current",
+                display_name="Test server",
+            )
+            try:
+                connection = runtime.client._connect()
+                try:
+                    rows = connection.execute(
+                        """SELECT status,revoke_pending,
+                        revoke_expected_revision,revoke_idempotency_key
+                        FROM client_routes ORDER BY route_id"""
+                    ).fetchall()
+                finally:
+                    connection.close()
+                self.assertEqual(len(rows), 2)
+                self.assertTrue(all(row["status"] == "revoked" for row in rows))
+                self.assertTrue(all(int(row["revoke_pending"]) == 0 for row in rows))
+                self.assertTrue(
+                    all(row["revoke_expected_revision"] is None for row in rows)
+                )
+                self.assertTrue(
+                    all(row["revoke_idempotency_key"] is None for row in rows)
+                )
+            finally:
+                runtime.shutdown()
+
+    def test_inbox_only_status_hides_legacy_cross_chat_scopes(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            runtime = SecurePeerRuntime(
+                Path(temporary) / "secure-peers",
+                server_identity="server_identity_test",
+                server_instance_id="server_instance_test",
+                display_name="Test server",
+            )
+            legacy_scopes = [
+                "teamspace.read",
+                "teamspace.write",
+                "cross_chat.instruction",
+                "cross_chat.request_reply",
+            ]
+            try:
+                incoming = runtime._incoming_pairing(
+                    {
+                        **self.incoming_pairing("active", 123),
+                        "requested_scopes": legacy_scopes,
+                        "scopes": legacy_scopes,
+                    }
+                )
+                outgoing = runtime._outgoing_pairing(
+                    {
+                        **self.outgoing_pairing(123),
+                        "requested_scopes": legacy_scopes,
+                        "scopes": legacy_scopes,
+                    }
+                )
+                for projection in (incoming, outgoing):
+                    self.assertEqual(
+                        projection["requested_scopes"],
+                        ["teamspace.read", "teamspace.write"],
+                    )
+                    self.assertEqual(
+                        projection["granted_scopes"],
+                        ["teamspace.read", "teamspace.write"],
+                    )
+            finally:
+                runtime.shutdown()
+
+    def test_inbox_only_route_retirement_never_calls_the_peer(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            runtime = SecurePeerRuntime(
+                Path(temporary) / "secure-peers",
+                server_identity="server_identity_test",
+                server_instance_id="server_instance_test",
+                display_name="Test server",
+            )
+            self.assertEqual(
+                runtime.client._pairing_capabilities,
+                ("cert_renewal", "teamspace"),
+            )
+            with (
+                mock.patch.object(
+                    runtime.client,
+                    "revoke_published_route",
+                ) as remote_revoke,
+                mock.patch.object(
+                    runtime,
+                    "_require_route_outbound_quiescent",
+                    side_effect=AssertionError(
+                        "disabled relay must not enter remote CAS fencing"
+                    ),
+                ) as outbound_fence,
+            ):
+                self.assertEqual(
+                    runtime.revoke_routes_for_chat("chat-local"),
+                    0,
+                )
+                with self.assertRaises(SecurePeerError) as retired:
+                    runtime.revoke_route(
+                        route_id=str(uuid.uuid4()),
+                        expected_connection_id=str(uuid.uuid4()),
+                        expected_revision="rev_" + "a" * 32,
+                        idempotency_key=str(uuid.uuid4()),
+                    )
+            self.assertEqual(
+                retired.exception.code,
+                "remote_route_delivery_unavailable",
+            )
+            remote_revoke.assert_not_called()
+            outbound_fence.assert_not_called()
             runtime.shutdown()
 
     def test_failed_host_attachment_is_retried_without_service_restart(self) -> None:
@@ -890,6 +1261,7 @@ class SecurePeerRuntimeTests(unittest.TestCase):
                 server_identity="server_identity_test",
                 server_instance_id="server_instance_test",
                 display_name="Test server",
+                agent_relay_enabled=True,
             )
             active = {
                 **self.outgoing_pairing(123),
@@ -2262,7 +2634,7 @@ class SecurePeerRuntimeTests(unittest.TestCase):
             self.assertFalse(result["active"])
             runtime.shutdown()
 
-    def test_teamspace_only_connection_skips_cross_chat_route_refresh(self) -> None:
+    def test_inbox_only_connection_makes_no_route_maintenance_rpc(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             runtime = SecurePeerRuntime(
                 Path(temporary) / "secure-peers",
@@ -2286,8 +2658,7 @@ class SecurePeerRuntimeTests(unittest.TestCase):
                 mock.patch.object(
                     runtime.client,
                     "flush_pending_route_revocations_for_connection",
-                    return_value=0,
-                ),
+                ) as flush_route_revocations,
                 mock.patch.object(
                     runtime.client,
                     "renew_if_due",
@@ -2304,6 +2675,7 @@ class SecurePeerRuntimeTests(unittest.TestCase):
                 ) as list_remote_routes,
             ):
                 result = runtime.maintenance_once()
+            flush_route_revocations.assert_not_called()
             list_remote_routes.assert_not_called()
             self.assertTrue(result["healthy"])
             self.assertEqual(runtime._remote_routes_cache[connection_id], [])
@@ -2317,6 +2689,7 @@ class SecurePeerRuntimeTests(unittest.TestCase):
                 server_identity="server_identity_test",
                 server_instance_id="server_instance_test",
                 display_name="Test server",
+                agent_relay_enabled=True,
             )
             active = {
                 **self.outgoing_pairing(123),
@@ -2601,6 +2974,135 @@ class SecurePeerRuntimeTests(unittest.TestCase):
                 retire.assert_not_called()
                 runtime.shutdown()
 
+    def test_inbox_only_proxy_rejects_agent_addresses_before_peer_io(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            runtime = SecurePeerRuntime(
+                Path(temporary) / "secure-peers",
+                server_identity="server_identity_test",
+                server_instance_id="server_instance_test",
+                display_name="Test server",
+            )
+            connection_id = str(uuid.uuid4())
+            attempts = (
+                (
+                    "POST",
+                    "/v1/teams/team-1/network/mailbox",
+                    "",
+                    {"to": {"kind": "agent", "id": "agent-1"}},
+                ),
+                (
+                    "POST",
+                    "/v1/teams/team-1/network/requests",
+                    "",
+                    {
+                        "to": {"kind": "server", "id": "server-2"},
+                        "from_agent_id": "agent-1",
+                    },
+                ),
+                (
+                    "POST",
+                    "/v1/teams/team-1/network/requests/request-1/replies",
+                    "",
+                    {"from_agent_id": "agent-1"},
+                ),
+                (
+                    "POST",
+                    "/v1/teams/team-1/network/messages",
+                    "",
+                    {"recipients": [{"kind": "agent", "id": "agent-1"}]},
+                ),
+                (
+                    "GET",
+                    "/v1/teams/team-1/network/mailbox",
+                    "address_kind=agent&address_id=agent-1",
+                    None,
+                ),
+            )
+            for method, path, query, value in attempts:
+                body = (
+                    json.dumps(value).encode("utf-8")
+                    if value is not None
+                    else None
+                )
+                with (
+                    self.subTest(method=method, path=path, body=value),
+                    mock.patch.object(runtime.client, "list_connections") as listed,
+                    mock.patch.object(runtime.client, "proxy") as peer_proxy,
+                    self.assertRaises(SecurePeerError) as rejected,
+                ):
+                    runtime.proxy(
+                        connection_id,
+                        method,
+                        path,
+                        query=query,
+                        headers={"content-type": "application/json"},
+                        body=body,
+                    )
+                self.assertEqual(rejected.exception.code, "invalid_request")
+                self.assertEqual(rejected.exception.status_code, 422)
+                listed.assert_not_called()
+                peer_proxy.assert_not_called()
+            runtime.shutdown()
+
+    def test_inbox_only_proxy_preflights_legacy_request_before_reply(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            runtime = SecurePeerRuntime(
+                Path(temporary) / "secure-peers",
+                server_identity="server_identity_test",
+                server_instance_id="server_instance_test",
+                display_name="Test server",
+            )
+            active = self.outgoing_pairing(123)
+            connection_id = active["connection_id"]
+            legacy_parent = ProxyResponse(
+                200,
+                (("content-type", "application/json"),),
+                json.dumps(
+                    {
+                        "item": {
+                            "from": {"kind": "agent", "id": "agent-1"},
+                            "to": {"kind": "server", "id": "server-2"},
+                        }
+                    }
+                ).encode("utf-8"),
+            )
+            with (
+                mock.patch.object(
+                    runtime.client,
+                    "list_connections",
+                    return_value=[active],
+                ),
+                mock.patch.object(
+                    runtime.client,
+                    "proxy",
+                    return_value=legacy_parent,
+                ) as peer_proxy,
+                self.assertRaises(SecurePeerError) as rejected,
+            ):
+                runtime.proxy(
+                    connection_id,
+                    "POST",
+                    "/v1/teams/team-1/network/requests/request-1/replies",
+                    query="",
+                    headers={"content-type": "application/json"},
+                    body=json.dumps(
+                        {
+                            "body": "reply",
+                            "idempotency_key": "reply-legacy-agent-1",
+                        }
+                    ).encode("utf-8"),
+                )
+            self.assertEqual(rejected.exception.code, "invalid_request")
+            peer_proxy.assert_called_once_with(
+                connection_id,
+                "GET",
+                "/v1/teams/team-1/network/requests/request-1",
+                query="",
+                headers={"accept": "application/json"},
+                body=None,
+            )
+            runtime.shutdown()
+
     def test_proxy_keeps_local_trust_when_status_says_peer_is_active(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             runtime = SecurePeerRuntime(
@@ -2766,6 +3268,7 @@ class SecurePeerRuntimeTests(unittest.TestCase):
             self.assertIsNone(status["active_connection_id"])
             self.assertIn("safety validation", status["host"]["error"])
             self.assertFalse(runtime.remote_route_delivery_available())
+            self.assertEqual(runtime.revoke_routes_for_chat("chat-local"), 0)
             with self.assertRaises(SecurePeerError) as raised:
                 runtime.begin_pairing(
                     host="192.0.2.10",
@@ -2785,6 +3288,7 @@ class SecurePeerRuntimeTests(unittest.TestCase):
                 server_identity="server_identity_test",
                 server_instance_id="server_instance_test",
                 display_name="Test server",
+                agent_relay_enabled=True,
             )
             connection_id = str(uuid.uuid4())
             route_id = str(uuid.uuid4())

@@ -1,6 +1,7 @@
 import hashlib
 import json
 import os
+import plistlib
 import shutil
 import socket
 import sqlite3
@@ -1585,6 +1586,37 @@ exit 0
         self.assertNotIn('echo "  ${COLOR_BOLD}Access token', source)
         self.assertIsNone(re.search(r"(?m)^\s*sudo\b", source))
 
+    def test_server_name_rejects_controls_and_overlong_values(self):
+        for label, invalid in (
+            ("control", "Sonic\nInjected"),
+            ("overlong", "S" * 161),
+            ("overlong-multibyte", "界" * 60),
+        ):
+            with self.subTest(label=label), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary).resolve()
+                _home, fake_bin, install_root, environment = (
+                    self.fake_linux_preinstall_environment(root)
+                )
+                self.write_fake_uv(fake_bin)
+                environment["AGENTSDOCK_SERVER_NAME"] = invalid
+
+                result = subprocess.run(
+                    ["/bin/bash", str(INSTALLER), "--non-interactive"],
+                    env=environment,
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                )
+
+                self.assertEqual(result.returncode, 2, result.stderr)
+                self.assertIn(
+                    "empty or at most 160 UTF-8 bytes and contain no control characters",
+                    result.stderr,
+                )
+                self.assertTrue(
+                    (install_root / "current" / "runtime-marker").is_file()
+                )
+
     def test_help_does_not_modify_the_machine(self):
         result = subprocess.run(
             ["bash", str(INSTALLER), "--help"],
@@ -2583,7 +2615,11 @@ chmod 755 "$project/.venv/bin/python"
             hub_id = "hub_install_contract_12345678"
             config_root = root / "config"
             config_root.mkdir()
-            self.write_private_file(config_root / "env", "AGENTSDOCK_TEAM_HUB_MODE=host\n")
+            self.write_private_file(
+                config_root / "env",
+                "AGENTSDOCK_TEAM_HUB_MODE=host\n"
+                "AGENTSDOCK_SERVER_NAME=Zen's Studio\n",
+            )
             environment.update(
                 {
                     "FAKE_HEALTH_VERSION": self.release_version(),
@@ -2614,6 +2650,10 @@ chmod 755 "$project/.venv/bin/python"
             self.assertIn("AGENTSDOCK_TEAM_HUB_MODE=host\n", installed_env)
             self.assertIn("AGENTSDOCK_TEAM_HUB_TRANSPORT=loopback\n", installed_env)
             self.assertIn("AGENTSDOCK_TEAM_HUB_URL=\n", installed_env)
+            self.assertIn(
+                'AGENTSDOCK_SERVER_NAME="Zen\'s Studio"\n',
+                installed_env,
+            )
             service = (
                 home / ".config" / "systemd" / "user" / "agents-server.service"
             ).read_text()
@@ -5925,6 +5965,7 @@ chmod 755 "$project/.venv/bin/python"
             launchctl_state = root / "launchctl-state"
             launchctl_log = root / "launchctl.log"
             transient_done = root / "transient-done"
+            server_name = "Sonic & </string><key>Injected</key>"
             launchctl_state.write_text("loaded\n")
             self.write_executable(fake_bin / "launchctl", """#!/bin/sh
 command="$1"
@@ -5983,6 +6024,7 @@ exit 2
                 "FAKE_TEAM_HUB_ID": "hub_darwin_bootstrap_12345678",
                 "FAKE_TEAM_HUB_MODE": "host",
                 "AGENTS_SERVER_HEALTH_CHECK_ATTEMPTS": "1",
+                "AGENTSDOCK_SERVER_NAME": server_name,
             })
 
             result = subprocess.run(
@@ -6007,13 +6049,21 @@ exit 2
             self.assertEqual(calls.count("bootstrap"), 2)
             self.assertEqual(launchctl_state.read_text().strip(), "loaded")
             self.assertTrue((install_root / "current" / "agent_server.py").is_file())
-            plist = (
+            plist_path = (
                 home
                 / "Library"
                 / "LaunchAgents"
                 / "com.agentsdock.server.plist"
-            ).read_text()
+            )
+            plist = plist_path.read_text()
             self.assertIn("<key>AGENTSDOCK_TEAM_HUB_MODE</key><string>host</string>", plist)
+            launchd = plistlib.loads(plist_path.read_bytes())
+            self.assertEqual(
+                launchd["EnvironmentVariables"]["AGENTSDOCK_SERVER_NAME"],
+                server_name,
+            )
+            self.assertNotIn("Injected", launchd)
+            self.assertIn("&lt;/string&gt;&lt;key&gt;Injected&lt;/key&gt;", plist)
 
     def test_darwin_restart_allows_more_than_five_seconds_for_bootout(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -6216,6 +6266,7 @@ chmod 755 "$project/.venv/bin/python"
             "FAKE_LAUNCHCTL_LOG": str(root / "launchctl.log"),
             "REAL_PYTHON": sys.executable,
         }
+        environment.pop("AGENTSDOCK_SERVER_NAME", None)
         return home, fake_bin, install_root, environment
 
     @staticmethod
@@ -6258,6 +6309,7 @@ chmod 755 "$project/.venv/bin/python"
             "REAL_PYTHON": sys.executable,
         }
         for key in (
+            "AGENTSDOCK_SERVER_NAME",
             "AGENTSDOCK_TEAM_HUB_MODE",
             "AGENTSDOCK_TEAM_HUB_TRANSPORT",
             "AGENTSDOCK_TEAM_HUB_URL",

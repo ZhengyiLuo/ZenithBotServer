@@ -277,7 +277,7 @@ class SecurePeerHubAdapter:
     def _address(cls, value: Any) -> dict[str, str]:
         if not isinstance(value, dict) or set(value) != {"kind", "id"}:
             raise HubError("invalid_request", "Request body is invalid", 422)
-        if value.get("kind") not in {"server", "agent"}:
+        if value.get("kind") != "server":
             raise HubError("invalid_request", "Request body is invalid", 422)
         return {
             "kind": str(value["kind"]),
@@ -375,10 +375,11 @@ class SecurePeerHubAdapter:
             ),
         }
         from_agent = value.get("from_agent_id")
-        if from_agent is not None:
-            result["from_agent_id"] = cls._identifier(from_agent)
-        else:
-            result["from_agent_id"] = None
+        if mode in {"mailbox", "request", "reply"} and from_agent is not None:
+            # A secure peer speaks for its authenticated server identity.  It
+            # may not forge an agent sender, even when replaying a legacy body.
+            raise HubError("invalid_request", "Request body is invalid", 422)
+        result["from_agent_id"] = None
         if mode in {"mailbox", "request"}:
             result["to"] = cls._address(value.get("to"))
         if mode == "bulletin":
@@ -548,10 +549,7 @@ class SecurePeerHubAdapter:
             raise HubError("invalid_request", "Query is invalid", 422)
         if "limit" in values and not 1 <= int(values["limit"]) <= 100:
             raise HubError("invalid_request", "Query is invalid", 422)
-        if "address_kind" in values and values["address_kind"] not in {
-            "server",
-            "agent",
-        }:
+        if "address_kind" in values and values["address_kind"] != "server":
             raise HubError("invalid_request", "Query is invalid", 422)
         if "address_id" in values:
             values["address_id"] = SecurePeerHubAdapter._resource_id(
@@ -967,11 +965,40 @@ class SecurePeerHubAdapter:
                     and pieces[1:3] == [_NETWORK_CHILD, "requests"]
                     and pieces[4] == "replies"
                 ):
+                    request_id = self._resource_id(pieces[3])
+                    reply_body = self._network_text_body(request, mode="reply")
+                    existing_request = self.store.get_network_request(
+                        claims,
+                        team_id,
+                        request_id,
+                    )
+                    request_item = existing_request.get("item")
+                    sender = (
+                        request_item.get("from")
+                        if isinstance(request_item, dict)
+                        else None
+                    )
+                    recipient = (
+                        request_item.get("to")
+                        if isinstance(request_item, dict)
+                        else None
+                    )
+                    if (
+                        not isinstance(sender, dict)
+                        or not isinstance(recipient, dict)
+                        or sender.get("kind") == "agent"
+                        or recipient.get("kind") == "agent"
+                    ):
+                        raise HubError(
+                            "invalid_request",
+                            "Agent-addressed peer replies are retired",
+                            422,
+                        )
                     result = self.store.create_network_request_reply(
                         claims,
                         team_id,
-                        self._resource_id(pieces[3]),
-                        self._network_text_body(request, mode="reply"),
+                        request_id,
+                        reply_body,
                     )
                 elif len(pieces) == 3 and pieces[1:] == [_NETWORK_CHILD, "messages"]:
                     result = self.store.create_team_message(

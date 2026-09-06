@@ -223,6 +223,7 @@ class ManagedTeamHubHost:
         data_dir: Path,
         server_identity: str,
         server_instance_id: str = "server-instance-local-preview",
+        managed_host_display_name: str = "Team Hub host",
         allowed_hosts: set[str],
         transport: str = TEAM_HUB_TRANSPORT_LOOPBACK,
         hub_url: str | None = None,
@@ -241,6 +242,7 @@ class ManagedTeamHubHost:
         self.data_dir = Path(data_dir)
         self.server_identity = str(server_identity)
         self.server_instance_id = str(server_instance_id)
+        self.managed_host_display_name = str(managed_host_display_name)
         self.allowed_hosts = set(allowed_hosts)
         self.transport = transport
         self.hub_url = hub_url
@@ -330,6 +332,7 @@ class ManagedTeamHubHost:
                 allowed_hosts=self.allowed_hosts,
                 managed_host_identity=self.server_identity,
                 managed_server_instance_id=self.server_instance_id,
+                managed_host_display_name=self.managed_host_display_name,
                 managed_transport=self.transport,
                 managed_hub_url=(
                     self.hub_url

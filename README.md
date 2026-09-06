@@ -348,12 +348,15 @@ default-deny: only an ordinary user prompt whose first token is exactly
 `/mail` receives a short-lived provider capability. The helper freezes at most
 512 currently visible destinations as opaque run-local routes, accepts at most
 four sends, and reads the UTF-8 body from stdin so message content does not
-appear in process arguments. It creates a passive Team Network Inbox item; it
-never starts or steers a chat or agent. Scheduled jobs, synthetic handoffs, and
-near-matches such as `/mailbox` do not receive this authority. The provider
-mail harness creates message items only; it cannot create new Team Network
-requests. Existing request records and the separate Team Hub request lifecycle
-remain readable for backward data compatibility.
+appear in process arguments. Every listed destination is an active, non-owned
+server and every new item is addressed to that server's passive Team Network
+Inbox; `/mail` never targets, starts, or steers a remote agent. Scheduled jobs,
+synthetic handoffs, and near-matches such as `/mailbox` do not receive this
+authority. The provider mail harness creates message items only; it cannot
+create new Team Network requests. Legacy agent-addressed mail and request
+records remain readable through compatibility APIs, but provider and secure-
+peer mail paths cannot create new ones. The separate Team Hub request lifecycle
+also remains readable for backward data compatibility.
 
 The additive strict form `/mail server NAME MESSAGE` treats `NAME` as one
 case-sensitive token and the remainder as the exact normalized message body.
@@ -362,7 +365,7 @@ whose raw display name exactly equals `NAME`. Zero matches fail as not found;
 multiple matches, including equal names on different Team Networks, fail as
 ambiguous. A successful strict command exposes only that one opaque route and
 permits exactly one idempotent `kind=message` effect with the exact body. It
-cannot fall back to an agent destination, a case-insensitive name, a request,
+cannot target an agent destination, use a case-insensitive name, create a request,
 rewritten content, or a second send. Legacy `/mail` remains available for
 older clients. Health advertises the strict syntax and feature flags inside
 `agent_team_mail_v1`, so clients can discover it without a global API-contract
