@@ -4,6 +4,7 @@ storms, health-poll reconcile spam, and update-when-idle lockout."""
 import asyncio
 import json
 import tempfile
+import tracemalloc
 import unittest
 import uuid
 from datetime import datetime, timedelta, timezone
@@ -1064,6 +1065,141 @@ class PruneImportedHistoryTests(unittest.TestCase):
                 summary = agent_server.prune_duplicate_imported_history_sync("chat", dry_run=False)
             self.assertEqual(summary["removed_events"], 0)
             self.assertEqual(log.read_bytes(), before)
+
+    def test_prune_preserves_malformed_bytes_and_unframed_tail(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            log = Path(temporary) / "events.jsonl"
+            native = json.dumps({
+                "seq": 1,
+                "type": "turn_started",
+                "run_id": "native",
+                "prompt": "same",
+            }, separators=(",", ":")).encode() + b"\n"
+            marker = json.dumps({
+                "seq": 2,
+                "type": "history_imported",
+                "run_id": "import_tail",
+                "imported": True,
+            }, separators=(",", ":")).encode() + b"\n"
+            duplicate = json.dumps({
+                "seq": 3,
+                "type": "turn_started",
+                "run_id": "import_tail",
+                "imported": True,
+                "prompt": "same",
+            }, separators=(",", ":")).encode() + b"\n"
+            terminal = json.dumps({
+                "seq": 4,
+                "type": "turn_finished",
+                "run_id": "import_tail",
+                "imported": True,
+            }, separators=(",", ":")).encode() + b"\n"
+            malformed = b"not-json-\xff-without-final-newline"
+            original = native + marker + duplicate + terminal + malformed
+            log.write_bytes(original)
+            with patch.object(agent_server, "events_path", return_value=log), patch.object(
+                agent_server,
+                "fsync_parent_directory",
+                wraps=agent_server.fsync_parent_directory,
+            ) as directory_fsync:
+                dry = agent_server.prune_duplicate_imported_history_sync(
+                    "chat",
+                    dry_run=True,
+                )
+                real = agent_server.prune_duplicate_imported_history_sync(
+                    "chat",
+                    dry_run=False,
+                )
+
+            expected_without_checkpoint = native + malformed
+            self.assertEqual(dry["bytes_after"], len(expected_without_checkpoint))
+            self.assertEqual(real["removed_events"], 3)
+            self.assertEqual(real["removed_runs"], 1)
+            rewritten = log.read_bytes()
+            self.assertTrue(rewritten.startswith(expected_without_checkpoint + b"\n"))
+            self.assertIn(b'"type":"_event_sequence_checkpoint"', rewritten)
+            self.assertEqual(real["bytes_after"], len(rewritten))
+            directory_fsync.assert_called_once_with(log)
+            self.assertEqual(
+                list(log.parent.glob(".*prune*")),
+                [],
+            )
+
+    def test_prune_uses_bounded_python_memory_for_large_history(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            log = Path(temporary) / "events.jsonl"
+            with log.open("wb") as output:
+                seq = 0
+                # Roughly eight MiB and tens of thousands of unique keys. The
+                # old read/split/parse/list/set implementation peaked around
+                # one hundred MiB for this shape.
+                while output.tell() < 8 * 1024 * 1024:
+                    seq += 1
+                    output.write(json.dumps({
+                        "seq": seq,
+                        "type": "assistant_text",
+                        "run_id": f"native_{seq}",
+                        "text": f"unique history message {seq:08d} " + ("x" * 96),
+                    }, separators=(",", ":")).encode() + b"\n")
+            with patch.object(agent_server, "events_path", return_value=log):
+                tracemalloc.start()
+                tracemalloc.reset_peak()
+                try:
+                    summary = agent_server.prune_duplicate_imported_history_sync(
+                        "chat",
+                        dry_run=True,
+                    )
+                    _current, peak = tracemalloc.get_traced_memory()
+                finally:
+                    tracemalloc.stop()
+
+            self.assertEqual(summary["removed_events"], 0)
+            self.assertGreaterEqual(summary["bytes_before"], 8 * 1024 * 1024)
+            self.assertLess(
+                peak,
+                12 * 1024 * 1024,
+                f"streaming prune allocated {peak / (1024 * 1024):.1f} MiB",
+            )
+
+    def test_prune_refuses_to_replace_a_concurrently_changed_log(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            log = Path(temporary) / "events.jsonl"
+            events = [
+                {"seq": 1, "type": "turn_started", "run_id": "native", "prompt": "same"},
+                {"seq": 2, "type": "history_imported", "run_id": "import_1", "imported": True},
+                {"seq": 3, "type": "turn_started", "run_id": "import_1", "imported": True, "prompt": "same"},
+                {"seq": 4, "type": "turn_finished", "run_id": "import_1", "imported": True},
+            ]
+            self.write_log(log, events)
+            before = log.read_bytes()
+            # Exercise the generation fence directly by changing the file
+            # after the replacement stream has been fsynced.
+            real_stat = agent_server.Path.stat
+            calls = 0
+
+            def changing_stat(target, *args, **kwargs):
+                nonlocal calls
+                result = real_stat(target, *args, **kwargs)
+                if target == log:
+                    calls += 1
+                    if calls == 3:
+                        with log.open("ab") as output:
+                            output.write(b'{"seq":5,"type":"assistant_text","text":"late"}\n')
+                        result = real_stat(target, *args, **kwargs)
+                return result
+
+            with patch.object(agent_server, "events_path", return_value=log), patch.object(
+                agent_server.Path,
+                "stat",
+                changing_stat,
+            ):
+                with self.assertRaises(RuntimeError):
+                    agent_server.prune_duplicate_imported_history_sync(
+                        "chat",
+                        dry_run=False,
+                    )
+            self.assertTrue(log.read_bytes().startswith(before))
+            self.assertIn(b'"text":"late"', log.read_bytes())
 
 
 class DarwinMetricsTests(unittest.TestCase):

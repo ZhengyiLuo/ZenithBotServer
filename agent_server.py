@@ -22427,6 +22427,64 @@ def is_imported_history_event(event: dict[str, Any]) -> bool:
     return event.get("imported") is True or str(event.get("run_id") or "").startswith("import_")
 
 
+def fsync_parent_directory(path: Path) -> None:
+    """Persist an atomic rename on POSIX; file fsync is sufficient on Windows."""
+
+    if os.name == "nt":
+        return
+    flags = os.O_RDONLY
+    flags |= getattr(os, "O_DIRECTORY", 0)
+    flags |= getattr(os, "O_CLOEXEC", 0)
+    descriptor = os.open(path.parent, flags)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def _prune_history_bookkeeping_connection(path: Path) -> sqlite3.Connection:
+    """Create bounded-memory, disposable bookkeeping for one history prune."""
+
+    connection = sqlite3.connect(path)
+    # This database is disposable and never becomes authoritative. Keeping its
+    # journal and cache small moves the unbounded key/drop sets out of Python
+    # without adding durability work to the real event log transaction.
+    connection.execute("PRAGMA journal_mode=OFF")
+    connection.execute("PRAGMA synchronous=OFF")
+    connection.execute("PRAGMA temp_store=FILE")
+    connection.execute("PRAGMA cache_size=-2048")
+    connection.executescript(
+        """
+        CREATE TABLE seen_messages (
+            digest BLOB NOT NULL,
+            kind TEXT NOT NULL,
+            normalized_text TEXT NOT NULL,
+            PRIMARY KEY (digest, kind, normalized_text)
+        ) WITHOUT ROWID;
+        CREATE TABLE kept_runs (
+            run_id TEXT PRIMARY KEY,
+            kept_count INTEGER NOT NULL
+        ) WITHOUT ROWID;
+        CREATE TABLE dropped_lines (
+            byte_offset INTEGER PRIMARY KEY,
+            byte_length INTEGER NOT NULL,
+            run_id TEXT,
+            is_import_marker INTEGER NOT NULL DEFAULT 0
+        );
+        """
+    )
+    return connection
+
+
+def _prune_history_message_key(event: dict[str, Any]) -> tuple[str, str] | None:
+    event_type = str(event.get("type") or "")
+    if event_type == "turn_started":
+        return history_dedup_key("user", event.get("prompt"))
+    if event_type == "assistant_text":
+        return history_dedup_key("assistant", event.get("text"))
+    return None
+
+
 def prune_duplicate_imported_history_sync(
     session_id: str,
     *,
@@ -22453,108 +22511,236 @@ def prune_duplicate_imported_history_sync(
     }
     if not path.exists():
         return summary
-    raw_lines = path.read_bytes().split(b"\n")
-    summary["bytes_before"] = path.stat().st_size
-    parsed: list[tuple[bytes, dict[str, Any] | None]] = []
-    for raw in raw_lines:
-        if not raw.strip():
-            parsed.append((raw, None))
-            continue
+    source_stat = path.stat()
+    summary["bytes_before"] = source_stat.st_size
+    token = f"{os.getpid()}.{threading.get_ident()}.{uuid.uuid4().hex}"
+    bookkeeping_path = path.with_name(f".{path.name}.prune-{token}.sqlite3")
+    replacement_path = path.with_name(f".{path.name}.{token}.prune-tmp")
+    connection: sqlite3.Connection | None = None
+    try:
+        connection = _prune_history_bookkeeping_connection(bookkeeping_path)
+        # Pass one establishes exactly the same first-copy-wins relation as
+        # the historical in-memory implementation. Both the normalized text
+        # and a fixed digest are stored: the digest keeps lookups efficient,
+        # while the full key makes hash collisions semantically harmless.
+        with path.open("rb") as source:
+            while True:
+                byte_offset = source.tell()
+                raw_line = source.readline()
+                if not raw_line:
+                    break
+                if not raw_line.strip():
+                    continue
+                try:
+                    loaded = json.loads(raw_line)
+                except Exception:
+                    continue
+                if not isinstance(loaded, dict):
+                    continue
+                summary["events_before"] += 1
+                with suppress(TypeError, ValueError):
+                    summary["_max_seq_before"] = max(
+                        int(summary.get("_max_seq_before") or 0),
+                        int(loaded.get("seq") or 0),
+                    )
+                key = _prune_history_message_key(loaded)
+                if key is None:
+                    continue
+                kind, normalized = key
+                digest = hashlib.sha256(
+                    kind.encode("utf-8", "surrogatepass")
+                    + b"\0"
+                    + normalized.encode("utf-8", "surrogatepass")
+                ).digest()
+                duplicate = connection.execute(
+                    """
+                    SELECT 1 FROM seen_messages
+                    WHERE digest = ? AND kind = ? AND normalized_text = ?
+                    """,
+                    (digest, kind, normalized),
+                ).fetchone() is not None
+                if is_imported_history_event(loaded) and duplicate:
+                    connection.execute(
+                        """
+                        INSERT OR IGNORE INTO dropped_lines
+                            (byte_offset, byte_length, run_id, is_import_marker)
+                        VALUES (?, ?, ?, 0)
+                        """,
+                        (
+                            byte_offset,
+                            len(raw_line),
+                            str(loaded.get("run_id") or ""),
+                        ),
+                    )
+                    continue
+                if is_imported_history_event(loaded):
+                    run_id = str(loaded.get("run_id") or "")
+                    connection.execute(
+                        """
+                        INSERT INTO kept_runs (run_id, kept_count) VALUES (?, 1)
+                        ON CONFLICT(run_id) DO UPDATE
+                            SET kept_count = kept_count + 1
+                        """,
+                        (run_id,),
+                    )
+                connection.execute(
+                    """
+                    INSERT OR IGNORE INTO seen_messages
+                        (digest, kind, normalized_text)
+                    VALUES (?, ?, ?)
+                    """,
+                    (digest, kind, normalized),
+                )
+        connection.commit()
+
+        # Pass two drops empty import-run markers and computes the surviving
+        # sequence high-water mark without retaining any raw event or line.
+        max_kept_seq = 0
+        with path.open("rb") as source:
+            while True:
+                byte_offset = source.tell()
+                raw_line = source.readline()
+                if not raw_line:
+                    break
+                dropped = connection.execute(
+                    "SELECT 1 FROM dropped_lines WHERE byte_offset = ?",
+                    (byte_offset,),
+                ).fetchone() is not None
+                event: dict[str, Any] | None = None
+                if raw_line.strip():
+                    with suppress(Exception):
+                        loaded = json.loads(raw_line)
+                        if isinstance(loaded, dict):
+                            event = loaded
+                if event is not None and not dropped and is_imported_history_event(event):
+                    event_type = str(event.get("type") or "")
+                    run_id = str(event.get("run_id") or "")
+                    if event_type in {"history_imported", "turn_finished"} and run_id:
+                        kept = connection.execute(
+                            "SELECT kept_count FROM kept_runs WHERE run_id = ?",
+                            (run_id,),
+                        ).fetchone()
+                        if kept is None or int(kept[0]) == 0:
+                            connection.execute(
+                                """
+                                INSERT OR IGNORE INTO dropped_lines
+                                    (byte_offset, byte_length, run_id, is_import_marker)
+                                VALUES (?, ?, ?, ?)
+                                """,
+                                (
+                                    byte_offset,
+                                    len(raw_line),
+                                    run_id,
+                                    1 if event_type == "history_imported" else 0,
+                                ),
+                            )
+                            dropped = True
+                if event is not None and not dropped:
+                    seq = durable_event_seq(event)
+                    if seq is not None:
+                        max_kept_seq = max(max_kept_seq, seq)
+        connection.commit()
+
+        dropped = connection.execute(
+            """
+            SELECT COUNT(*), COALESCE(SUM(byte_length), 0)
+            FROM dropped_lines
+            """
+        ).fetchone()
+        summary["removed_events"] = int(dropped[0] if dropped else 0)
+        removed_bytes = int(dropped[1] if dropped else 0)
+        summary["removed_runs"] = int(connection.execute(
+            """
+            SELECT COUNT(DISTINCT run_id)
+            FROM dropped_lines
+            WHERE is_import_marker = 1 AND run_id <> ''
+            """
+        ).fetchone()[0])
+        summary.setdefault("_max_seq_before", 0)
+        summary["bytes_after"] = summary["bytes_before"] - removed_bytes
+        if dry_run or not summary["removed_events"]:
+            return summary
+
+        # Stream the replacement on the same filesystem. Malformed JSON,
+        # blank lines, original newline framing, and every non-dropped byte
+        # are copied verbatim.
+        mode = stat.S_IMODE(source_stat.st_mode)
+        descriptor = os.open(
+            replacement_path,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+            mode or 0o600,
+        )
+        bytes_written = 0
+        last_byte = b""
         try:
-            loaded = json.loads(raw)
-            parsed.append((raw, loaded if isinstance(loaded, dict) else None))
-        except Exception:
-            parsed.append((raw, None))
-    summary["events_before"] = sum(1 for _raw, event in parsed if event is not None)
-    max_seq_before = 0
-    for _raw, event in parsed:
-        if not isinstance(event, dict):
-            continue
-        with suppress(TypeError, ValueError):
-            max_seq_before = max(max_seq_before, int(event.get("seq") or 0))
-    summary["_max_seq_before"] = max_seq_before
+            with os.fdopen(descriptor, "wb") as replacement, path.open("rb") as source:
+                while True:
+                    byte_offset = source.tell()
+                    raw_line = source.readline()
+                    if not raw_line:
+                        break
+                    if connection.execute(
+                        "SELECT 1 FROM dropped_lines WHERE byte_offset = ?",
+                        (byte_offset,),
+                    ).fetchone() is not None:
+                        continue
+                    replacement.write(raw_line)
+                    bytes_written += len(raw_line)
+                    last_byte = raw_line[-1:]
 
-    seen: Counter[tuple[str, str]] = Counter()
-    kept_per_import_run: Counter[str] = Counter()
-    drop_indexes: set[int] = set()
-    for index, (_raw, event) in enumerate(parsed):
-        if event is None:
-            continue
-        event_type = str(event.get("type") or "")
-        if event_type == "turn_started":
-            key = history_dedup_key("user", event.get("prompt"))
-        elif event_type == "assistant_text":
-            key = history_dedup_key("assistant", event.get("text"))
-        else:
-            continue
-        if is_imported_history_event(event):
-            run_id = str(event.get("run_id") or "")
-            if seen.get(key):
-                drop_indexes.add(index)
-                continue
-            kept_per_import_run[run_id] += 1
-        seen[key] += 1
-    for index, (_raw, event) in enumerate(parsed):
-        if event is None or not is_imported_history_event(event):
-            continue
-        event_type = str(event.get("type") or "")
-        if event_type in {"history_imported", "turn_finished"}:
-            run_id = str(event.get("run_id") or "")
-            if run_id and kept_per_import_run.get(run_id, 0) == 0:
-                drop_indexes.add(index)
-    removed_runs = {
-        str(event.get("run_id") or "")
-        for index, (_raw, event) in enumerate(parsed)
-        if index in drop_indexes and event is not None
-        and str(event.get("type") or "") == "history_imported"
-    }
-    summary["removed_events"] = len(drop_indexes)
-    summary["removed_runs"] = len(removed_runs)
-    kept = [raw for index, (raw, _event) in enumerate(parsed) if index not in drop_indexes]
-    rewritten = b"\n".join(kept)
-    summary["bytes_after"] = len(rewritten)
-    if dry_run or not drop_indexes:
-        summary["bytes_after"] = summary["bytes_before"] if not drop_indexes else summary["bytes_after"]
+                # A client may already have advanced its cursor through a
+                # removed tail. Persist that high-water mark in the same
+                # replacement so a crash cannot make a later event reuse it.
+                max_seq_before = int(summary.get("_max_seq_before") or 0)
+                if max_kept_seq < max_seq_before:
+                    checkpoint = {
+                        "seq": max_seq_before,
+                        "id": f"evt_checkpoint_{uuid.uuid4().hex[:16]}",
+                        "session_id": session_id,
+                        "type": "_event_sequence_checkpoint",
+                        "ts": now_iso(),
+                        "server_internal": True,
+                    }
+                    if bytes_written and last_byte != b"\n":
+                        replacement.write(b"\n")
+                        bytes_written += 1
+                    checkpoint_line = json.dumps(
+                        checkpoint,
+                        separators=(",", ":"),
+                    ).encode("utf-8") + b"\n"
+                    replacement.write(checkpoint_line)
+                    bytes_written += len(checkpoint_line)
+                replacement.flush()
+                os.fsync(replacement.fileno())
+        except BaseException:
+            with suppress(OSError):
+                replacement_path.unlink()
+            raise
+
+        current_stat = path.stat()
+        if (
+            current_stat.st_dev != source_stat.st_dev
+            or current_stat.st_ino != source_stat.st_ino
+            or current_stat.st_size != source_stat.st_size
+            or current_stat.st_mtime_ns != source_stat.st_mtime_ns
+        ):
+            raise RuntimeError("event log changed while duplicate history was pruned")
+        os.replace(replacement_path, path)
+        # The sparse timeline index is inode-bound and would be ignored, but
+        # remove it now so recovery never mistakes dead metadata for state.
+        with suppress(OSError):
+            events_index_path(path).unlink()
+        fsync_parent_directory(path)
+        summary["bytes_after"] = bytes_written
         return summary
-
-    # A client may already have advanced its cursor through a duplicate at
-    # the old tail. If pruning removes that tail, retain an internal sequence
-    # checkpoint in the same atomic replacement so even a crash before the
-    # session registry is updated cannot make a later event reuse the number.
-    max_kept_seq = max(
-        (
-            seq
-            for _raw, event in (
-                item for index, item in enumerate(parsed) if index not in drop_indexes
-            )
-            if event is not None
-            and (seq := durable_event_seq(event)) is not None
-        ),
-        default=0,
-    )
-    if max_kept_seq < max_seq_before:
-        checkpoint = {
-            "seq": max_seq_before,
-            "id": f"evt_checkpoint_{uuid.uuid4().hex[:16]}",
-            "session_id": session_id,
-            "type": "_event_sequence_checkpoint",
-            "ts": now_iso(),
-            "server_internal": True,
-        }
-        if rewritten and not rewritten.endswith(b"\n"):
-            rewritten += b"\n"
-        rewritten += json.dumps(
-            checkpoint,
-            separators=(",", ":"),
-        ).encode("utf-8") + b"\n"
-        summary["bytes_after"] = len(rewritten)
-    tmp = path.with_suffix(".jsonl.prune-tmp")
-    with tmp.open("wb") as stream:
-        stream.write(rewritten)
-        stream.flush()
-        os.fsync(stream.fileno())
-    os.replace(tmp, path)
-    return summary
+    finally:
+        if connection is not None:
+            with suppress(Exception):
+                connection.close()
+        with suppress(OSError):
+            bookkeeping_path.unlink()
+        with suppress(OSError):
+            replacement_path.unlink()
 
 
 async def recover_abandoned_codex_compactions_after_start(
