@@ -618,16 +618,17 @@ terminate its own installer. Progress is written to
 sessions remain under the persistent state/configuration roots and are never
 placed inside a release directory.
 
-`capabilities.server_updates` v7 defines install-when-idle as a passive,
-durable reservation. Chats, messages, terminal connections, settings changes,
-and manual restart remain available while the reservation is pending. The
-server begins maintenance only when one shared-lock snapshot proves it is
-actually idle; that same atomic transition closes new-work admission. A
-pending reservation survives a manual restart and is re-armed after startup.
-While it is pending it fences nothing: new turns, Force Send, scheduled jobs,
-and provider controls are all admitted, and the update simply waits for the
-next moment nothing is running. (Releases before 0.1.26-beta.31 parked new
-turns behind the reservation; that behavior is gone.)
+`capabilities.server_updates` v10 defines install-when-idle as a passive,
+durable reservation for human work. Chats, ordinary turns, durable message
+intake, Force Send, provider controls, terminal connections, settings changes,
+and manual restart remain available while the reservation is pending.
+Autonomous scheduled and loop job admissions are deferred losslessly so they
+cannot replenish the active set forever; they resume after the update or an
+explicit cancellation. The server begins maintenance only when one shared-lock
+snapshot proves existing work is actually idle; that same atomic transition
+closes new-work admission. A pending reservation survives a manual restart and
+is re-armed after startup. (Releases before 0.1.26-beta.31 parked every new
+turn behind the reservation; that global operator lockout remains gone.)
 
 ## Uninstalling AgentsServer
 

@@ -1151,10 +1151,11 @@ HEALTH_TEAM_HUB_CAPABILITY_TIMEOUT_SECONDS = max(
         ),
     ),
 )
-# A pending update-when-idle reservation is passive: it waits for a moment
-# when no work is running and never fences admission. Earlier releases parked
-# every new turn (including Force Send) behind the reservation so the server
-# could reach idleness, which locked every chat out for 27 minutes on
+# A pending update-when-idle reservation remains passive for user work: it
+# never fences ordinary turns, Force Send, or provider controls. Autonomous
+# scheduled jobs are deferred so recurring work cannot replenish the active
+# set forever and starve the update. Earlier releases parked every new turn
+# behind the reservation, which locked every chat out for 27 minutes on
 # 2026-09-04 while one long turn ran.
 QUEUE_FENCE_LOG_INTERVAL_SECONDS = 60.0
 # Hidden cross-chat/secure-peer delivery rows retry admission when the target
@@ -9491,6 +9492,15 @@ def clear_job_runtime_unavailable_deferral(job: dict[str, Any]) -> None:
     job.pop("_runtime_unavailable_defer_count", None)
 
 
+def clear_job_update_park(job: dict[str, Any]) -> None:
+    """Remove private ownership metadata for an idle-update job park."""
+
+    job.pop("_update_park_schedule_id", None)
+    job.pop("_update_park_occurrence", None)
+    job.pop("_update_park_original_next_run_at", None)
+    job.pop("_update_park_revision", None)
+
+
 def durable_scheduled_job_admissions(
     jobs: dict[str, dict[str, Any]],
 ) -> dict[str, dict[str, Any]]:
@@ -9779,6 +9789,7 @@ class JobStore:
                 job.pop("manual_run_requested_at", None)
                 job.pop("manual_run_defer_reason", None)
                 job.pop("_last_manual_defer_event_at", None)
+                clear_job_update_park(job)
                 job["updated_at"] = now_iso()
                 job["_revision"] = new_job_revision()
                 changed = True
@@ -10338,6 +10349,7 @@ class JobStore:
             # unavailable-runtime budget. A stale scheduler snapshot is then
             # unable to consume or advance the edited occurrence.
             clear_job_runtime_unavailable_deferral(job)
+            clear_job_update_park(job)
             job["updated_at"] = now_iso()
             job["_revision"] = new_job_revision()
             self.jobs[jid] = job
@@ -10421,6 +10433,7 @@ class JobStore:
                 job["next_run_at"] = None
                 job["scheduled_run_at"] = None
                 clear_job_runtime_unavailable_deferral(job)
+                clear_job_update_park(job)
                 if manual_pending:
                     job["manual_run_pending"] = False
                     job.pop("manual_run_requested_at", None)
@@ -10477,6 +10490,7 @@ class JobStore:
             job["next_run_at"] = None
             job["scheduled_run_at"] = None
             clear_job_runtime_unavailable_deferral(job)
+            clear_job_update_park(job)
             job["manual_run_pending"] = False
             job.pop("manual_run_requested_at", None)
             job.pop("manual_run_defer_reason", None)
@@ -10628,6 +10642,7 @@ class JobStore:
                 job["next_run_at"] = None
                 job["scheduled_run_at"] = None
             clear_job_runtime_unavailable_deferral(job)
+            clear_job_update_park(job)
             job["updated_at"] = now_iso()
             job["_revision"] = new_job_revision()
             await self.save()
@@ -10641,6 +10656,7 @@ class JobStore:
         *,
         expected_revision: str | None = None,
         expected_next_run_at: float | None = None,
+        update_schedule_id: str | None = None,
     ) -> bool:
         delay = int(delay_seconds or JOB_BUSY_RETRY_SECONDS)
         emit_event = False
@@ -10665,6 +10681,34 @@ class JobStore:
                 if not same_occurrence:
                     return False
             now = time.time()
+            if update_schedule_id is not None:
+                occurrence = job.get("scheduled_run_at")
+                if occurrence is None:
+                    occurrence = expected_next_run_at
+                try:
+                    clean_occurrence = float(occurrence)
+                    original_next_run_at = float(
+                        job.get("_update_park_original_next_run_at")
+                        if (
+                            job.get("_update_park_schedule_id")
+                            == update_schedule_id
+                            and job.get("_update_park_original_next_run_at")
+                            is not None
+                        )
+                        else job.get("next_run_at")
+                    )
+                except (TypeError, ValueError) as exc:
+                    raise RuntimeError(
+                        "scheduled update park lost its occurrence"
+                    ) from exc
+                if not math.isfinite(clean_occurrence) or not math.isfinite(
+                    original_next_run_at
+                ):
+                    raise RuntimeError(
+                        "scheduled update park has an invalid occurrence"
+                    )
+            else:
+                clear_job_update_park(job)
             job["next_run_at"] = now + max(delay, 5)
             job["last_deferred_at"] = now_iso()
             job["last_defer_reason"] = reason
@@ -10674,7 +10718,15 @@ class JobStore:
                 emit_event = True
                 event_job = public_job(job)
             job["updated_at"] = now_iso()
-            job["_revision"] = new_job_revision()
+            revision = new_job_revision()
+            job["_revision"] = revision
+            if update_schedule_id is not None:
+                job["_update_park_schedule_id"] = update_schedule_id
+                job["_update_park_occurrence"] = clean_occurrence
+                job["_update_park_original_next_run_at"] = (
+                    original_next_run_at
+                )
+                job["_update_park_revision"] = revision
             await self.save()
         if emit_event and event_job and event_job.get("session_id"):
             await append_event(str(event_job["session_id"]), "job_deferred", {
@@ -10683,6 +10735,98 @@ class JobStore:
                 "message": f"Scheduled job deferred: {event_job.get('title') or jid} — {reason}",
             })
         return True
+
+    async def defer_for_pending_server_update(
+        self,
+        jid: str,
+        reason: str,
+        *,
+        expected_revision: str | None,
+        expected_next_run_at: float | None,
+    ) -> bool:
+        """Durably park one unchanged automatic occurrence for an exact update.
+
+        Cancellation takes the same operation lock before clearing the update
+        reservation and rearming these markers. The two operations therefore
+        cannot strand a park on the wrong side of cancellation.
+        """
+
+        async with SERVER_UPDATE_OPERATION_LOCK:
+            status = read_server_update_status()
+            if not managed_server_update_is_pending(status):
+                return False
+            schedule_id = str(status.get("schedule_id") or "").strip()
+            if not schedule_id:
+                return False
+            return await self.defer(
+                jid,
+                reason,
+                JOB_BUSY_RETRY_SECONDS,
+                expected_revision=expected_revision,
+                expected_next_run_at=expected_next_run_at,
+                update_schedule_id=schedule_id,
+            )
+
+    async def resume_update_parked(
+        self,
+        schedule_id: str | None = None,
+        *,
+        active_schedule_id: str | None = None,
+    ) -> int:
+        """Rearm unchanged occurrences parked by an ended idle reservation."""
+
+        resumed = 0
+        changed = False
+        async with self._lock:
+            now = time.time()
+            updated_at = now_iso()
+            for job in self.jobs.values():
+                parked_schedule_id = str(
+                    job.get("_update_park_schedule_id") or ""
+                ).strip()
+                if not parked_schedule_id or (
+                    schedule_id is not None
+                    and parked_schedule_id != schedule_id
+                ) or (
+                    active_schedule_id is not None
+                    and parked_schedule_id == active_schedule_id
+                ):
+                    continue
+                changed = True
+                parked_revision = str(
+                    job.get("_update_park_revision") or ""
+                )
+                try:
+                    parked_occurrence = float(
+                        job.get("_update_park_occurrence")
+                    )
+                    current_occurrence = float(job.get("scheduled_run_at"))
+                    original_next_run_at = float(
+                        job.get("_update_park_original_next_run_at")
+                    )
+                except (TypeError, ValueError):
+                    exact_park = False
+                else:
+                    exact_park = (
+                        math.isfinite(parked_occurrence)
+                        and math.isfinite(current_occurrence)
+                        and math.isfinite(original_next_run_at)
+                        and job.get("_revision") == parked_revision
+                        and bool(job.get("enabled"))
+                        and current_occurrence == parked_occurrence
+                    )
+                clear_job_update_park(job)
+                if exact_park:
+                    # Preserve the canonical occurrence, but make its retry
+                    # immediately due. A future edit has already failed the
+                    # revision/occurrence CAS above and remains authoritative.
+                    job["next_run_at"] = min(original_next_run_at, now)
+                    resumed += 1
+                job["updated_at"] = updated_at
+                job["_revision"] = new_job_revision()
+            if changed:
+                await self.save()
+        return resumed
 
     async def defer_runtime_unavailable(
         self,
@@ -10737,6 +10881,7 @@ class JobStore:
                 return "exhausted"
 
             now = time.time()
+            clear_job_update_park(job)
             job["_runtime_unavailable_occurrence"] = occurrence
             job["_runtime_unavailable_defer_count"] = defer_count + 1
             job["next_run_at"] = now + max(JOB_BUSY_RETRY_SECONDS, 5)
@@ -11024,7 +11169,10 @@ class JobStore:
 
             try:
                 if not blocker_checked:
-                    blocker = await scheduled_job_blocker(session_id)
+                    blocker = await scheduled_job_blocker(
+                        session_id,
+                        manual=True,
+                    )
                     if blocker:
                         return await self._record_manual_run_deferred(jid, blocker)
                 result = await self._start_job_run(jid, manual=True)
@@ -11199,10 +11347,20 @@ class JobStore:
                             concise_error_message(exc),
                         )
                     continue
-                blocker = await scheduled_job_blocker(job_session_id)
+                blocker = await scheduled_job_blocker(
+                    job_session_id,
+                    manual=manual_run_pending,
+                )
                 if blocker:
                     if manual_run_pending:
                         await self._record_manual_run_deferred(jid, blocker)
+                    elif blocker == MANAGED_SERVER_UPDATE_PENDING_DETAIL:
+                        await self.defer_for_pending_server_update(
+                            jid,
+                            blocker,
+                            expected_revision=due_revision,
+                            expected_next_run_at=due_next_run_at,
+                        )
                     else:
                         await self.defer(
                             jid,
@@ -11341,6 +11499,13 @@ class JobStore:
                                 jid,
                                 lifecycle_defer_reason,
                             )
+                        elif isinstance(e, ManagedServerUpdatePendingError):
+                            await self.defer_for_pending_server_update(
+                                jid,
+                                lifecycle_defer_reason,
+                                expected_revision=due_revision,
+                                expected_next_run_at=due_next_run_at,
+                            )
                         else:
                             # Preserve the canonical occurrence and use the due
                             # snapshot as a CAS guard. If a user edited/replaced
@@ -11414,6 +11579,7 @@ class JobStore:
                             job["next_run_at"] = None
                             job["scheduled_run_at"] = None
                         clear_job_runtime_unavailable_deferral(job)
+                        clear_job_update_park(job)
                         await self.save()
                         failed_job = dict(job)
                     if failed_job.get("session_id"):
@@ -43675,9 +43841,15 @@ def host_pressure_snapshot() -> dict[str, Any]:
     }
 
 
-async def scheduled_job_blocker(session_id: str) -> str | None:
+async def scheduled_job_blocker(
+    session_id: str,
+    *,
+    manual: bool = False,
+) -> str | None:
     async with ACTIVE_LOCK:
-        update_blocker = managed_server_update_admission_blocker()
+        update_blocker = managed_server_update_scheduled_job_blocker(
+            manual=manual,
+        )
         if update_blocker:
             return update_blocker
         session = STORE.sessions.get(session_id) or {}
@@ -58901,11 +59073,23 @@ async def _start_turn_locked(
                 )
             )
     async with ACTIVE_LOCK:
-        update_blocker = managed_server_update_admission_blocker()
+        automatic_scheduled_job = (
+            req.purpose == "scheduled_job"
+            and scheduled_job_revision is not None
+            and not scheduled_job_manual_run
+        )
+        update_blocker = (
+            managed_server_update_scheduled_job_blocker(manual=False)
+            if automatic_scheduled_job
+            else managed_server_update_admission_blocker()
+        )
         if update_blocker:
-            # Only an update or restart that is actually replacing this
-            # process fences admission; a pending when-idle reservation never
-            # does.
+            if update_blocker == MANAGED_SERVER_UPDATE_PENDING_DETAIL:
+                # The scheduler normally observes this before dispatch. Keep
+                # the turn-level check under ACTIVE_LOCK as the authoritative
+                # race fence when an update is scheduled between that probe
+                # and reservation of the provider slot.
+                raise ManagedServerUpdatePendingError()
             raise HTTPException(status_code=503, detail=update_blocker)
         requested_backend = str(
             req.backend or sess.get("backend") or DEFAULT_BACKEND
@@ -59930,12 +60114,35 @@ def managed_server_update_admission_blocker() -> str | None:
 
     A pending update-when-idle reservation is deliberately NOT a blocker: it
     waits for a moment when nothing is running and must never refuse a turn,
-    a Force Send, a scheduled job, or a provider control. Earlier releases
-    parked every new turn behind the reservation, which locked the operator
-    out of every chat while one long turn ran.
+    a Force Send, a manual Run Now, or a provider control. Automatic
+    scheduled jobs use the narrower durable deferral path below. Earlier
+    releases parked every new turn behind the reservation, which locked the
+    operator out of every chat while one long turn ran.
     """
 
     return managed_server_update_blocker()
+
+
+def managed_server_update_scheduled_job_blocker(
+    *,
+    manual: bool = False,
+) -> str | None:
+    """Fence autonomous job admission while an idle update is reserved.
+
+    A pending reservation deliberately stays invisible to ordinary user turns,
+    Force Send, provider controls, and manual Run Now. Automatic job
+    dispatches are durable and retryable, so deferring only that autonomous
+    admission path prevents recurring jobs from starving the updater without
+    reviving the global pending fence that locked operators out on
+    2026-09-04.
+    """
+
+    blocker = managed_server_update_blocker()
+    if blocker:
+        return blocker
+    if not manual and managed_server_update_is_pending():
+        return MANAGED_SERVER_UPDATE_PENDING_DETAIL
+    return None
 
 
 def live_unsafe_http_mutation_ids_locked() -> list[str]:
@@ -62499,7 +62706,19 @@ async def lifespan(app: FastAPI):
     )
     reconcile_server_restart_status_after_startup()
     clear_imported_active_runs()
-    await reconcile_server_update_status_after_startup()
+    startup_update_status = await reconcile_server_update_status_after_startup()
+    active_update_schedule_id = (
+        str(startup_update_status.get("schedule_id") or "").strip()
+        if managed_server_update_is_pending(startup_update_status)
+        else None
+    )
+    # A completed/failed update, an offline cancellation, or replacement by a
+    # new reservation may leave exact automatic occurrences parked in the
+    # durable job registry. Rearm untouched revisions except those owned by
+    # the one reservation that is still live.
+    await JOBS.resume_update_parked(
+        active_schedule_id=active_update_schedule_id,
+    )
     abandoned_compaction_count = (
         await recover_abandoned_codex_compactions_after_start(
             forced_restart_request_id=(forced_restart_request_id or None),
@@ -64815,9 +65034,10 @@ async def health() -> dict[str, Any]:
                 "required": False,
                 "message": "Signed Stable and Beta AgentsServer channels are available.",
                 "action": None,
-                # v9 binds status and controls to the exact live responder.
-                # v8 fenced new materialization while existing work drained.
-                "version": 9,
+                # v10 keeps human work passive while pending updates defer
+                # autonomous scheduled-job admission. v9 binds status and
+                # controls to the exact live responder.
+                "version": 10,
                 "tracks": ["stable", "beta"],
             },
             "tmux": tmux,
@@ -66371,6 +66591,12 @@ async def server_update_status(
         # second update attempt before reconnecting.
         public_status = public_server_update_status(status)
         await TERMINAL_ATTACHMENTS.reopen_if_update_inactive(public_status)
+        if managed_server_update_is_pending(status):
+            await JOBS.resume_update_parked(
+                active_schedule_id=str(status.get("schedule_id") or "").strip(),
+            )
+        elif not managed_server_update_blocks_work(status):
+            await JOBS.resume_update_parked()
         return public_status
 
 
@@ -67139,6 +67365,9 @@ async def cancel_server_update(
         )
         public_status = public_server_update_status(cancelled)
         await TERMINAL_ATTACHMENTS.reopen_if_update_inactive(public_status)
+        # The status transition and exact job rearm share the operation lock,
+        # so a concurrent scheduler park cannot land after cancellation.
+        await JOBS.resume_update_parked(actual_schedule_id)
         # Messages accepted while the drain was pending are already durable.
         # Wake their queues immediately when the user cancels instead of
         # waiting for the periodic deferred-turn retry.
@@ -67346,11 +67575,18 @@ async def server_update_pending_waiter_loop() -> None:
                     diagnostic or "transient server transition",
                 )
             else:
-                terminal = await asyncio.to_thread(
-                    fail_pending_server_update,
-                    schedule_id,
-                    exc,
-                )
+                async with SERVER_UPDATE_OPERATION_LOCK:
+                    terminal = await asyncio.to_thread(
+                        fail_pending_server_update,
+                        schedule_id,
+                        exc,
+                    )
+                    if not (
+                        managed_server_update_is_pending(terminal)
+                        and str(terminal.get("schedule_id") or "").strip()
+                        == schedule_id
+                    ):
+                        await JOBS.resume_update_parked(schedule_id)
                 logger.warning(
                     "pending server update advance stopped phase=%s "
                     "error_type=%s error_code=%s detail=%s",

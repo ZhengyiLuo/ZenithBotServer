@@ -327,8 +327,8 @@ class ExplicitStopDeadlineTests(unittest.IsolatedAsyncioTestCase):
         schedule.assert_called_once_with("chat")
 
 
-class PendingUpdateNeverFencesTests(unittest.IsolatedAsyncioTestCase):
-    async def test_pending_reservation_blocks_nothing(self):
+class PendingUpdateSelectiveDrainTests(unittest.IsolatedAsyncioTestCase):
+    async def test_pending_reservation_defers_only_automatic_jobs(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             with patch.object(
@@ -354,7 +354,16 @@ class PendingUpdateNeverFencesTests(unittest.IsolatedAsyncioTestCase):
                 self.assertTrue(agent_server.managed_server_update_is_pending())
                 self.assertIsNone(agent_server.managed_server_update_admission_blocker())
                 self.assertIsNone(await agent_server.turn_start_blocker())
-                self.assertIsNone(await agent_server.scheduled_job_blocker("other-chat"))
+                self.assertEqual(
+                    await agent_server.scheduled_job_blocker("other-chat"),
+                    agent_server.MANAGED_SERVER_UPDATE_PENDING_DETAIL,
+                )
+                self.assertIsNone(
+                    await agent_server.scheduled_job_blocker(
+                        "other-chat",
+                        manual=True,
+                    )
+                )
 
     async def test_active_update_still_fences(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -372,6 +381,37 @@ class PendingUpdateNeverFencesTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(
                     agent_server.managed_server_update_admission_blocker(),
                     agent_server.MANAGED_SERVER_UPDATE_ACTIVE_DETAIL,
+                )
+                self.assertEqual(
+                    await agent_server.scheduled_job_blocker(
+                        "other-chat",
+                        manual=True,
+                    ),
+                    agent_server.MANAGED_SERVER_UPDATE_ACTIVE_DETAIL,
+                )
+
+    async def test_active_restart_still_fences_manual_jobs(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            with patch.object(
+                agent_server,
+                "SERVER_RESTART_STATUS_FILE",
+                root / "restart.json",
+            ), patch.object(
+                agent_server,
+                "SERVER_UPDATE_STATUS_FILE",
+                root / "update.json",
+            ):
+                agent_server.write_server_restart_status(
+                    phase="signaling",
+                    request_id="restart-1",
+                )
+                self.assertEqual(
+                    await agent_server.scheduled_job_blocker(
+                        "other-chat",
+                        manual=True,
+                    ),
+                    agent_server.MANAGED_SERVER_RESTART_ACTIVE_DETAIL,
                 )
 
 
