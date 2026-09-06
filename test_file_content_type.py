@@ -1,5 +1,6 @@
 import json
 import tempfile
+import threading
 import unittest
 from collections import deque
 from pathlib import Path
@@ -147,6 +148,63 @@ class FileContentTypeTests(unittest.TestCase):
 
 
 class FileContentTypeEndpointTests(unittest.IsolatedAsyncioTestCase):
+    async def test_full_file_resolutions_run_off_the_event_loop(self) -> None:
+        main_thread = threading.get_ident()
+        event = {"id": "event-1", "seq": 1, "type": "file_uploaded"}
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "notes.txt"
+            path.write_text("content")
+            meta = {
+                "id": "file-1",
+                "session_id": "session-1",
+                "filename": path.name,
+                "path": str(path),
+                "content_type": "text/plain",
+            }
+
+            def off_loop(value):
+                self.assertNotEqual(threading.get_ident(), main_thread)
+                return value
+
+            with patch.object(
+                agent_server.STORE,
+                "sessions",
+                {"session-1": {"id": "session-1"}},
+            ), patch.object(
+                agent_server,
+                "list_session_file_records",
+                side_effect=lambda _session_id: off_loop([meta]),
+            ) as list_records, patch.object(
+                agent_server,
+                "resolve_session_file_event",
+                side_effect=lambda _session_id, _file_id: off_loop(event),
+            ) as resolve_event, patch.object(
+                agent_server,
+                "session_file_for_link",
+                side_effect=lambda _session_id, _target: off_loop(meta),
+            ) as resolve_link:
+                listed = await agent_server.list_session_files(
+                    "session-1",
+                    limit=None,
+                    offset=0,
+                    content_prefix=None,
+                )
+                found_event = await agent_server.get_session_file_event(
+                    "session-1",
+                    "file-1",
+                )
+                linked = await agent_server.get_session_linked_file(
+                    "session-1",
+                    str(path),
+                )
+
+        self.assertEqual(listed["files"], [meta])
+        self.assertEqual(found_event, {"event": event})
+        self.assertEqual(linked.path, str(path))
+        list_records.assert_called_once_with("session-1")
+        resolve_event.assert_called_once_with("session-1", "file-1")
+        resolve_link.assert_called_once_with("session-1", str(path))
+
     async def test_image_filter_includes_legacy_generic_png(self) -> None:
         event = {
             "id": "event-1",

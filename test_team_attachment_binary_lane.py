@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import os
 from pathlib import Path
 import socket
 import tempfile
@@ -118,6 +119,54 @@ class TeamAttachmentBinaryLaneTests(unittest.TestCase):
             self.network.connection_id, self.network.team_id, attachment["id"]
         )
         self.assertEqual(repaired.read_bytes(), payload)
+
+    def test_host_receiver_opens_peer_uploaded_message_attachment(self) -> None:
+        """Mirror Studio peer -> Sonic host attachment receipt end to end."""
+
+        payload = b"peer-authored image bytes"
+        attachment = self.declare(payload, "studio-image.png")
+        self.upload(attachment["id"], payload)
+        projection = self.network.hub.get_network(
+            self.network.owner,
+            self.network.team_id,
+        )
+        host_node = next(server for server in projection["servers"] if server["is_host"])
+        message = self.network.peer_proxy_json(
+            "POST",
+            f"/v1/teams/{self.network.team_id}/network/messages",
+            body={
+                "kind": "message",
+                "title": None,
+                "body": "Studio attachment for Sonic",
+                "body_format": "plain",
+                "recipients": [{"kind": "server", "id": host_node["id"]}],
+                "attachment_ids": [attachment["id"]],
+                "in_reply_to_message_id": None,
+                "skill": None,
+                "provenance": {},
+                "idempotency_key": "receiver_" + uuid.uuid4().hex,
+            },
+        )["message"]
+
+        host_claims = self.network.hub.managed_server_claims()
+        inbox = self.network.hub.list_team_messages(
+            host_claims,
+            self.network.team_id,
+            box="inbox",
+            after_sequence=0,
+            limit=50,
+        )
+        self.assertIn(message["id"], {item["id"] for item in inbox["messages"]})
+        public, lease = self.network.hub.open_team_attachment(
+            host_claims,
+            self.network.team_id,
+            attachment["id"],
+        )
+        try:
+            self.assertEqual(public["message_id"], message["id"])
+            self.assertEqual(os.read(lease.descriptor, len(payload) + 1), payload)
+        finally:
+            lease.close()
 
     def test_cache_is_lru_bounded_and_requires_live_connection(self) -> None:
         first_payload, second_payload = b"a" * 5_001, b"b" * 5_003

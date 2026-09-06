@@ -1,6 +1,7 @@
 import asyncio
 import json
 import tempfile
+import threading
 import unittest
 from pathlib import Path
 from unittest.mock import AsyncMock, Mock, patch
@@ -3343,6 +3344,106 @@ class CodexNativeLifecycleTests(unittest.IsolatedAsyncioTestCase):
             self.assertFalse(session_path.exists())
         self.assertNotIn("chat", agent_server.STORE.sessions)
         self.assertTrue(late_event["discarded"])
+
+    async def test_cancelled_committed_delete_finishes_all_cleanup(self) -> None:
+        store = agent_server.SessionStore()
+        store.sessions = {
+            "chat": {
+                "id": "chat",
+                "backend": agent_server.BACKEND_CODEX,
+                "codex_thread_id": "thread",
+            },
+        }
+        first_write_started = threading.Event()
+        release_first_write = threading.Event()
+        real_write = agent_server.write_sessions_json_text
+
+        def blocked_write(
+            path: Path,
+            text: str,
+            *,
+            durable: bool,
+        ) -> None:
+            self.assertNotIn("chat", json.loads(text))
+            first_write_started.set()
+            self.assertTrue(release_first_write.wait(timeout=2))
+            real_write(path, text, durable=durable)
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            state_dir = Path(temp_dir)
+            session_path = state_dir / "sessions" / "chat"
+            session_path.mkdir(parents=True)
+            (session_path / "events.jsonl").write_text("{}\n")
+            delete_jobs = AsyncMock(return_value=2)
+            retire_tunnels = AsyncMock()
+            event_seq_cache = {"chat": 41}
+            with (
+                patch.object(agent_server, "STORE", store),
+                patch.object(agent_server, "STATE_DIR", state_dir),
+                patch.object(
+                    agent_server,
+                    "SESSIONS_FILE",
+                    state_dir / "sessions.json",
+                ),
+                patch.object(agent_server, "ensure_dirs"),
+                patch.object(
+                    agent_server,
+                    "EVENT_SEQ_CACHE",
+                    event_seq_cache,
+                ),
+                patch.object(agent_server, "EVENT_SEQ_LOCK", asyncio.Lock()),
+                patch.object(
+                    agent_server,
+                    "write_sessions_json_text",
+                    side_effect=blocked_write,
+                ),
+                patch.object(
+                    agent_server,
+                    "CODEX_APP_SERVER_MANAGER",
+                    None,
+                ),
+                patch.object(
+                    agent_server.JOBS,
+                    "delete_for_session",
+                    delete_jobs,
+                ),
+                patch.object(
+                    agent_server,
+                    "retire_session_port_tunnels",
+                    retire_tunnels,
+                ),
+                patch.object(agent_server, "kill_terminal_session"),
+            ):
+                delete_task = asyncio.create_task(
+                    agent_server.delete_session("chat")
+                )
+                try:
+                    self.assertTrue(
+                        await asyncio.to_thread(first_write_started.wait, 1)
+                    )
+                    delete_task.cancel()
+                    await asyncio.sleep(0)
+                    self.assertFalse(delete_task.done())
+                    # Cleanup remains owned through repeated caller cancels.
+                    delete_task.cancel()
+                finally:
+                    release_first_write.set()
+                with self.assertRaises(asyncio.CancelledError):
+                    await delete_task
+
+            persisted = json.loads(
+                (state_dir / "sessions.json").read_text(encoding="utf-8")
+            )
+            self.assertNotIn("chat", persisted)
+            self.assertFalse(session_path.exists())
+
+        self.assertNotIn("chat", store.sessions)
+        self.assertNotIn("chat", event_seq_cache)
+        self.assertIn("chat", agent_server.DELETED_SESSION_TOMBSTONES)
+        self.assertNotIn("chat", agent_server.DELETING_SESSIONS)
+        delete_jobs.assert_awaited_once_with("chat")
+        retire_tunnels.assert_awaited_once()
+        agent_server.DELETED_SESSION_TOMBSTONES.discard("chat")
 
     async def test_delete_job_cleanup_failure_is_retryable_without_resurrection(
         self,

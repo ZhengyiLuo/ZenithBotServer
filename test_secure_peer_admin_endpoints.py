@@ -24,6 +24,51 @@ class _StoreBackedRevokeRuntime:
 
 
 class SecurePeerHostAdminEndpointTests(unittest.IsolatedAsyncioTestCase):
+    def test_public_pairing_models_accept_only_teamspace_scopes(self) -> None:
+        self.assertEqual(
+            agent_server.canonical_secure_peer_scopes(
+                ["teamspace.write", "teamspace.read"]
+            ),
+            ["teamspace.read", "teamspace.write"],
+        )
+        with self.assertRaisesRegex(ValueError, "supported subset"):
+            agent_server.canonical_secure_peer_scopes(
+                ["teamspace.read", "cross_chat.instruction"]
+            )
+
+    async def test_chat_route_publication_is_retired_before_runtime_lookup(
+        self,
+    ) -> None:
+        runtime = Mock()
+        request = Mock()
+        body = agent_server.SecurePeerRouteCreateRequest(
+            request_id="42e7bb2e-3b47-4be7-89fc-2cecd90f4434",
+            expected_server_identity="server-current",
+            expected_server_instance_id="instance-current",
+            confirmed=True,
+            connection_id="22e7bb2e-3b47-4be7-89fc-2cecd90f4434",
+            chat_id="chat-current",
+            alias="remote",
+            display_title="Remote chat",
+            actions=["instruction"],
+        )
+        with (
+            patch.object(agent_server, "SECURE_PEER_RUNTIME", runtime),
+            patch.object(agent_server, "SERVER_INSTANCE_ID", "instance-current"),
+            patch.object(agent_server, "server_identity", return_value="server-current"),
+            patch.object(agent_server, "require_secure_peer_control") as require_control,
+            patch.object(agent_server, "SECURE_PEER_AGENT_RELAY_ENABLED", False),
+            self.assertRaises(HTTPException) as raised,
+        ):
+            await agent_server.secure_peer_route_publish_endpoint(
+                body,
+                request,
+            )
+        self.assertEqual(raised.exception.status_code, 409)
+        self.assertIn("Team Network Inbox", str(raised.exception.detail))
+        require_control.assert_called_once_with(request)
+        runtime.publish_route.assert_not_called()
+
     async def test_lists_only_the_exact_team_under_the_current_server_instance(self) -> None:
         runtime = Mock()
         runtime.list_peers.return_value = {"peers": []}

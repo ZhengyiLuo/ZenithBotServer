@@ -92,7 +92,16 @@ class CodexThreadPolicyTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("Never rely on provider-local timers, loops, or detached processes", instructions)
         self.assertIn("wake this AgentsDock chat or deliver a later reply", instructions)
         self.assertIn("Manage durable scheduled jobs only when explicitly asked", instructions)
-        self.assertLessEqual(len(instructions.splitlines()), 16)
+        # Context diet: the static provider-authority usage and delivery
+        # provenance rules moved from every per-turn prompt into these thread
+        # instructions, so the line budget applies to the core policy and the
+        # static addendum is bounded separately (present exactly once).
+        core = instructions.split(agent_server.PROVIDER_THREAD_INSTRUCTION_ADDENDUM.strip())[0]
+        self.assertLessEqual(len(core.strip().splitlines()), 16)
+        self.assertEqual(
+            instructions.count(agent_server.PROVIDER_THREAD_INSTRUCTION_ADDENDUM.strip()),
+            1,
+        )
 
     def test_codex_policy_version_rotates_existing_thread_hashes(self) -> None:
         session = self.session()
@@ -105,13 +114,14 @@ class CodexThreadPolicyTests(unittest.IsolatedAsyncioTestCase):
                 "chat-1",
                 session,
             )
-            with patch.object(agent_server, "CODEX_THREAD_POLICY_VERSION", "6"):
+            with patch.object(agent_server, "CODEX_THREAD_POLICY_VERSION", "7"):
                 previous_hash = agent_server.codex_thread_instruction_hash(
                     "chat-1",
                     session,
                 )
 
-        self.assertEqual(agent_server.CODEX_THREAD_POLICY_VERSION, "7")
+        # v8 migrates resumed threads onto the context-diet instructions.
+        self.assertEqual(agent_server.CODEX_THREAD_POLICY_VERSION, "8")
         self.assertNotEqual(current_hash, previous_hash)
 
     def test_claude_policy_has_the_same_retry_and_context_hygiene_rules(self) -> None:
@@ -126,8 +136,15 @@ class CodexThreadPolicyTests(unittest.IsolatedAsyncioTestCase):
             instructions,
         )
         self.assertIn("cannot durably deliver a later chat update", instructions)
-        self.assertIn("exact Jobs `--authority-file` command", instructions)
-        self.assertLessEqual(len(instructions.splitlines()), 16)
+        self.assertIn("Jobs `--authority-file` command below", instructions)
+        # Context diet: the static addendum is appended once; the core policy
+        # keeps its line budget.
+        core = instructions.split(agent_server.PROVIDER_THREAD_INSTRUCTION_ADDENDUM.strip())[0]
+        self.assertLessEqual(len(core.strip().splitlines()), 16)
+        self.assertEqual(
+            instructions.count(agent_server.PROVIDER_THREAD_INSTRUCTION_ADDENDUM.strip()),
+            1,
+        )
 
     async def test_new_thread_receives_policy_once_at_thread_start(self) -> None:
         manager = FakeCodexAppServerManager()

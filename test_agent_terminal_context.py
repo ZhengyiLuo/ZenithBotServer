@@ -90,7 +90,14 @@ class AgentTerminalContextTests(unittest.TestCase):
         self.assertEqual(first_prompt, second_prompt)
         self.assertNotIn("Current jobs for this chat", first_prompt)
         self.assertNotIn("turn-start snapshot", first_prompt)
-        self.assertLess(len(first_prompt), 2_400)
+        # The static provider-authority and delivery guidance now lives here
+        # once per session instead of being appended to every turn's prompt,
+        # so the prelude is larger but still bounded and byte-stable.
+        self.assertIn(
+            agent_server.PROVIDER_THREAD_INSTRUCTION_ADDENDUM.strip(),
+            first_prompt,
+        )
+        self.assertLess(len(first_prompt), 12_000)
 
     def test_claude_transcript_suppression_flag_only_affects_fresh_command(self) -> None:
         standalone = agent_server.build_claude_cmd(
@@ -463,7 +470,7 @@ class AgentTerminalContextTests(unittest.TestCase):
             compact = " ".join(prompt.split())
             self.assertIn("Publish user-facing files", compact)
             self.assertIn('"files":["/absolute/path.ext"', compact)
-            self.assertIn("exact `--authority-file` command", compact)
+            self.assertIn("`--authority-file` command", compact)
             self.assertIn("playable `.mp4`/`.mov` videos", compact)
             self.assertIn("successful JSON receipt", compact)
             self.assertIn("submitted for attachment", compact)

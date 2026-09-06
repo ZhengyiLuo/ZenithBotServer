@@ -35,6 +35,33 @@ TEAM_HUB_TAILSCALE_SERVE_PORT = 8444
 TEAM_HUB_TAILNET_LABEL_PATTERN = re.compile(
     r"^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?$"
 )
+TEAM_HUB_STARTUP_FAILURE_REASON_MAX_CHARS = 320
+TEAM_HUB_STARTUP_SECRET_RE = re.compile(
+    r"(?i)\b(token|secret|password|proof|authorization|bearer)\b"
+    r"(?:\s*[:=]\s*|\s+)[^\s,;]+"
+)
+TEAM_HUB_ABSOLUTE_PATH_RE = re.compile(
+    r"(?<![A-Za-z0-9])(?:/[A-Za-z0-9_.~+@%=-][^\s,;]*|[A-Za-z]:[\\/][^\s,;]*)"
+)
+
+
+def concise_team_hub_startup_failure(exc: BaseException) -> str:
+    """Return one bounded operator-safe reason without credentials or paths."""
+
+    message = " ".join(str(exc).split()).strip()
+    if not message:
+        message = type(exc).__name__
+    message = TEAM_HUB_STARTUP_SECRET_RE.sub(
+        lambda match: f"{match.group(1)}=[redacted]",
+        message,
+    )
+    message = TEAM_HUB_ABSOLUTE_PATH_RE.sub("[path]", message)
+    if len(message) > TEAM_HUB_STARTUP_FAILURE_REASON_MAX_CHARS:
+        message = (
+            message[: TEAM_HUB_STARTUP_FAILURE_REASON_MAX_CHARS - 3].rstrip()
+            + "..."
+        )
+    return message
 
 
 def _canonical_tailnet_hostname(value: str) -> bool:
@@ -173,6 +200,19 @@ def configured_team_hub_endpoint(
     return TEAM_HUB_TRANSPORT_TAILSCALE_SERVE, canonical, hostname, None
 
 
+async def _join_task_despite_caller_cancellation(
+    task: asyncio.Task[Any],
+) -> Any:
+    """Join an owned side effect even when the caller keeps cancelling."""
+
+    while True:
+        try:
+            return await asyncio.shield(task)
+        except asyncio.CancelledError:
+            if task.done():
+                return task.result()
+
+
 class ManagedTeamHubHost:
     """An unavailable-first ASGI mount whose credential realm is Hub-only."""
 
@@ -183,11 +223,18 @@ class ManagedTeamHubHost:
         data_dir: Path,
         server_identity: str,
         server_instance_id: str = "server-instance-local-preview",
+        managed_host_display_name: str = "Team Hub host",
         allowed_hosts: set[str],
         transport: str = TEAM_HUB_TRANSPORT_LOOPBACK,
         hub_url: str | None = None,
         routes: dict[str, str | None] | None = None,
         secure_peer_manager: Any | None = None,
+        reactivation_hub_id: str | None = None,
+        reactivation_operation_id: str | None = None,
+        reactivation_snapshot: Path | None = None,
+        update_hub_id: str | None = None,
+        update_operation_id: str | None = None,
+        update_snapshot: Path | None = None,
         config_error: str | None = None,
         logger: logging.Logger | None = None,
     ) -> None:
@@ -195,6 +242,7 @@ class ManagedTeamHubHost:
         self.data_dir = Path(data_dir)
         self.server_identity = str(server_identity)
         self.server_instance_id = str(server_instance_id)
+        self.managed_host_display_name = str(managed_host_display_name)
         self.allowed_hosts = set(allowed_hosts)
         self.transport = transport
         self.hub_url = hub_url
@@ -228,6 +276,12 @@ class ManagedTeamHubHost:
             if route in configured_routes
         }
         self.secure_peer_manager = secure_peer_manager
+        self.reactivation_hub_id = reactivation_hub_id
+        self.reactivation_operation_id = reactivation_operation_id
+        self.reactivation_snapshot = reactivation_snapshot
+        self.update_hub_id = update_hub_id
+        self.update_operation_id = update_operation_id
+        self.update_snapshot = update_snapshot
         self.config_error = config_error or route_error
         self.logger = logger or logging.getLogger("agents-server.team-hub")
         self._guard = threading.RLock()
@@ -238,6 +292,8 @@ class ManagedTeamHubHost:
         self._runtime_lease_fd: int | None = None
         self._accepting = False
         self._startup_failed = False
+        self._startup_failure_reason: str | None = None
+        self._fenced_finalize_in_progress = False
         self._bootstrap_rate_guard = threading.Lock()
         self._bootstrap_rate_buckets: dict[str, tuple[int, int]] = {}
 
@@ -256,10 +312,17 @@ class ManagedTeamHubHost:
                 self.logger.error("Team Hub is disabled: %s", self.config_error)
             return
         if self.config_error:
+            failure_reason = concise_team_hub_startup_failure(
+                RuntimeError(self.config_error)
+            )
             with self._guard:
                 self._startup_failed = True
+                self._startup_failure_reason = failure_reason
                 self._accepting = False
-            self.logger.error("Team Hub host configuration is invalid: %s", self.config_error)
+            self.logger.error(
+                "Team Hub host configuration is invalid reason=%s",
+                failure_reason,
+            )
             return
         lease: int | None = None
         try:
@@ -269,6 +332,7 @@ class ManagedTeamHubHost:
                 allowed_hosts=self.allowed_hosts,
                 managed_host_identity=self.server_identity,
                 managed_server_instance_id=self.server_instance_id,
+                managed_host_display_name=self.managed_host_display_name,
                 managed_transport=self.transport,
                 managed_hub_url=(
                     self.hub_url
@@ -282,17 +346,26 @@ class ManagedTeamHubHost:
                     for route, url in self.routes.items()
                 },
                 secure_peer_manager=self.secure_peer_manager,
+                managed_reactivation_hub_id=self.reactivation_hub_id,
+                managed_reactivation_operation_id=self.reactivation_operation_id,
+                managed_reactivation_snapshot=self.reactivation_snapshot,
+                managed_update_hub_id=self.update_hub_id,
+                managed_update_operation_id=self.update_operation_id,
+                managed_update_snapshot=self.update_snapshot,
             )
         except Exception as exc:
             HubStore.release_managed_runtime_lease(lease)
+            failure_reason = concise_team_hub_startup_failure(exc)
             with self._guard:
                 self._startup_failed = True
+                self._startup_failure_reason = failure_reason
                 self._delegate = None
                 self._store = None
                 self._accepting = False
             self.logger.error(
-                "managed Team Hub activation failed error_type=%s",
+                "managed Team Hub activation failed error_type=%s reason=%s",
                 type(exc).__name__,
+                failure_reason,
             )
             return
         with self._guard:
@@ -301,7 +374,11 @@ class ManagedTeamHubHost:
             self._store = application.state.store
             self._accepting = True
             self._startup_failed = False
-        if self.secure_peer_manager is not None:
+            self._startup_failure_reason = None
+        if (
+            self.secure_peer_manager is not None
+            and not application.state.store.maintenance_fenced_start
+        ):
             try:
                 self.secure_peer_manager.attach_host_hub(
                     hub_id=application.state.store.hub_id,
@@ -333,11 +410,83 @@ class ManagedTeamHubHost:
                     ),
                 )
 
+    def _finalize_committed_fenced_start(self) -> None:
+        """Attach peer hosting after the installer consumes the exact fence.
+
+        The candidate remains manager-owned and running throughout commit.
+        Health polling drives this idempotent transition, so no service
+        bootout/restart window exists after rollback becomes impossible.
+        """
+
+        with self._guard:
+            store = self._store
+            if (
+                store is None
+                or not store.maintenance_fenced_start
+                or self._fenced_finalize_in_progress
+            ):
+                return
+            try:
+                fence = store.maintenance_fence()
+            except Exception as exc:
+                self.logger.error(
+                    "Team Hub fenced finalization check failed error_type=%s",
+                    type(exc).__name__,
+                )
+                return
+            if fence is not None:
+                return
+            self._fenced_finalize_in_progress = True
+        try:
+            if self.secure_peer_manager is not None:
+                self.secure_peer_manager.attach_host_hub(
+                    hub_id=store.hub_id,
+                    hub_data_dir=self.data_dir,
+                    hub_store=store,
+                )
+        except Exception as exc:
+            self.logger.error(
+                "secure peer host post-commit attachment failed error_type=%s error_code=%s",
+                type(exc).__name__,
+                getattr(exc, "code", "secure_peer_host_recovery_failed"),
+            )
+            if self.secure_peer_manager is not None:
+                self.secure_peer_manager.mark_host_unavailable(
+                    "The secure peer host could not finish recovery.",
+                    error_code=str(
+                        getattr(
+                            exc,
+                            "code",
+                            "secure_peer_host_recovery_failed",
+                        )
+                    ),
+                    action="Retry after the Team Hub database is available.",
+                )
+        else:
+            with self._guard:
+                if self._store is store:
+                    store.maintenance_fenced_start = False
+                    store.reactivation_fenced_start = False
+                    store.maintenance_fence_reason = None
+                    store.maintenance_operation_id = None
+                    store.maintenance_fence_snapshot = None
+                    self.reactivation_hub_id = None
+                    self.reactivation_operation_id = None
+                    self.reactivation_snapshot = None
+                    self.update_hub_id = None
+                    self.update_operation_id = None
+                    self.update_snapshot = None
+        finally:
+            with self._guard:
+                self._fenced_finalize_in_progress = False
+
     def capability(self) -> dict[str, Any]:
+        self._finalize_committed_fenced_start()
         with self._guard:
             available = bool(self._accepting and self._store is not None)
             hub_id = self._store.hub_id if available and self._store is not None else None
             startup_failed = self._startup_failed
+            startup_failure_reason = self._startup_failure_reason
         if not self.designated_host:
             message = (
                 "Team Hub host mode is misconfigured on this AgentsServer."
@@ -374,6 +523,9 @@ class ManagedTeamHubHost:
             ],
             "hub_id": hub_id,
             "host_server_identity": self.server_identity,
+            "startup_failure_reason": (
+                startup_failure_reason if startup_failed else None
+            ),
             "message": (
                 "This AgentsServer hosts Team Hub over private Tailscale Serve."
                 if available and self.transport == TEAM_HUB_TRANSPORT_TAILSCALE_SERVE
@@ -533,9 +685,26 @@ class ManagedTeamHubHost:
             # The TLS gateway bypasses ASGI but shares the authoritative Hub
             # database. Close and drain it before a maintenance snapshot can
             # begin so an acknowledged peer write cannot land post-snapshot.
-            await asyncio.to_thread(
-                self.secure_peer_manager.close_host_admission
+            close_task = asyncio.create_task(
+                asyncio.to_thread(
+                    self.secure_peer_manager.close_host_admission
+                )
             )
+            try:
+                await asyncio.shield(close_task)
+            except asyncio.CancelledError as cancellation:
+                # The native peer drain cannot be stopped once its worker has
+                # begun. Keep ownership until it settles so a later close
+                # cannot race the cancellation rollback's reopen.
+                try:
+                    await _join_task_despite_caller_cancellation(close_task)
+                except BaseException as exc:
+                    self.logger.error(
+                        "secure peer maintenance drain failed during cancellation "
+                        "error_type=%s",
+                        type(exc).__name__,
+                    )
+                raise cancellation
         async with self._admission:
             with self._guard:
                 self._accepting = False
@@ -549,26 +718,135 @@ class ManagedTeamHubHost:
         drain_timeout_seconds: float = 10.0,
         persistent_fence: bool = True,
         operation_id: str | None = None,
+        allow_unavailable_host: bool = False,
+        _reopen_on_abort: bool = True,
     ) -> Path | None:
         """Close Hub admission, drain delegated requests, then snapshot."""
 
         if not self.designated_host:
             return None
+
+        async def cleanup_aborted_maintenance(
+            *,
+            store: HubStore | None = None,
+            snapshot: Path | None = None,
+        ) -> None:
+            if not _reopen_on_abort:
+                # Lifespan shutdown may outlive its bounded caller while a
+                # native snapshot worker settles. Publish permanent local
+                # closure before any further await so that straggler can never
+                # resurrect admission after the peer runtime is shut down.
+                with self._guard:
+                    self._accepting = False
+            if persistent_fence and store is not None:
+                if snapshot is not None:
+                    await asyncio.to_thread(
+                        store.clear_maintenance_fence,
+                        expected_reason=reason,
+                        expected_operation_id=str(operation_id),
+                        expected_snapshot=snapshot,
+                    )
+                # A failed snapshot worker may have installed an incomplete,
+                # changed, or otherwise ambiguous fence without returning its
+                # snapshot.  Probe before reopening; a valid remaining marker
+                # or a validation error must leave both admission surfaces
+                # closed for explicit recovery.
+                remaining_fence = await asyncio.to_thread(
+                    store.maintenance_fence
+                )
+                if remaining_fence is not None:
+                    raise RuntimeError(
+                        "Team Hub maintenance fence remains after abort"
+                    )
+            if _reopen_on_abort:
+                # Local ASGI and secure-peer admission form one boundary. They
+                # reopen only after the exact durable fence is cleared (or
+                # after a pre-snapshot abort where no fence was installed).
+                await self.reopen_admission()
+
+        async def settle_aborted_maintenance(
+            *,
+            store: HubStore | None = None,
+            snapshot: Path | None = None,
+        ) -> asyncio.CancelledError | None:
+            cleanup_task = asyncio.create_task(
+                cleanup_aborted_maintenance(store=store, snapshot=snapshot)
+            )
+            try:
+                await asyncio.shield(cleanup_task)
+                return None
+            except asyncio.CancelledError as cancellation:
+                try:
+                    await _join_task_despite_caller_cancellation(cleanup_task)
+                except BaseException as exc:
+                    self.logger.error(
+                        "Team Hub maintenance cancellation cleanup failed "
+                        "error_type=%s",
+                        type(exc).__name__,
+                    )
+                return cancellation
+            except BaseException as exc:
+                self.logger.error(
+                    "Team Hub maintenance cancellation cleanup failed "
+                    "error_type=%s",
+                    type(exc).__name__,
+                )
+                return None
+
+        drain_task = asyncio.create_task(self._close_and_drain())
         try:
             await asyncio.wait_for(
-                self._close_and_drain(),
+                asyncio.shield(drain_task),
                 timeout=max(0.1, float(drain_timeout_seconds)),
             )
-        except TimeoutError as exc:
-            await self.reopen_admission()
+        except asyncio.CancelledError as cancellation:
+            drain_task.cancel()
+            try:
+                await _join_task_despite_caller_cancellation(drain_task)
+            except BaseException:
+                pass
+            await settle_aborted_maintenance()
+            raise cancellation
+        except asyncio.TimeoutError as exc:
+            drain_task.cancel()
+            try:
+                await _join_task_despite_caller_cancellation(drain_task)
+            except BaseException:
+                pass
+            cleanup_cancellation = await settle_aborted_maintenance()
+            if cleanup_cancellation is not None:
+                raise cleanup_cancellation
             raise RuntimeError("Team Hub request drain timed out") from exc
+        except BaseException:
+            cleanup_cancellation = await settle_aborted_maintenance()
+            if cleanup_cancellation is not None:
+                raise cleanup_cancellation
+            raise
         with self._guard:
             store = self._store
+            startup_failed = self._startup_failed
+            startup_failure_reason = self._startup_failure_reason
         if store is None:
-            await self.reopen_admission()
+            if allow_unavailable_host and startup_failed:
+                # A failed host has no live HubStore whose logical state can
+                # be snapshotted. Keep both local and peer admission closed;
+                # the caller must bind the repair transaction to an exact
+                # cold on-disk generation before replacing the release.
+                self.logger.warning(
+                    "Team Hub maintenance proceeding without a live snapshot "
+                    "reason=%s startup_failure=%s",
+                    reason,
+                    startup_failure_reason or "unavailable",
+                )
+                return None
+            cleanup_cancellation = await settle_aborted_maintenance()
+            if cleanup_cancellation is not None:
+                raise cleanup_cancellation
             raise RuntimeError("designated Team Hub is unavailable for maintenance")
         if persistent_fence and not operation_id:
-            await self.reopen_admission()
+            cleanup_cancellation = await settle_aborted_maintenance()
+            if cleanup_cancellation is not None:
+                raise cleanup_cancellation
             raise ValueError("persistent Team Hub maintenance requires an operation_id")
         snapshot_call = (
             asyncio.to_thread(
@@ -584,26 +862,24 @@ class ManagedTeamHubHost:
         )
         try:
             return await asyncio.shield(snapshot_task)
-        except asyncio.CancelledError:
+        except asyncio.CancelledError as cancellation:
             snapshot: Path | None = None
             try:
-                snapshot = await snapshot_task
-            except Exception:
-                pass
-            if persistent_fence and snapshot is not None:
-                try:
-                    await asyncio.to_thread(
-                        store.clear_maintenance_fence,
-                        expected_reason=reason,
-                        expected_operation_id=str(operation_id),
-                        expected_snapshot=snapshot,
-                    )
-                except Exception:
-                    pass
-            await self.reopen_admission()
-            raise
+                snapshot = await _join_task_despite_caller_cancellation(
+                    snapshot_task
+                )
+            except BaseException as exc:
+                self.logger.error(
+                    "Team Hub maintenance snapshot failed during cancellation "
+                    "error_type=%s",
+                    type(exc).__name__,
+                )
+            await settle_aborted_maintenance(store=store, snapshot=snapshot)
+            raise cancellation
         except BaseException:
-            await self.reopen_admission()
+            cleanup_cancellation = await settle_aborted_maintenance(store=store)
+            if cleanup_cancellation is not None:
+                raise cleanup_cancellation
             raise
 
     async def clear_maintenance(
@@ -618,12 +894,23 @@ class ManagedTeamHubHost:
             if self.designated_host:
                 raise RuntimeError("designated Team Hub is unavailable")
             return False
-        return await asyncio.to_thread(
-            store.clear_maintenance_fence,
-            expected_reason=reason,
-            expected_operation_id=operation_id,
-            expected_snapshot=snapshot,
+        clear_task = asyncio.create_task(
+            asyncio.to_thread(
+                store.clear_maintenance_fence,
+                expected_reason=reason,
+                expected_operation_id=operation_id,
+                expected_snapshot=snapshot,
+            )
         )
+        try:
+            return await asyncio.shield(clear_task)
+        except asyncio.CancelledError as cancellation:
+            # The filesystem replace/unlink sequence cannot be cancelled once
+            # its worker has begun.  Retain ownership through repeated caller
+            # cancellation so a caller cannot reopen admission while the
+            # durable fence still exists (or while its outcome is unknown).
+            await _join_task_despite_caller_cancellation(clear_task)
+            raise cancellation
 
     def clear_maintenance_sync(
         self,
@@ -655,14 +942,51 @@ class ManagedTeamHubHost:
     async def reopen_admission(self) -> None:
         with self._guard:
             ready = self._delegate is not None and self._store is not None
-        async with self._admission:
-            with self._guard:
-                self._accepting = ready
-            self._admission.notify_all()
-        if self.secure_peer_manager is not None:
-            await asyncio.to_thread(
-                self.secure_peer_manager.reopen_host_admission
+            # Do not expose the local ASGI surface while the secure-peer
+            # surface is still closed or its reopen outcome is unknown.
+            if self.secure_peer_manager is not None:
+                self._accepting = False
+        cancellation: asyncio.CancelledError | None = None
+        if self.secure_peer_manager is not None and ready:
+            reopen_task = asyncio.create_task(
+                asyncio.to_thread(
+                    self.secure_peer_manager.reopen_host_admission
+                )
             )
+            try:
+                await asyncio.shield(reopen_task)
+            except asyncio.CancelledError as exc:
+                try:
+                    await _join_task_despite_caller_cancellation(reopen_task)
+                except BaseException:
+                    with self._guard:
+                        self._accepting = False
+                    raise
+                cancellation = exc
+            except BaseException:
+                with self._guard:
+                    self._accepting = False
+                raise
+
+        # No await is allowed between a successful peer reopen and publishing
+        # local admission: cancellation must observe both surfaces in the same
+        # state. Notify condition waiters in a separately owned task afterward.
+        with self._guard:
+            self._accepting = ready
+
+        async def notify_reopened() -> None:
+            async with self._admission:
+                self._admission.notify_all()
+
+        notification_task = asyncio.create_task(notify_reopened())
+        try:
+            await asyncio.shield(notification_task)
+        except asyncio.CancelledError as exc:
+            await _join_task_despite_caller_cancellation(notification_task)
+            if cancellation is None:
+                cancellation = exc
+        if cancellation is not None:
+            raise cancellation
 
     def reopen_admission_sync(self) -> None:
         """Reopen after a synchronous restart signal worker fails.
@@ -674,9 +998,18 @@ class ManagedTeamHubHost:
         """
 
         with self._guard:
-            self._accepting = self._delegate is not None and self._store is not None
-        if self.secure_peer_manager is not None:
-            self.secure_peer_manager.reopen_host_admission()
+            ready = self._delegate is not None and self._store is not None
+            if self.secure_peer_manager is not None:
+                self._accepting = False
+        if self.secure_peer_manager is not None and ready:
+            try:
+                self.secure_peer_manager.reopen_host_admission()
+            except BaseException:
+                with self._guard:
+                    self._accepting = False
+                raise
+        with self._guard:
+            self._accepting = ready
 
     async def shutdown(self) -> None:
         if not self.designated_host:
@@ -693,7 +1026,9 @@ class ManagedTeamHubHost:
                     await asyncio.wait_for(self._close_and_drain(), timeout=10.0)
                 else:
                     await self.prepare_maintenance(
-                        "server-shutdown", persistent_fence=False
+                        "server-shutdown",
+                        persistent_fence=False,
+                        _reopen_on_abort=False,
                     )
             except Exception as exc:
                 self.logger.error(

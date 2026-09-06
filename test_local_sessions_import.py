@@ -588,7 +588,9 @@ class StagedHistoryBatchTests(unittest.IsolatedAsyncioTestCase):
             {"kind": "user", "text": "hello"},
             {"kind": "assistant", "text": "hi"},
         ]
-        append_batch = AsyncMock(return_value=3)
+        # marker + two messages + the terminal turn_finished that closes the
+        # import run so clients never treat replayed history as live.
+        append_batch = AsyncMock(return_value=4)
         with patch.object(
             agent_server,
             "append_imported_events",
@@ -605,8 +607,9 @@ class StagedHistoryBatchTests(unittest.IsolatedAsyncioTestCase):
         event_specs = append_batch.await_args.args[1]
         self.assertEqual(
             [event_type for event_type, _payload in event_specs],
-            ["history_imported", "turn_started", "assistant_text"],
+            ["history_imported", "turn_started", "assistant_text", "turn_finished"],
         )
+        self.assertTrue(event_specs[-1][1]["imported"])
 
     async def test_staged_history_rejects_an_incomplete_batch_write(self) -> None:
         session = {

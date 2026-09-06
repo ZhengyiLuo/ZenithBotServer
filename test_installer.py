@@ -1,6 +1,7 @@
 import hashlib
 import json
 import os
+import plistlib
 import shutil
 import socket
 import sqlite3
@@ -30,7 +31,7 @@ RELEASE_WORKFLOW = ROOT / ".github" / "workflows" / "server-release.yml"
 class InstallerContractTests(unittest.TestCase):
     def test_top_level_release_symlinks_are_rejected_by_packager_and_installer(self):
         with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
+            root = Path(temporary).resolve()
             source = root / "source"
             source.mkdir()
             for name in package_release.FILES:
@@ -128,6 +129,72 @@ class InstallerContractTests(unittest.TestCase):
             INSTALLER.read_text(),
         )
 
+    def test_forced_source_build_has_an_exact_closed_backend_constraint_set(self):
+        project = tomllib.loads((ROOT / "pyproject.toml").read_text())
+        uv_configuration = project["tool"]["uv"]
+        expected_constraints = [
+            "hatchling==1.32.0",
+            "packaging==26.3",
+            "pathspec==1.1.1",
+            "pluggy==1.6.0",
+            "tomli==2.4.1; python_version < '3.11'",
+            "tomlkit==0.15.1",
+            "trove-classifiers==2026.6.1.19",
+        ]
+
+        self.assertEqual(
+            uv_configuration["no-binary-package"],
+            ["claude-agent-sdk"],
+        )
+        self.assertEqual(
+            uv_configuration["build-constraint-dependencies"],
+            expected_constraints,
+        )
+
+        lock = tomllib.loads((ROOT / "uv.lock").read_text())
+        locked_constraints = lock["manifest"]["build-constraints"]
+        self.assertEqual(
+            locked_constraints,
+            [
+                {
+                    "name": requirement.split("==", 1)[0],
+                    "specifier": f"=={requirement.split('==', 1)[1].split(';', 1)[0]}",
+                    **(
+                        {"marker": "python_full_version < '3.11'"}
+                        if requirement.startswith("tomli==")
+                        else {}
+                    ),
+                }
+                for requirement in expected_constraints
+            ],
+        )
+
+    def test_cryptography_lock_is_patched_and_matches_supported_mac_architecture(self):
+        project = tomllib.loads((ROOT / "pyproject.toml").read_text())
+        self.assertIn(
+            "cryptography>=50.0.1,<51",
+            project["project"]["dependencies"],
+        )
+        lock = tomllib.loads((ROOT / "uv.lock").read_text())
+        packages = [
+            package
+            for package in lock["package"]
+            if package.get("name") == "cryptography"
+        ]
+        self.assertEqual(len(packages), 1)
+        version = tuple(int(part) for part in packages[0]["version"].split("."))
+        self.assertGreaterEqual(version, (50, 0, 1))
+        macos_wheels = [
+            wheel["url"]
+            for wheel in packages[0].get("wheels", [])
+            if "-macosx_" in wheel["url"]
+        ]
+        self.assertTrue(macos_wheels)
+        self.assertTrue(all("_arm64.whl" in url for url in macos_wheels))
+        self.assertTrue(
+            any("cp39-abi3-macosx_11_0_arm64.whl" in url for url in macos_wheels)
+        )
+
     def test_shell_syntax_is_valid(self):
         for script in (INSTALLER, UNINSTALLER, DEPLOYER):
             with self.subTest(script=script.name):
@@ -158,7 +225,7 @@ class InstallerContractTests(unittest.TestCase):
         self.assertLess(scrubbed, argument_parsing)
 
         with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
+            root = Path(temporary).resolve()
             home = root / "home"
             home.mkdir()
             install_root = root / "install"
@@ -221,7 +288,7 @@ class InstallerContractTests(unittest.TestCase):
         if service_cgroup is None:
             self.skipTest("fixture process is in the root cgroup")
         with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
+            root = Path(temporary).resolve()
             _home, fake_bin, install_root, environment = (
                 self.fake_linux_preinstall_environment(root)
             )
@@ -253,12 +320,14 @@ class InstallerContractTests(unittest.TestCase):
         if not Path("/proc/self/cgroup").is_file():
             self.skipTest("Linux /proc cgroup fixture is unavailable")
         with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            _home, fake_bin, _install_root, environment = (
+            root = Path(temporary).resolve()
+            home, fake_bin, _install_root, environment = (
                 self.fake_linux_preinstall_environment(root)
             )
+            self.write_running_systemd_service(home)
             events = root / "systemctl.log"
             stopped = root / "stopped"
+            count = root / "show-count"
             self.write_exact_health_uv(fake_bin)
             self.write_json_health_curl(fake_bin)
             self.write_executable(fake_bin / "sleep", "#!/bin/sh\nexit 0\n")
@@ -268,8 +337,19 @@ class InstallerContractTests(unittest.TestCase):
 printf '%s\n' "$*" >> "$FAKE_SYSTEMCTL_LOG"
 case "$*" in
   "--user show-environment") exit 0 ;;
+  "--user show agents-server.service --property=LoadState --value") echo loaded; exit 0 ;;
+  "--user is-enabled agents-server.service") echo enabled; exit 0 ;;
+  "--user show zenithbot-agent.service --property=LoadState --value") echo not-found; exit 0 ;;
+  "--user show zenithbot-agent.service --property=ActiveState --value") echo inactive; exit 0 ;;
+  "--user is-enabled zenithbot-agent.service") echo not-found; exit 1 ;;
   "--user show agents-server.service --property=ActiveState --value")
-    if [ -e "$FAKE_STOPPED_SENTINEL" ]; then echo inactive; else echo deactivating; fi
+    current="$(cat "$FAKE_SHOW_COUNT" 2>/dev/null || echo 0)"
+    current=$((current + 1))
+    printf '%s\n' "$current" > "$FAKE_SHOW_COUNT"
+    if [ -e "$FAKE_STOPPED_SENTINEL" ]; then echo inactive
+    elif [ "$current" -eq 1 ]; then echo active
+    else echo deactivating
+    fi
     exit 0
     ;;
   "--user kill --kill-who=all --signal=SIGKILL agents-server.service")
@@ -282,8 +362,10 @@ exit 0
             )
             server_identity = "server_test_identity_12345678"
             environment.update({
+                "FAKE_AUTHORITATIVE_SYSTEMCTL": "false",
                 "FAKE_SYSTEMCTL_LOG": str(events),
                 "FAKE_STOPPED_SENTINEL": str(stopped),
+                "FAKE_SHOW_COUNT": str(count),
                 "FAKE_HEALTH_VERSION": self.release_version(),
                 "FAKE_SERVER_IDENTITY": server_identity,
                 "FAKE_TEAM_HUB_ID": "",
@@ -293,6 +375,8 @@ exit 0
                 [
                     "/bin/bash",
                     str(INSTALLER),
+                    "--port",
+                    "47850",
                     "--non-interactive",
                     "--expected-server-identity",
                     server_identity,
@@ -320,10 +404,11 @@ exit 0
         if not Path("/proc/self/cgroup").is_file():
             self.skipTest("Linux /proc cgroup fixture is unavailable")
         with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            _home, fake_bin, _install_root, environment = (
+            root = Path(temporary).resolve()
+            home, fake_bin, _install_root, environment = (
                 self.fake_linux_preinstall_environment(root)
             )
+            self.write_running_systemd_service(home)
             events = root / "systemctl.log"
             count = root / "show-count"
             self.write_exact_health_uv(fake_bin)
@@ -335,11 +420,19 @@ exit 0
 printf '%s\n' "$*" >> "$FAKE_SYSTEMCTL_LOG"
 case "$*" in
   "--user show-environment") exit 0 ;;
+  "--user show agents-server.service --property=LoadState --value") echo loaded; exit 0 ;;
+  "--user is-enabled agents-server.service") echo enabled; exit 0 ;;
+  "--user show zenithbot-agent.service --property=LoadState --value") echo not-found; exit 0 ;;
+  "--user show zenithbot-agent.service --property=ActiveState --value") echo inactive; exit 0 ;;
+  "--user is-enabled zenithbot-agent.service") echo not-found; exit 1 ;;
   "--user show agents-server.service --property=ActiveState --value")
     current="$(cat "$FAKE_SHOW_COUNT" 2>/dev/null || echo 0)"
     current=$((current + 1))
     printf '%s\n' "$current" > "$FAKE_SHOW_COUNT"
-    if [ "$current" -gt 50 ]; then echo inactive; else echo deactivating; fi
+    if [ "$current" -eq 1 ]; then echo active
+    elif [ "$current" -gt 50 ]; then echo inactive
+    else echo deactivating
+    fi
     exit 0
     ;;
   "--user kill --kill-who=all --signal=SIGKILL agents-server.service")
@@ -351,6 +444,7 @@ exit 0
             )
             server_identity = "server_test_identity_12345678"
             environment.update({
+                "FAKE_AUTHORITATIVE_SYSTEMCTL": "false",
                 "FAKE_SYSTEMCTL_LOG": str(events),
                 "FAKE_SHOW_COUNT": str(count),
                 "FAKE_HEALTH_VERSION": self.release_version(),
@@ -362,6 +456,8 @@ exit 0
                 [
                     "/bin/bash",
                     str(INSTALLER),
+                    "--port",
+                    "47850",
                     "--non-interactive",
                     "--expected-server-identity",
                     server_identity,
@@ -390,7 +486,7 @@ exit 0
         end = source.index("\nrestart_service() {", start)
         functions = source[start:end]
         with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
+            root = Path(temporary).resolve()
             fake_bin = root / "bin"
             fake_bin.mkdir()
             events = root / "events"
@@ -446,7 +542,7 @@ exit 0
         end = source.index("\nrestart_service() {", start)
         functions = source[start:end]
         with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
+            root = Path(temporary).resolve()
             fake_bin = root / "bin"
             fake_bin.mkdir()
             events = root / "events"
@@ -541,7 +637,7 @@ exit 0
                 return 0
 
         with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
+            root = Path(temporary).resolve()
             stubborn = root / "stubborn.py"
             stubborn.write_text(
                 "import os, signal, time\n"
@@ -684,7 +780,7 @@ exit 0
         active_connection=True,
     ):
         with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
+            root = Path(temporary).resolve()
             fake_bin = root / "bin"
             fake_bin.mkdir()
             ssh_log = root / "ssh.log"
@@ -858,7 +954,7 @@ print(json.dumps(health, separators=(",", ":")))
         secure_state_available=True,
     ):
         with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
+            root = Path(temporary).resolve()
             fake_bin = root / "bin"
             fake_bin.mkdir()
             ssh_log = root / "ssh.log"
@@ -1050,7 +1146,7 @@ raise SystemExit(0)
 
     def test_direct_deploy_refuses_designated_hub_before_copy_or_restart(self):
         with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
+            root = Path(temporary).resolve()
             fake_bin = root / "bin"
             fake_bin.mkdir()
             ssh_log = root / "ssh.log"
@@ -1100,7 +1196,7 @@ exit 0
 
     def test_direct_deploy_refuses_legacy_target_before_copy_or_restart(self):
         with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
+            root = Path(temporary).resolve()
             fake_bin = root / "bin"
             fake_bin.mkdir()
             ssh_log = root / "ssh.log"
@@ -1150,7 +1246,7 @@ exit 0
 
     def test_direct_deploy_rejects_post_restart_server_identity_change(self):
         with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
+            root = Path(temporary).resolve()
             fake_bin = root / "bin"
             fake_bin.mkdir()
             ssh_log = root / "ssh.log"
@@ -1222,7 +1318,7 @@ exit 0
 
     def test_direct_deploy_rejects_quarantined_secure_peer_state_after_restart(self):
         with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
+            root = Path(temporary).resolve()
             fake_bin = root / "bin"
             fake_bin.mkdir()
             ssh_log = root / "ssh.log"
@@ -1296,9 +1392,10 @@ exit 0
         installer_source = INSTALLER.read_text()
         packager_source = PACKAGER.read_text()
         self.assertIn(
-            "RELEASE_FILES=(agent_server.py team_hub_host.py secure_peer_runtime.py secure_peer_delivery.py agentsdock_jobs.py agentsdock_chats.py agentsdock_emergency.py agentsdock_publish.py agentsdock_mail.py agentsdock_team.py claude_sdk_client.py codex_app_server.py cursor_agent_client.py cursor_process_guard.py",
+            "RELEASE_FILES=(activation_transaction.py agent_server.py team_hub_host.py secure_peer_runtime.py secure_peer_delivery.py agentsdock_jobs.py agentsdock_chats.py agentsdock_emergency.py agentsdock_publish.py agentsdock_mail.py agentsdock_team.py claude_sdk_client.py codex_app_server.py cursor_agent_client.py cursor_process_guard.py",
             installer_source,
         )
+        self.assertIn('"$STAGE_DIR/activation_transaction.py"', installer_source)
         self.assertIn('"$STAGE_DIR/agentsdock_team.py"', installer_source)
         self.assertIn("RELEASE_DIRECTORIES=(agentsdock_team_hub)", installer_source)
         self.assertIn('"$STAGE_DIR/agentsdock_chats.py"', installer_source)
@@ -1315,6 +1412,7 @@ exit 0
         self.assertIn('"$STAGE_DIR/secure_peer_delivery.py"', installer_source)
         self.assertIn('"$STAGE_DIR/uninstall.sh"', installer_source)
         self.assertIn('"agentsdock_publish.py"', packager_source)
+        self.assertIn('"activation_transaction.py"', packager_source)
         self.assertIn('"agentsdock_chats.py"', packager_source)
         self.assertIn('"agentsdock_emergency.py"', packager_source)
         self.assertIn('"agentsdock_mail.py"', packager_source)
@@ -1435,6 +1533,10 @@ exit 0
                 f"agents-server-{version}/agentsdock_team_hub/migrations/0010_team_attachment_orphan_reclamation.sql",
                 members,
             )
+            self.assertIn(
+                f"agents-server-{version}/agentsdock_team_hub/migrations/0011_human_admin_paging.sql",
+                members,
+            )
             self.assertFalse(
                 any("__pycache__" in name or name.endswith((".pyc", ".pyo")) for name in members)
             )
@@ -1462,11 +1564,16 @@ exit 0
         self.assertIn('PREVIOUS_LINK="$INSTALL_ROOT/previous"', source)
         self.assertIn('REPLACED_DIR="$RELEASES_ROOT/$RELEASE_VERSION-replaced-', source)
         self.assertIn("ManagedOOMPreference=avoid", source)
-        self.assertLess(source.index('OLD_TARGET=""'), source.index('mv "$STAGE_DIR" "$RELEASE_DIR"'))
+        self.assertLess(
+            source.index('OLD_TARGET=""'),
+            source.index('activate_transaction_files "$STAGE_DIR"'),
+        )
+        self.assertIn("activation_transaction begin", source)
         self.assertIn("rolling back", source)
         self.assertIn("--team-hub-host", source)
         self.assertIn("--team-hub-tailscale-serve-url", source)
         self.assertIn("--team-hub-direct-ip-url", source)
+        self.assertIn("--reactivate-team-hub-host", source)
         self.assertIn("--no-team-hub-host", source)
         self.assertIn("AGENTSDOCK_TEAM_HUB_MODE=$TEAM_HUB_MODE", source)
         self.assertIn("AGENTSDOCK_TEAM_HUB_TRANSPORT=$TEAM_HUB_TRANSPORT", source)
@@ -1478,6 +1585,37 @@ exit 0
         self.assertNotIn("AGENTSDOCK_AGENT_TLS_KEYFILE", source)
         self.assertNotIn('echo "  ${COLOR_BOLD}Access token', source)
         self.assertIsNone(re.search(r"(?m)^\s*sudo\b", source))
+
+    def test_server_name_rejects_controls_and_overlong_values(self):
+        for label, invalid in (
+            ("control", "Sonic\nInjected"),
+            ("overlong", "S" * 161),
+            ("overlong-multibyte", "界" * 60),
+        ):
+            with self.subTest(label=label), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary).resolve()
+                _home, fake_bin, install_root, environment = (
+                    self.fake_linux_preinstall_environment(root)
+                )
+                self.write_fake_uv(fake_bin)
+                environment["AGENTSDOCK_SERVER_NAME"] = invalid
+
+                result = subprocess.run(
+                    ["/bin/bash", str(INSTALLER), "--non-interactive"],
+                    env=environment,
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                )
+
+                self.assertEqual(result.returncode, 2, result.stderr)
+                self.assertIn(
+                    "empty or at most 160 UTF-8 bytes and contain no control characters",
+                    result.stderr,
+                )
+                self.assertTrue(
+                    (install_root / "current" / "runtime-marker").is_file()
+                )
 
     def test_help_does_not_modify_the_machine(self):
         result = subprocess.run(
@@ -1727,12 +1865,12 @@ exit 0
 
     def test_show_token_reads_current_token_without_mutating_configured_roots(self):
         with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
+            root = Path(temporary).resolve()
             home, install_root, config_root, state_root, environment = (
                 self.show_token_environment(root)
             )
             token = "current_agentsdock_token_abcdefghijklmnopqrstuvwxyz"
-            (config_root / "env").write_text(
+            self.write_private_file(config_root / "env",
                 f"AGENTSDOCK_AGENT_TOKEN={token}\n"
                 "PRESERVED_SETTING=unchanged\n"
             )
@@ -1765,13 +1903,13 @@ exit 0
         )
         for scenario, variable_name, source in scenarios:
             with self.subTest(scenario=scenario), tempfile.TemporaryDirectory() as temporary:
-                root = Path(temporary)
+                root = Path(temporary).resolve()
                 home, _install_root, config_root, _state_root, environment = (
                     self.show_token_environment(root)
                 )
                 token = f"{scenario}_token_abcdefghijklmnopqrstuvwxyz"
                 if source == "config":
-                    (config_root / "env").write_text(f"{variable_name}={token}\n")
+                    self.write_private_file(config_root / "env", f"{variable_name}={token}\n")
                 elif source == "legacy_env":
                     legacy_env = home / "Zenithbot" / ".env"
                     legacy_env.parent.mkdir(parents=True)
@@ -1804,7 +1942,7 @@ exit 0
 
     def test_show_token_fails_without_a_token_and_does_not_mutate_roots(self):
         with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
+            root = Path(temporary).resolve()
             home, install_root, config_root, state_root, environment = (
                 self.show_token_environment(root)
             )
@@ -1830,9 +1968,46 @@ exit 0
                 before,
             )
 
+    def test_show_token_rejects_unsafe_or_unbounded_configuration_sources(self):
+        for source_type in ("symlink", "hardlink", "fifo", "oversized"):
+            with self.subTest(source_type=source_type), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary).resolve()
+                _home, _install_root, config_root, _state_root, environment = (
+                    self.show_token_environment(root)
+                )
+                env_path = config_root / "env"
+                victim = root / "victim"
+                self.write_private_file(
+                    victim,
+                    "AGENTSDOCK_AGENT_TOKEN=must_not_be_disclosed_abcdefghijklmnopqrstuvwxyz\n",
+                )
+                if source_type == "symlink":
+                    env_path.symlink_to(victim)
+                elif source_type == "hardlink":
+                    os.link(victim, env_path)
+                elif source_type == "fifo":
+                    os.mkfifo(env_path, 0o600)
+                else:
+                    with env_path.open("wb") as output:
+                        output.truncate(16 * 1024 * 1024 + 1)
+                    os.chmod(env_path, 0o600)
+
+                result = subprocess.run(
+                    ["/bin/bash", str(INSTALLER), "--show-token"],
+                    env=environment,
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                    timeout=5,
+                )
+
+                self.assertNotEqual(result.returncode, 0)
+                self.assertEqual(result.stdout, "")
+                self.assertNotIn("must_not_be_disclosed", result.stdout)
+
     def test_same_version_reinstall_keeps_the_replaced_runtime_for_rollback(self):
         with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
+            root = Path(temporary).resolve()
             home = root / "home"
             fake_bin = root / "bin"
             install_root = root / "install"
@@ -1840,7 +2015,7 @@ exit 0
             home.mkdir()
             self.write_executable(fake_bin / "uname", "#!/bin/sh\necho Linux\n")
             self.write_executable(fake_bin / "systemctl", "#!/bin/sh\nexit 0\n")
-            self.write_executable(fake_bin / "curl", "#!/bin/sh\nexit 0\n")
+            self.write_json_health_curl(fake_bin)
             self.write_executable(fake_bin / "tmux", "#!/bin/sh\nexit 0\n")
             self.write_executable(fake_bin / "uv", """#!/bin/sh
 project=""
@@ -1848,7 +2023,7 @@ while [ "$#" -gt 0 ]; do
   if [ "$1" = "--project" ]; then project="$2"; shift 2; else shift; fi
 done
 mkdir -p "$project/.venv/bin"
-printf '#!/bin/sh\nexit 0\n' > "$project/.venv/bin/python"
+printf '#!/bin/sh\nexec "$REAL_PYTHON" "$@"\n' > "$project/.venv/bin/python"
 chmod 755 "$project/.venv/bin/python"
 """)
             environment = {
@@ -1858,6 +2033,11 @@ chmod 755 "$project/.venv/bin/python"
                 "AGENTS_SERVER_INSTALL_DIR": str(install_root),
                 "AGENTS_SERVER_CONFIG_DIR": str(root / "config"),
                 "AGENTSDOCK_STATE_DIR": str(root / "state"),
+                "REAL_PYTHON": sys.executable,
+                "FAKE_HEALTH_VERSION": self.release_version(),
+                "FAKE_SERVER_IDENTITY": "e5" * 12,
+                "FAKE_TEAM_HUB_MODE": "disabled",
+                "AGENTS_SERVER_HEALTH_CHECK_ATTEMPTS": "1",
             }
 
             for attempt in range(2):
@@ -1881,7 +2061,7 @@ chmod 755 "$project/.venv/bin/python"
 
     def test_dependency_sync_ignores_an_inherited_external_uv_environment(self):
         with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
+            root = Path(temporary).resolve()
             home = root / "home"
             fake_bin = root / "bin"
             install_root = root / "install"
@@ -1905,7 +2085,7 @@ if env | grep -Eq '^(AGENTSDOCK_AGENT_TOKEN|ZENITHDOCK_AGENT_TOKEN|ZENITHBOT_AGE
   exit 90
 fi
 target="${UV_PROJECT_ENVIRONMENT:-$project/.venv}"
-printf '%s\n' "$target" > "$FAKE_UV_SYNC_TARGET_LOG"
+printf '%s\n' "$target" > "${0%/*}/../uv-sync-target"
 mkdir -p "$target/bin"
 cat > "$target/bin/python" <<'PYTHON'
 #!/bin/sh
@@ -1915,6 +2095,9 @@ fi
 if [ "${1:-}" = "-" ]; then
   exec "$REAL_PYTHON" "$@"
 fi
+case "$*" in
+  *"-m activation_transaction "*) exec "$REAL_PYTHON" "$@" ;;
+esac
 exit 0
 PYTHON
 chmod 755 "$target/bin/python"
@@ -1962,9 +2145,9 @@ chmod 755 "$target/bin/python"
             self.assertEqual(sync_target.parent.parent, install_root / "releases")
             self.assertTrue((install_root / "current" / ".venv" / "bin" / "python").is_file())
 
-    def test_downloaded_uv_installer_does_not_inherit_server_secrets(self):
+    def test_missing_uv_is_not_bootstrapped_by_a_downloaded_installer(self):
         with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
+            root = Path(temporary).resolve()
             home = root / "home"
             fake_bin = root / "bin"
             install_root = root / "install"
@@ -1995,6 +2178,9 @@ if env | grep -Eq '^(AGENTSDOCK_AGENT_TOKEN|ZENITHDOCK_AGENT_TOKEN|ZENITHBOT_AGE
   exit 94
 fi
 if [ "${1:-}" = "-" ]; then exec "$REAL_PYTHON" "$@"; fi
+case "$*" in
+  *"-m activation_transaction "*) exec "$REAL_PYTHON" "$@" ;;
+esac
 exit 0
 PYTHON
 chmod 755 "$project/.venv/bin/python"
@@ -2064,12 +2250,15 @@ esac
                 check=False,
             )
 
-            self.assertEqual(result.returncode, 0, result.stdout + "\n" + result.stderr)
-            self.assertTrue(bootstrap_clean.is_file())
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("Unavailable prerequisite: uv", result.stderr)
+            self.assertIn("Install the trusted uv package manager", result.stderr)
+            self.assertFalse(bootstrap_clean.exists())
+            self.assertFalse((home / ".local" / "bin" / "uv").exists())
 
     def test_dependency_sync_rejects_a_missing_staged_runtime(self):
         with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
+            root = Path(temporary).resolve()
             home, fake_bin, install_root, environment = self.fake_linux_preinstall_environment(root)
             self.write_executable(fake_bin / "curl", "#!/bin/sh\nexit 0\n")
             self.write_executable(fake_bin / "uv", "#!/bin/sh\nexit 0\n")
@@ -2088,7 +2277,7 @@ esac
 
     def test_default_legacy_state_is_moved_and_linked(self):
         with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
+            root = Path(temporary).resolve()
             home = root / "home"
             fake_bin = root / "bin"
             fake_bin.mkdir()
@@ -2111,7 +2300,7 @@ esac
             )
             self.write_executable(fake_bin / "uname", "#!/bin/sh\necho Linux\n")
             self.write_executable(fake_bin / "systemctl", "#!/bin/sh\nexit 0\n")
-            self.write_executable(fake_bin / "curl", "#!/bin/sh\nexit 0\n")
+            self.write_json_health_curl(fake_bin)
             self.write_executable(fake_bin / "tmux", "#!/bin/sh\nexit 0\n")
             self.write_executable(fake_bin / "uv", """#!/bin/sh
 project=""
@@ -2119,7 +2308,7 @@ while [ "$#" -gt 0 ]; do
   if [ "$1" = "--project" ]; then project="$2"; shift 2; else shift; fi
 done
 mkdir -p "$project/.venv/bin"
-printf '#!/bin/sh\nexit 0\n' > "$project/.venv/bin/python"
+printf '#!/bin/sh\nexec "$REAL_PYTHON" "$@"\n' > "$project/.venv/bin/python"
 chmod 755 "$project/.venv/bin/python"
 """)
             environment = {
@@ -2128,6 +2317,12 @@ chmod 755 "$project/.venv/bin/python"
                 "PATH": f"{fake_bin}:/usr/bin:/bin",
                 "AGENTS_SERVER_INSTALL_DIR": str(root / "install"),
                 "AGENTS_SERVER_CONFIG_DIR": str(root / "config"),
+                "REAL_PYTHON": sys.executable,
+                "FAKE_HEALTH_VERSION": self.release_version(),
+                "FAKE_SERVER_IDENTITY": "d4" * 12,
+                "FAKE_TEAM_HUB_MODE": "disabled",
+                "FAKE_EVENT_LOG": str(root / "systemctl-events.log"),
+                "AGENTS_SERVER_HEALTH_CHECK_ATTEMPTS": "1",
             }
             for name in ("AGENTSDOCK_STATE_DIR", "AGENTS_SERVER_STATE_DIR", "ZENITHBOT_AGENT_DIR"):
                 environment.pop(name, None)
@@ -2154,18 +2349,27 @@ chmod 755 "$project/.venv/bin/python"
 
     def test_broken_tmux_is_optional_and_installation_still_succeeds(self):
         with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
+            root = Path(temporary).resolve()
             home, fake_bin, install_root, environment = self.fake_linux_preinstall_environment(root)
+            self.write_running_systemd_service(home)
             config_root = root / "config"
             state_root = root / "state"
             config_root.mkdir()
             state_root.mkdir()
             (state_root / "sessions.json").write_text('{"keep": true}\n')
             token = "preserved_token_abcdefghijklmnopqrstuvwxyz0123456789"
-            (config_root / "env").write_text(f"AGENTSDOCK_AGENT_TOKEN={token}\n")
+            self.write_private_file(config_root / "env", f"AGENTSDOCK_AGENT_TOKEN={token}\n")
             self.write_executable(fake_bin / "tmux", "#!/bin/sh\nexit 127\n")
-            self.write_executable(fake_bin / "curl", "#!/bin/sh\nexit 0\n")
+            self.write_json_health_curl(fake_bin)
             self.write_fake_uv(fake_bin)
+            environment.update(
+                {
+                    "FAKE_HEALTH_VERSION": self.release_version(),
+                    "FAKE_SERVER_IDENTITY": "server_optional_tmux_12345678",
+                    "FAKE_TEAM_HUB_ID": "hub_optional_tmux_12345678",
+                    "AGENTS_SERVER_HEALTH_CHECK_ATTEMPTS": "1",
+                }
+            )
 
             result = subprocess.run(
                 ["/bin/bash", str(INSTALLER), "--port", "17850", "--non-interactive"],
@@ -2188,19 +2392,18 @@ chmod 755 "$project/.venv/bin/python"
             )
             self.assertNotIn(token, human_output)
             self.assertNotIn("Access token", result.stdout)
-            self.assertEqual(result.stdout.count(token), 1)
+            self.assertNotIn(token, result.stdout)
+            self.assertNotIn("AGENTSDOCK_SETUP_RESULT=", result.stdout)
 
     def test_preflight_reports_every_missing_platform_prerequisite(self):
         with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
+            root = Path(temporary).resolve()
             home = root / "home"
             fake_bin = root / "bin"
             fake_bin.mkdir()
             home.mkdir()
-            self.prepare_preflight_path(fake_bin, os_name="Linux", commands=("tmux", "curl"))
+            self.prepare_preflight_path(fake_bin, os_name="Linux", commands=("tmux",))
             self.write_executable(fake_bin / "tmux", "#!/bin/sh\nexit 127\n")
-            self.write_executable(fake_bin / "curl", "#!/bin/sh\nexit 127\n")
-            self.write_executable(fake_bin / "wget", "#!/bin/sh\nexit 127\n")
             self.write_executable(fake_bin / "systemctl", "#!/bin/sh\nexit 1\n")
             result = subprocess.run(
                 ["/bin/bash", str(INSTALLER), "--non-interactive"],
@@ -2219,25 +2422,76 @@ chmod 755 "$project/.venv/bin/python"
 
             self.assertNotEqual(result.returncode, 0)
             self.assertIn("Optional prerequisite unavailable: tmux", result.stderr)
-            self.assertIn("Unavailable prerequisite: curl or wget", result.stderr)
+            self.assertIn("Unavailable prerequisite: uv", result.stderr)
             self.assertIn("Unavailable prerequisite: systemctl --user session", result.stderr)
             final_error = result.stderr.strip().splitlines()[-1]
             self.assertNotIn("tmux", final_error)
-            self.assertIn("Missing prerequisites: curl or wget, systemctl --user session.", final_error)
+            self.assertIn("Missing prerequisites: uv, systemctl --user session.", final_error)
+            self.assertFalse((root / "install").exists())
+            self.assertFalse((root / "config").exists())
+            self.assertFalse((root / "state").exists())
+
+    def test_preflight_rejects_intel_macos_before_any_mutation(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            home = root / "home"
+            fake_bin = root / "bin"
+            source = root / "source"
+            fake_bin.mkdir()
+            home.mkdir()
+            source.mkdir()
+            for name in package_release.FILES:
+                shutil.copy2(ROOT / name, source / name)
+            for directory, names in package_release.DIRECTORY_FILES.items():
+                for name in names:
+                    destination = source / directory / name
+                    destination.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.copy2(ROOT / directory / name, destination)
+            self.prepare_preflight_path(
+                fake_bin,
+                os_name="Darwin",
+                commands=("curl", "launchctl", "tmux"),
+            )
+            self.write_executable(
+                fake_bin / "uname",
+                "#!/bin/sh\nif [ \"${1:-}\" = \"-m\" ]; then echo x86_64; else echo Darwin; fi\n",
+            )
+            result = subprocess.run(
+                ["/bin/bash", str(source / "install.sh"), "--non-interactive"],
+                env={
+                    **os.environ,
+                    "HOME": str(home),
+                    "PATH": str(fake_bin),
+                    "AGENTS_SERVER_INSTALL_DIR": str(root / "install"),
+                    "AGENTS_SERVER_CONFIG_DIR": str(root / "config"),
+                    "AGENTSDOCK_STATE_DIR": str(root / "state"),
+                },
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("Unsupported macOS architecture: x86_64", result.stderr)
+            self.assertIn("Apple silicon (arm64)", result.stderr)
+            self.assertIn("no state, release, configuration, or service changes", result.stderr)
             self.assertFalse((root / "install").exists())
             self.assertFalse((root / "config").exists())
             self.assertFalse((root / "state").exists())
 
     def test_explicit_port_is_pinned_without_allow_port_fallback(self):
         with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
+            root = Path(temporary).resolve()
             home, fake_bin, install_root, environment = self.fake_linux_preinstall_environment(root)
+            (install_root / "current").unlink()
             self.write_fake_uv(fake_bin)
             listener, port = self.adjacent_port_listener()
             try:
                 self.write_health_curl(fake_bin, conflict_port=port, healthy_port=port + 1)
                 environment.update({
                     "AGENTS_SERVER_HEALTH_CHECK_ATTEMPTS": "1",
+                    "FAKE_HEALTH_VERSION": self.release_version(),
+                    "FAKE_SERVER_IDENTITY": "07" * 12,
                 })
                 result = subprocess.run(
                     [
@@ -2259,22 +2513,25 @@ chmod 755 "$project/.venv/bin/python"
             self.assertIn(f"AgentsServer {self.release_version()} did not become healthy", result.stderr)
             self.assertNotIn("Selecting port", result.stderr)
             self.assertNotIn("AGENTSDOCK_SETUP_RESULT=", result.stdout)
-            self.assertTrue((install_root / "current" / "runtime-marker").is_file())
+            self.assertTrue((install_root / "releases" / "0.0.9" / "runtime-marker").is_file())
 
     def test_explicit_port_fallback_is_opt_in_and_persists_selected_port(self):
         with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
+            root = Path(temporary).resolve()
             home, fake_bin, install_root, environment = self.fake_linux_preinstall_environment(root)
+            (install_root / "current").unlink()
             config_root = root / "config"
             config_root.mkdir()
             token = "preserved_token_abcdefghijklmnopqrstuvwxyz0123456789"
-            (config_root / "env").write_text(f"AGENTSDOCK_AGENT_TOKEN={token}\n")
+            self.write_private_file(config_root / "env", f"AGENTSDOCK_AGENT_TOKEN={token}\n")
             self.write_fake_uv(fake_bin)
             listener, port = self.adjacent_port_listener()
             try:
                 self.write_health_curl(fake_bin, conflict_port=port, healthy_port=port + 1)
                 environment.update({
                     "AGENTS_SERVER_HEALTH_CHECK_ATTEMPTS": "1",
+                    "FAKE_HEALTH_VERSION": self.release_version(),
+                    "FAKE_SERVER_IDENTITY": "08" * 12,
                 })
                 result = subprocess.run(
                     [
@@ -2325,7 +2582,7 @@ chmod 755 "$project/.venv/bin/python"
 
     def test_newly_started_unhealthy_server_rolls_back_without_fallback(self):
         with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
+            root = Path(temporary).resolve()
             home, fake_bin, install_root, environment = self.fake_linux_preinstall_environment(root)
             self.write_exact_health_uv(fake_bin)
             listener, port = self.adjacent_port_listener()
@@ -2350,15 +2607,19 @@ chmod 755 "$project/.venv/bin/python"
 
     def test_team_hub_mode_is_persisted_and_exact_health_is_required(self):
         with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
+            root = Path(temporary).resolve()
             home, fake_bin, install_root, environment = self.fake_linux_preinstall_environment(root)
             self.write_exact_health_uv(fake_bin)
             self.write_json_health_curl(fake_bin)
-            server_identity = "server_install_contract_12345678"
+            server_identity = "a1" * 12
             hub_id = "hub_install_contract_12345678"
             config_root = root / "config"
             config_root.mkdir()
-            (config_root / "env").write_text("AGENTSDOCK_TEAM_HUB_MODE=host\n")
+            self.write_private_file(
+                config_root / "env",
+                "AGENTSDOCK_TEAM_HUB_MODE=host\n"
+                "AGENTSDOCK_SERVER_NAME=Zen's Studio\n",
+            )
             environment.update(
                 {
                     "FAKE_HEALTH_VERSION": self.release_version(),
@@ -2389,6 +2650,10 @@ chmod 755 "$project/.venv/bin/python"
             self.assertIn("AGENTSDOCK_TEAM_HUB_MODE=host\n", installed_env)
             self.assertIn("AGENTSDOCK_TEAM_HUB_TRANSPORT=loopback\n", installed_env)
             self.assertIn("AGENTSDOCK_TEAM_HUB_URL=\n", installed_env)
+            self.assertIn(
+                'AGENTSDOCK_SERVER_NAME="Zen\'s Studio"\n',
+                installed_env,
+            )
             service = (
                 home / ".config" / "systemd" / "user" / "agents-server.service"
             ).read_text()
@@ -2399,17 +2664,464 @@ chmod 755 "$project/.venv/bin/python"
             self.assertIn("agentsdock_team_hub.cli bootstrap-proof", result.stdout)
             self.assertIn(str(install_root / "current" / ".venv" / "bin" / "python"), result.stdout)
 
+    def test_explicit_team_hub_reactivation_verifies_binding_and_snapshots(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            home, fake_bin, install_root, environment = (
+                self.fake_linux_preinstall_environment(root)
+            )
+            self.write_exact_health_uv(fake_bin)
+            self.write_json_health_curl(fake_bin)
+            identity = "a" * 24
+            state_dir = root / "state"
+            state_dir.mkdir(mode=0o700)
+            (state_dir / "server-identity").write_text(identity + "\n")
+            (state_dir / "server-identity").chmod(0o600)
+            store = HubStore(
+                state_dir / "team-hub",
+                managed_host_identity=identity,
+            )
+            self.downgrade_database_to_schema4(store.database_path)
+            config_root = root / "config"
+            config_root.mkdir()
+            self.write_private_file(config_root / "env",
+                "AGENTSDOCK_AGENT_TOKEN=preserved_token_abcdefghijklmnopqrstuvwxyz0123456789\n"
+                "AGENTSDOCK_AGENT_PORT=17850\n"
+                "AGENTSDOCK_TEAM_HUB_MODE=disabled\n"
+            )
+            event_log = root / "events.log"
+            environment.update(
+                {
+                    "FAKE_EVENT_LOG": str(event_log),
+                    "FAKE_HEALTH_VERSION": self.release_version(),
+                    "FAKE_SERVER_IDENTITY": identity,
+                    "FAKE_TEAM_HUB_ID": store.hub_id,
+                    "FAKE_TEAM_HUB_MODE": "host",
+                    "REAL_PYTHON": sys.executable,
+                    "AGENTS_SERVER_HEALTH_CHECK_ATTEMPTS": "1",
+                }
+            )
+
+            result = subprocess.run(
+                [
+                    "/bin/bash",
+                    str(INSTALLER),
+                    "--non-interactive",
+                    "--port",
+                    "17850",
+                    "--reactivate-team-hub-host",
+                ],
+                env=environment,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn(
+                "AGENTSDOCK_TEAM_HUB_MODE=host\n",
+                (config_root / "env").read_text(),
+            )
+            generations = list(
+                (state_dir / "team-hub" / "maintenance-backups").glob(
+                    "snapshot_*"
+                )
+            )
+            self.assertEqual(len(generations), 1)
+            manifest = json.loads((generations[0] / "manifest.json").read_text())
+            self.assertEqual(manifest["reason"], "host-reactivation")
+            self.assertEqual(manifest["hub_id"], store.hub_id)
+            self.assertEqual(manifest["schema_version"], 4)
+            self.assertIn("prepare-reactivation:", event_log.read_text())
+            self.assertIn("verify-reactivation:", event_log.read_text())
+            self.assertTrue((install_root / "current" / "agent_server.py").is_file())
+            self.assertIn("Team Hub host operator commands", result.stdout)
+
+    def test_team_hub_reactivation_rejects_foreign_state_before_takeover(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            _home, fake_bin, install_root, environment = (
+                self.fake_linux_preinstall_environment(root)
+            )
+            self.write_exact_health_uv(fake_bin)
+            identity = "b" * 24
+            state_dir = root / "state"
+            state_dir.mkdir(mode=0o700)
+            (state_dir / "server-identity").write_text(identity + "\n")
+            (state_dir / "server-identity").chmod(0o600)
+            foreign = HubStore(
+                state_dir / "team-hub",
+                managed_host_identity="c" * 24,
+            )
+            database_before = foreign.database_path.read_bytes()
+            config_root = root / "config"
+            config_root.mkdir()
+            original_config = "AGENTSDOCK_TEAM_HUB_MODE=disabled\n"
+            self.write_private_file(config_root / "env", original_config)
+            event_log = root / "events.log"
+            environment.update(
+                {
+                    "FAKE_EVENT_LOG": str(event_log),
+                    "REAL_PYTHON": sys.executable,
+                    "AGENTS_SERVER_HEALTH_CHECK_ATTEMPTS": "1",
+                }
+            )
+
+            result = subprocess.run(
+                [
+                    "/bin/bash",
+                    str(INSTALLER),
+                    "--non-interactive",
+                    "--port",
+                    "17850",
+                    "--reactivate-team-hub-host",
+                ],
+                env=environment,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("startup guard binding does not match", result.stderr)
+            self.assertEqual((config_root / "env").read_text(), original_config)
+            self.assertEqual(foreign.database_path.read_bytes(), database_before)
+            self.assertTrue((install_root / "current" / "runtime-marker").is_file())
+            backups = state_dir / "team-hub" / "maintenance-backups"
+            self.assertFalse(backups.exists())
+
+    def test_managed_failed_host_repair_snapshots_before_candidate_takeover(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            home, fake_bin, install_root, environment = (
+                self.fake_linux_preinstall_environment(root)
+            )
+            self.configure_fake_darwin_managed_repair(
+                root,
+                home,
+                fake_bin,
+                install_root,
+                environment,
+            )
+            self.write_exact_health_uv(fake_bin)
+            self.write_json_health_curl(fake_bin)
+            identity = "e" * 24
+            state_dir = root / "state"
+            state_dir.mkdir(mode=0o700)
+            (state_dir / "server-identity").write_text(identity + "\n")
+            (state_dir / "server-identity").chmod(0o600)
+            store = HubStore(
+                state_dir / "team-hub",
+                managed_host_identity=identity,
+            )
+            self.downgrade_database_to_schema4(store.database_path)
+            config_root = root / "config"
+            config_root.mkdir()
+            original_config = (
+                "AGENTSDOCK_AGENT_TOKEN=preserved_token_abcdefghijklmnopqrstuvwxyz0123456789\n"
+                "AGENTSDOCK_AGENT_PORT=17850\n"
+                "AGENTSDOCK_TEAM_HUB_MODE=host\n"
+                "AGENTSDOCK_TEAM_HUB_TRANSPORT=loopback\n"
+                "AGENTSDOCK_TEAM_HUB_URL=\n"
+            )
+            self.write_private_file(config_root / "env", original_config)
+            event_log = root / "events.log"
+            environment.update(
+                {
+                    "FAKE_EVENT_LOG": str(event_log),
+                    "FAKE_HEALTH_VERSION": self.release_version(),
+                    "FAKE_SERVER_IDENTITY": identity,
+                    "FAKE_TEAM_HUB_ID": store.hub_id,
+                    "FAKE_TEAM_HUB_MODE": "host",
+                    "REAL_PYTHON": sys.executable,
+                    "AGENTS_SERVER_HEALTH_CHECK_ATTEMPTS": "1",
+                }
+            )
+
+            result = subprocess.run(
+                [
+                    "/bin/bash",
+                    str(INSTALLER),
+                    "--non-interactive",
+                    "--port",
+                    "17850",
+                    "--expected-server-identity",
+                    identity,
+                    "--managed-update-id",
+                    "repair-update-12345678",
+                    "--expected-service-cgroup",
+                    "/user.slice/repair-updater.service",
+                    "--repair-failed-team-hub-host",
+                    "--expected-team-hub-transport",
+                    "loopback",
+                    "--expected-team-hub-url",
+                    "",
+                    "--expected-team-hub-direct-ip-url",
+                    "",
+                ],
+                env=environment,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            repaired_config = (config_root / "env").read_text()
+            self.assertIn(
+                "AGENTSDOCK_AGENT_TOKEN=preserved_token_abcdefghijklmnopqrstuvwxyz0123456789\n",
+                repaired_config,
+            )
+            self.assertIn("AGENTSDOCK_AGENT_PORT=17850\n", repaired_config)
+            self.assertIn("AGENTSDOCK_TEAM_HUB_MODE=host\n", repaired_config)
+            self.assertIn(
+                "AGENTSDOCK_TEAM_HUB_TRANSPORT=loopback\n",
+                repaired_config,
+            )
+            self.assertIn("AGENTSDOCK_TEAM_HUB_URL=\n", repaired_config)
+            generations = list(
+                (state_dir / "team-hub" / "maintenance-backups").glob(
+                    "snapshot_*"
+                )
+            )
+            self.assertEqual(len(generations), 1)
+            manifest = json.loads((generations[0] / "manifest.json").read_text())
+            self.assertEqual(manifest["reason"], "host-reactivation")
+            self.assertEqual(manifest["hub_id"], store.hub_id)
+            events = event_log.read_text()
+            self.assertLess(
+                events.index("prepare-reactivation:"),
+                events.index("launchctl:bootstrap:candidate"),
+            )
+            self.assertIn("verify-reactivation:", events)
+            self.assertTrue((install_root / "current" / "agent_server.py").is_file())
+
+    def test_failed_managed_host_repair_restores_exact_cold_snapshot(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            home, fake_bin, install_root, environment = (
+                self.fake_linux_preinstall_environment(root)
+            )
+            self.configure_fake_darwin_managed_repair(
+                root,
+                home,
+                fake_bin,
+                install_root,
+                environment,
+            )
+            self.write_exact_health_uv(fake_bin)
+            self.write_json_health_curl(fake_bin)
+            identity = "f" * 24
+            state_dir = root / "state"
+            state_dir.mkdir(mode=0o700)
+            (state_dir / "server-identity").write_text(identity + "\n")
+            (state_dir / "server-identity").chmod(0o600)
+            store = HubStore(
+                state_dir / "team-hub",
+                managed_host_identity=identity,
+            )
+            database_before = store.database_path.read_bytes()
+            config_root = root / "config"
+            config_root.mkdir()
+            original_config = (
+                "AGENTSDOCK_AGENT_TOKEN=preserved_token_abcdefghijklmnopqrstuvwxyz0123456789\n"
+                "AGENTSDOCK_AGENT_PORT=17850\n"
+                "AGENTSDOCK_TEAM_HUB_MODE=host\n"
+                "AGENTSDOCK_TEAM_HUB_TRANSPORT=loopback\n"
+                "AGENTSDOCK_TEAM_HUB_URL=\n"
+            )
+            self.write_private_file(config_root / "env", original_config)
+            event_log = root / "events.log"
+            migration_sentinel = root / "candidate-migrated"
+            environment.update(
+                {
+                    "FAKE_EVENT_LOG": str(event_log),
+                    "FAKE_HEALTH_VERSION": self.release_version(),
+                    "FAKE_HEALTH_VERSION_AFTER_RESTORE": "0.0.9",
+                    "FAKE_SERVER_IDENTITY": identity,
+                    "FAKE_SERVER_IDENTITY_AFTER_RESTORE": "wrong-server-identity-1234",
+                    "FAKE_TEAM_HUB_ID": store.hub_id,
+                    "FAKE_TEAM_HUB_MODE": "disabled",
+                    "FAKE_TEAM_HUB_MODE_AFTER_RESTORE": "failed_host",
+                    "FAKE_MIGRATE_CANDIDATE_TEAM_HUB": "true",
+                    "FAKE_CANDIDATE_TEAM_HUB_MUTATION": "true",
+                    "FAKE_CANDIDATE_MIGRATION_SENTINEL": str(
+                        migration_sentinel
+                    ),
+                    "REAL_PYTHON": sys.executable,
+                    "AGENTS_SERVER_HEALTH_CHECK_ATTEMPTS": "1",
+                }
+            )
+
+            result = subprocess.run(
+                [
+                    "/bin/bash",
+                    str(INSTALLER),
+                    "--non-interactive",
+                    "--port",
+                    "17850",
+                    "--expected-server-identity",
+                    identity,
+                    "--managed-update-id",
+                    "repair-update-rollback-1234",
+                    "--expected-service-cgroup",
+                    "/user.slice/repair-updater.service",
+                    "--repair-failed-team-hub-host",
+                    "--expected-team-hub-transport",
+                    "loopback",
+                    "--expected-team-hub-url",
+                    "",
+                    "--expected-team-hub-direct-ip-url",
+                    "",
+                ],
+                env=environment,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn(
+                "exact server and Team Hub identities were not healthy; rollback is incomplete",
+                result.stderr,
+            )
+            self.assertNotIn("The previous release was restored.", result.stderr)
+            self.assertTrue(
+                migration_sentinel.exists(), result.stdout + "\n" + result.stderr
+            )
+            self.assertIn("restore-reactivation:", event_log.read_text())
+            self.assertEqual((config_root / "env").read_text(), original_config)
+            self.assertTrue((install_root / "current" / "runtime-marker").is_file())
+            snapshots = list(
+                (state_dir / "team-hub" / "maintenance-backups").glob(
+                    "snapshot_*"
+                )
+            )
+            self.assertEqual(len(snapshots), 1)
+            self.assertEqual(
+                store.database_path.read_bytes(),
+                (snapshots[0] / "team-hub.sqlite3").read_bytes(),
+            )
+            connection = sqlite3.connect(store.database_path)
+            try:
+                self.assertIsNone(
+                    connection.execute(
+                        "SELECT 1 FROM sqlite_master WHERE name='candidate_only'"
+                    ).fetchone()
+                )
+            finally:
+                connection.close()
+            self.assertFalse(
+                (state_dir / "team-hub" / "maintenance-fence.json").exists()
+            )
+            for control_name in (
+                ".restore-completion.json",
+                ".host-reactivation-handoff.json",
+                ".managed-startup-authority.json",
+            ):
+                self.assertFalse((state_dir / "team-hub" / control_name).exists())
+
+    def test_failed_team_hub_reactivation_restores_pre_reactivation_snapshot(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            _home, fake_bin, install_root, environment = (
+                self.fake_linux_preinstall_environment(root)
+            )
+            self.write_exact_health_uv(fake_bin)
+            self.write_json_health_curl(fake_bin)
+            self.write_event_systemctl(fake_bin)
+            identity = "d" * 24
+            state_dir = root / "state"
+            state_dir.mkdir(mode=0o700)
+            (state_dir / "server-identity").write_text(identity + "\n")
+            (state_dir / "server-identity").chmod(0o600)
+            store = HubStore(
+                state_dir / "team-hub",
+                managed_host_identity=identity,
+            )
+            config_root = root / "config"
+            config_root.mkdir()
+            original_config = (
+                "AGENTSDOCK_AGENT_TOKEN=preserved_token_abcdefghijklmnopqrstuvwxyz0123456789\n"
+                "AGENTSDOCK_AGENT_PORT=17850\n"
+                "AGENTSDOCK_TEAM_HUB_MODE=disabled\n"
+            )
+            self.write_private_file(config_root / "env", original_config)
+            event_log = root / "events.log"
+            migration_sentinel = root / "candidate-migrated"
+            environment.update(
+                {
+                    "FAKE_EVENT_LOG": str(event_log),
+                    "FAKE_HEALTH_VERSION": self.release_version(),
+                    "FAKE_SERVER_IDENTITY": identity,
+                    "FAKE_TEAM_HUB_ID": store.hub_id,
+                    # Force candidate exact-health rejection after its real
+                    # HubStore open below mutates the source generation.
+                    "FAKE_TEAM_HUB_MODE": "disabled",
+                    "FAKE_MIGRATE_CANDIDATE_TEAM_HUB": "true",
+                    "FAKE_CANDIDATE_TEAM_HUB_MUTATION": "true",
+                    "FAKE_CANDIDATE_MIGRATION_SENTINEL": str(
+                        migration_sentinel
+                    ),
+                    "REAL_PYTHON": sys.executable,
+                    "AGENTS_SERVER_HEALTH_CHECK_ATTEMPTS": "1",
+                }
+            )
+
+            result = subprocess.run(
+                [
+                    "/bin/bash",
+                    str(INSTALLER),
+                    "--non-interactive",
+                    "--port",
+                    "17850",
+                    "--reactivate-team-hub-host",
+                ],
+                env=environment,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+
+            self.assertNotEqual(result.returncode, 0)
+            self.assertTrue(migration_sentinel.exists())
+            self.assertIn("restore-reactivation:", event_log.read_text())
+            self.assertEqual((config_root / "env").read_text(), original_config)
+            self.assertTrue((install_root / "current" / "runtime-marker").is_file())
+            connection = sqlite3.connect(state_dir / "team-hub" / "team-hub.sqlite3")
+            try:
+                self.assertEqual(
+                    connection.execute("PRAGMA user_version").fetchone()[0],
+                    11,
+                )
+                self.assertIsNone(
+                    connection.execute(
+                        "SELECT 1 FROM sqlite_master WHERE name='candidate_only'"
+                    ).fetchone()
+                )
+            finally:
+                connection.close()
+            self.assertFalse(
+                (state_dir / "team-hub" / "maintenance-fence.json").exists()
+            )
+            for control_name in (
+                ".restore-completion.json",
+                ".host-reactivation-handoff.json",
+                ".managed-startup-authority.json",
+            ):
+                self.assertFalse((state_dir / "team-hub" / control_name).exists())
+
     def test_managed_disabled_install_does_not_print_the_agent_token(self):
         with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
+            root = Path(temporary).resolve()
             _home, fake_bin, _install_root, environment = self.fake_linux_preinstall_environment(root)
+            self.write_running_systemd_service(root / "home")
             self.write_exact_health_uv(fake_bin)
             self.write_json_health_curl(fake_bin)
             server_identity = "server_disabled_update_12345678"
             token = "preserved_token_abcdefghijklmnopqrstuvwxyz0123456789"
             config_root = root / "config"
             config_root.mkdir()
-            (config_root / "env").write_text(
+            self.write_private_file(config_root / "env",
                 f"AGENTSDOCK_AGENT_TOKEN={token}\n"
                 "AGENTSDOCK_AGENT_PORT=17850\n"
                 "AGENTSDOCK_TEAM_HUB_MODE=disabled\n"
@@ -2446,8 +3158,9 @@ chmod 755 "$project/.venv/bin/python"
 
     def test_managed_disabled_install_preserves_exact_secure_peer_client(self):
         with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
+            root = Path(temporary).resolve()
             _home, fake_bin, install_root, environment = self.fake_linux_preinstall_environment(root)
+            self.write_running_systemd_service(root / "home")
             self.write_exact_health_uv(fake_bin)
             self.write_json_health_curl(fake_bin)
             self.write_event_systemctl(fake_bin)
@@ -2459,7 +3172,7 @@ chmod 755 "$project/.venv/bin/python"
             event_log = root / "events.log"
             config_root = root / "config"
             config_root.mkdir()
-            (config_root / "env").write_text(
+            self.write_private_file(config_root / "env",
                 f"AGENTSDOCK_AGENT_TOKEN={token}\n"
                 "AGENTSDOCK_AGENT_PORT=17850\n"
                 "AGENTSDOCK_TEAM_HUB_MODE=disabled\n"
@@ -2511,8 +3224,9 @@ chmod 755 "$project/.venv/bin/python"
 
     def test_managed_disabled_install_preserves_inactive_approved_secure_peer_client(self):
         with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
+            root = Path(temporary).resolve()
             _home, fake_bin, install_root, environment = self.fake_linux_preinstall_environment(root)
+            self.write_running_systemd_service(root / "home")
             self.write_exact_health_uv(fake_bin)
             self.write_json_health_curl(fake_bin)
             self.write_event_systemctl(fake_bin)
@@ -2521,7 +3235,7 @@ chmod 755 "$project/.venv/bin/python"
             event_log = root / "events.log"
             config_root = root / "config"
             config_root.mkdir()
-            (config_root / "env").write_text(
+            self.write_private_file(config_root / "env",
                 f"AGENTSDOCK_AGENT_TOKEN={token}\n"
                 "AGENTSDOCK_AGENT_PORT=17850\n"
                 "AGENTSDOCK_TEAM_HUB_MODE=disabled\n"
@@ -2568,8 +3282,9 @@ chmod 755 "$project/.venv/bin/python"
     def test_managed_disabled_install_rejects_pending_pairing_before_takeover(self):
         for status_version in ("1", "2"):
             with self.subTest(status_version=status_version), tempfile.TemporaryDirectory() as temporary:
-                root = Path(temporary)
+                root = Path(temporary).resolve()
                 _home, fake_bin, _install_root, environment = self.fake_linux_preinstall_environment(root)
+                self.write_running_systemd_service(root / "home")
                 self.write_exact_health_uv(fake_bin)
                 self.write_json_health_curl(fake_bin)
                 self.write_event_systemctl(fake_bin)
@@ -2578,7 +3293,7 @@ chmod 755 "$project/.venv/bin/python"
                 event_log = root / "events.log"
                 config_root = root / "config"
                 config_root.mkdir()
-                (config_root / "env").write_text(
+                self.write_private_file(config_root / "env",
                     f"AGENTSDOCK_AGENT_TOKEN={token}\n"
                     "AGENTSDOCK_AGENT_PORT=17850\n"
                     "AGENTSDOCK_TEAM_HUB_MODE=disabled\n"
@@ -2625,8 +3340,9 @@ chmod 755 "$project/.venv/bin/python"
 
     def test_managed_disabled_install_rejects_changed_secure_peer_pairing(self):
         with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
+            root = Path(temporary).resolve()
             _home, fake_bin, install_root, environment = self.fake_linux_preinstall_environment(root)
+            self.write_running_systemd_service(root / "home")
             self.write_exact_health_uv(fake_bin)
             self.write_json_health_curl(fake_bin)
             self.write_event_systemctl(fake_bin)
@@ -2640,7 +3356,7 @@ chmod 755 "$project/.venv/bin/python"
             event_log = root / "events.log"
             config_root = root / "config"
             config_root.mkdir()
-            (config_root / "env").write_text(
+            self.write_private_file(config_root / "env",
                 f"AGENTSDOCK_AGENT_TOKEN={token}\n"
                 "AGENTSDOCK_AGENT_PORT=17850\n"
                 "AGENTSDOCK_TEAM_HUB_MODE=disabled\n"
@@ -2685,8 +3401,9 @@ chmod 755 "$project/.venv/bin/python"
 
     def test_managed_disabled_install_rejects_missing_secure_peer_pairing(self):
         with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
+            root = Path(temporary).resolve()
             _home, fake_bin, install_root, environment = self.fake_linux_preinstall_environment(root)
+            self.write_running_systemd_service(root / "home")
             self.write_exact_health_uv(fake_bin)
             self.write_json_health_curl(fake_bin)
             self.write_event_systemctl(fake_bin)
@@ -2700,7 +3417,7 @@ chmod 755 "$project/.venv/bin/python"
             event_log = root / "events.log"
             config_root = root / "config"
             config_root.mkdir()
-            (config_root / "env").write_text(
+            self.write_private_file(config_root / "env",
                 f"AGENTSDOCK_AGENT_TOKEN={token}\n"
                 "AGENTSDOCK_AGENT_PORT=17850\n"
                 "AGENTSDOCK_TEAM_HUB_MODE=disabled\n"
@@ -2745,8 +3462,9 @@ chmod 755 "$project/.venv/bin/python"
 
     def test_managed_disabled_install_rejects_missing_inactive_approved_pairing(self):
         with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
+            root = Path(temporary).resolve()
             _home, fake_bin, install_root, environment = self.fake_linux_preinstall_environment(root)
+            self.write_running_systemd_service(root / "home")
             self.write_exact_health_uv(fake_bin)
             self.write_json_health_curl(fake_bin)
             self.write_event_systemctl(fake_bin)
@@ -2760,7 +3478,7 @@ chmod 755 "$project/.venv/bin/python"
             event_log = root / "events.log"
             config_root = root / "config"
             config_root.mkdir()
-            (config_root / "env").write_text(
+            self.write_private_file(config_root / "env",
                 f"AGENTSDOCK_AGENT_TOKEN={token}\n"
                 "AGENTSDOCK_AGENT_PORT=17850\n"
                 "AGENTSDOCK_TEAM_HUB_MODE=disabled\n"
@@ -2806,8 +3524,9 @@ chmod 755 "$project/.venv/bin/python"
 
     def test_managed_disabled_install_accepts_secure_peer_certificate_renewal(self):
         with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
+            root = Path(temporary).resolve()
             _home, fake_bin, install_root, environment = self.fake_linux_preinstall_environment(root)
+            self.write_running_systemd_service(root / "home")
             self.write_exact_health_uv(fake_bin)
             self.write_json_health_curl(fake_bin)
             self.write_event_systemctl(fake_bin)
@@ -2821,7 +3540,7 @@ chmod 755 "$project/.venv/bin/python"
             event_log = root / "events.log"
             config_root = root / "config"
             config_root.mkdir()
-            (config_root / "env").write_text(
+            self.write_private_file(config_root / "env",
                 f"AGENTSDOCK_AGENT_TOKEN={token}\n"
                 "AGENTSDOCK_AGENT_PORT=17850\n"
                 "AGENTSDOCK_TEAM_HUB_MODE=disabled\n"
@@ -2871,8 +3590,9 @@ chmod 755 "$project/.venv/bin/python"
 
     def test_managed_disabled_install_accepts_legacy_disabled_source(self):
         with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
+            root = Path(temporary).resolve()
             _home, fake_bin, install_root, environment = self.fake_linux_preinstall_environment(root)
+            self.write_running_systemd_service(root / "home")
             self.write_exact_health_uv(fake_bin)
             self.write_json_health_curl(fake_bin)
             self.write_event_systemctl(fake_bin)
@@ -2881,7 +3601,7 @@ chmod 755 "$project/.venv/bin/python"
             event_log = root / "events.log"
             config_root = root / "config"
             config_root.mkdir()
-            (config_root / "env").write_text(
+            self.write_private_file(config_root / "env",
                 f"AGENTSDOCK_AGENT_TOKEN={token}\n"
                 "AGENTSDOCK_AGENT_PORT=17850\n"
                 "AGENTSDOCK_TEAM_HUB_MODE=disabled\n"
@@ -2924,8 +3644,9 @@ chmod 755 "$project/.venv/bin/python"
 
     def test_managed_secure_peer_client_rejects_quarantined_candidate(self):
         with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
+            root = Path(temporary).resolve()
             _home, fake_bin, install_root, environment = self.fake_linux_preinstall_environment(root)
+            self.write_running_systemd_service(root / "home")
             self.write_exact_health_uv(fake_bin)
             self.write_json_health_curl(fake_bin)
             self.write_event_systemctl(fake_bin)
@@ -2939,7 +3660,7 @@ chmod 755 "$project/.venv/bin/python"
             event_log = root / "events.log"
             config_root = root / "config"
             config_root.mkdir()
-            (config_root / "env").write_text(
+            self.write_private_file(config_root / "env",
                 f"AGENTSDOCK_AGENT_TOKEN={token}\n"
                 "AGENTSDOCK_AGENT_PORT=17850\n"
                 "AGENTSDOCK_TEAM_HUB_MODE=disabled\n"
@@ -2984,16 +3705,17 @@ chmod 755 "$project/.venv/bin/python"
 
     def test_rendering_systemd_service_does_not_run_restart_from_comment(self):
         with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
+            root = Path(temporary).resolve()
             home, fake_bin, _install_root, environment = (
                 self.fake_linux_preinstall_environment(root)
             )
+            self.write_running_systemd_service(home)
             self.write_exact_health_uv(fake_bin)
             self.write_json_health_curl(fake_bin)
             server_identity = "server_service_render_12345678"
             config_root = root / "config"
             config_root.mkdir()
-            (config_root / "env").write_text(
+            self.write_private_file(config_root / "env",
                 "AGENTSDOCK_AGENT_TOKEN=preserved_token_abcdefghijklmnopqrstuvwxyz0123456789\n"
                 "AGENTSDOCK_AGENT_PORT=17850\n"
                 "AGENTSDOCK_TEAM_HUB_MODE=disabled\n"
@@ -3053,15 +3775,16 @@ exit 0
 
     def test_quarantined_secure_peer_state_is_rejected_before_takeover(self):
         with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
+            root = Path(temporary).resolve()
             _home, fake_bin, install_root, environment = self.fake_linux_preinstall_environment(root)
+            self.write_running_systemd_service(root / "home")
             self.write_exact_health_uv(fake_bin)
             self.write_json_health_curl(fake_bin)
             server_identity = "server_secure_state_gate_12345678"
             token = "preserved_token_abcdefghijklmnopqrstuvwxyz0123456789"
             config_root = root / "config"
             config_root.mkdir()
-            (config_root / "env").write_text(
+            self.write_private_file(config_root / "env",
                 f"AGENTSDOCK_AGENT_TOKEN={token}\n"
                 "AGENTSDOCK_AGENT_PORT=17850\n"
                 "AGENTSDOCK_TEAM_HUB_MODE=disabled\n"
@@ -3102,11 +3825,11 @@ exit 0
 
     def test_team_hub_tailscale_serve_transport_is_persisted_and_verified(self):
         with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
+            root = Path(temporary).resolve()
             home, fake_bin, install_root, environment = self.fake_linux_preinstall_environment(root)
             self.write_exact_health_uv(fake_bin)
             self.write_json_health_curl(fake_bin)
-            server_identity = "server_tailnet_contract_12345678"
+            server_identity = "b2" * 12
             hub_id = "hub_tailnet_contract_12345678"
             hub_url = "https://sonic.example.ts.net:8444/api/team-hub"
             config_root = root / "config"
@@ -3151,15 +3874,15 @@ exit 0
 
     def test_canonical_loopback_config_ignores_stale_process_transport(self):
         with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
+            root = Path(temporary).resolve()
             _home, fake_bin, _install_root, environment = self.fake_linux_preinstall_environment(root)
             self.write_exact_health_uv(fake_bin)
             self.write_json_health_curl(fake_bin)
-            server_identity = "server_loopback_precedence_12345678"
+            server_identity = "c3" * 12
             hub_id = "hub_loopback_precedence_12345678"
             config_root = root / "config"
             config_root.mkdir()
-            (config_root / "env").write_text(
+            self.write_private_file(config_root / "env",
                 "AGENTSDOCK_TEAM_HUB_MODE=host\n"
                 "AGENTSDOCK_TEAM_HUB_TRANSPORT=loopback\n"
                 "AGENTSDOCK_TEAM_HUB_URL=\n"
@@ -3194,7 +3917,7 @@ exit 0
 
     def test_installed_operator_cli_resolves_from_unrelated_working_directory(self):
         with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
+            root = Path(temporary).resolve()
             release = root / "installed" / "current"
             release.mkdir(parents=True)
             shutil.copytree(ROOT / "agentsdock_team_hub", release / "agentsdock_team_hub")
@@ -3235,11 +3958,11 @@ exit 0
 
     def test_same_release_style_direct_ip_add_refuses_existing_team_hub_state_before_staging(self):
         with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
+            root = Path(temporary).resolve()
             _home, _fake_bin, install_root, environment = self.fake_linux_preinstall_environment(root)
             config_root = root / "config"
             config_root.mkdir()
-            (config_root / "env").write_text(
+            self.write_private_file(config_root / "env",
                 "AGENTSDOCK_TEAM_HUB_MODE=host\n"
                 "AGENTSDOCK_TEAM_HUB_TRANSPORT=tailscale_serve\n"
                 "AGENTSDOCK_TEAM_HUB_URL=https://sonic.example.ts.net:8444/api/team-hub\n"
@@ -3270,7 +3993,7 @@ exit 0
 
     def test_failed_managed_hub_update_restores_snapshot_before_old_service(self):
         with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
+            root = Path(temporary).resolve()
             home, fake_bin, install_root, environment = self.fake_linux_preinstall_environment(root)
             event_log = root / "events.log"
             self.write_exact_health_uv(fake_bin)
@@ -3288,6 +4011,17 @@ exit 0
                 operation_id=operation_id,
                 server_identity=server_identity,
                 hub_id=hub_id,
+            )
+            service_file = home / ".config" / "systemd" / "user" / "agents-server.service"
+            service_file.parent.mkdir(parents=True)
+            service_file.write_text("[Service]\nExecStart=/old/release/server\n")
+            config_root = root / "config"
+            config_root.mkdir()
+            self.write_private_file(
+                config_root / "env",
+                "AGENTSDOCK_TEAM_HUB_MODE=host\n"
+                "AGENTSDOCK_TEAM_HUB_TRANSPORT=loopback\n"
+                "AGENTSDOCK_TEAM_HUB_URL=\n",
             )
             environment.update(
                 {
@@ -3337,12 +4071,15 @@ exit 0
             candidate_restart = events.index(
                 "systemctl:--user restart agents-server.service"
             )
-            stopped = events.index("systemctl:--user stop agents-server.service")
+            stopped = events.index(
+                "systemctl:--user stop agents-server.service",
+                candidate_restart + 1,
+            )
             restored = next(
                 index for index, value in enumerate(events) if value.startswith("restore:")
             )
             old_restart = events.index(
-                "systemctl:--user restart agents-server.service",
+                "systemctl:--user start agents-server.service",
                 candidate_restart + 1,
             )
             self.assertLess(candidate_restart, stopped)
@@ -3358,7 +4095,7 @@ exit 0
 
     def test_beta2_schema4_managed_host_upgrades_with_exact_identity_and_secrets(self):
         with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
+            root = Path(temporary).resolve()
             _home, fake_bin, install_root, environment = self.fake_linux_preinstall_environment(root)
             event_log = root / "events.log"
             migration_sentinel = root / "candidate-hub-opened"
@@ -3380,7 +4117,7 @@ exit 0
             expected_proof = store.bootstrap_proof_path.read_bytes()
             config_root = root / "config"
             config_root.mkdir()
-            (config_root / "env").write_text(
+            self.write_private_file(config_root / "env",
                 "AGENTSDOCK_AGENT_TOKEN=preserved_token_abcdefghijklmnopqrstuvwxyz0123456789\n"
                 "AGENTSDOCK_AGENT_PORT=7850\n"
                 "AGENTSDOCK_TEAM_HUB_MODE=host\n"
@@ -3425,7 +4162,7 @@ exit 0
             self.assertFalse(store.maintenance_fence_path.exists())
             connection = sqlite3.connect(store.database_path)
             try:
-                self.assertEqual(connection.execute("PRAGMA user_version").fetchone()[0], 10)
+                self.assertEqual(connection.execute("PRAGMA user_version").fetchone()[0], 11)
                 self.assertEqual(
                     connection.execute(
                         "SELECT hub_id, server_identity FROM managed_host_bindings"
@@ -3453,7 +4190,7 @@ exit 0
 
     def test_beta2_schema4_candidate_failure_restores_exact_legacy_state(self):
         with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
+            root = Path(temporary).resolve()
             _home, fake_bin, install_root, environment = self.fake_linux_preinstall_environment(root)
             event_log = root / "events.log"
             migration_sentinel = root / "candidate-hub-opened"
@@ -3471,14 +4208,13 @@ exit 0
                 schema_version=4,
             )
             hub_id = store.hub_id
-            expected_database = (snapshot / "team-hub.sqlite3").read_bytes()
             expected_key = (snapshot / "access-token-signing.key").read_bytes()
             expected_proof = (
                 snapshot / "proofs" / "bootstrap-owner.proof"
             ).read_bytes()
             config_root = root / "config"
             config_root.mkdir()
-            (config_root / "env").write_text(
+            self.write_private_file(config_root / "env",
                 "AGENTSDOCK_AGENT_TOKEN=preserved_token_abcdefghijklmnopqrstuvwxyz0123456789\n"
                 "AGENTSDOCK_AGENT_PORT=7850\n"
                 "AGENTSDOCK_TEAM_HUB_MODE=host\n"
@@ -3519,7 +4255,14 @@ exit 0
             self.assertNotEqual(result.returncode, 0)
             self.assertIn("The previous release was restored.", result.stderr)
             self.assertTrue((install_root / "current" / "runtime-marker").is_file())
-            self.assertEqual(store.database_path.read_bytes(), expected_database)
+            # Cold rebase replaces the initially supplied generation with an
+            # exact snapshot of the now-stopped source. SQLite online backups
+            # may differ byte-for-byte across equivalent generations, so bind
+            # rollback to the durable rebased snapshot that the fence names.
+            self.assertEqual(
+                store.database_path.read_bytes(),
+                (snapshot / "team-hub.sqlite3").read_bytes(),
+            )
             self.assertEqual(store.signing_key_path.read_bytes(), expected_key)
             self.assertEqual(store.bootstrap_proof_path.read_bytes(), expected_proof)
             self.assertFalse(store.maintenance_fence_path.exists())
@@ -3549,7 +4292,7 @@ exit 0
 
     def test_schema5_sonic_update_preserves_exact_transport_url_and_hub_state(self):
         with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
+            root = Path(temporary).resolve()
             _home, fake_bin, install_root, environment = self.fake_linux_preinstall_environment(root)
             event_log = root / "events.log"
             self.write_exact_health_uv(fake_bin)
@@ -3573,7 +4316,7 @@ exit 0
             (install_root / "current" / "VERSION").write_text("0.1.25-beta.3\n")
             config_root = root / "config"
             config_root.mkdir()
-            (config_root / "env").write_text(
+            self.write_private_file(config_root / "env",
                 "AGENTSDOCK_AGENT_TOKEN=preserved_token_abcdefghijklmnopqrstuvwxyz0123456789\n"
                 "AGENTSDOCK_AGENT_PORT=7850\n"
                 "AGENTSDOCK_TEAM_HUB_MODE=host\n"
@@ -3630,7 +4373,7 @@ exit 0
 
     def test_failed_snapshot_verification_does_not_start_old_service(self):
         with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
+            root = Path(temporary).resolve()
             _home, fake_bin, install_root, environment = self.fake_linux_preinstall_environment(root)
             event_log = root / "events.log"
             self.write_exact_health_uv(fake_bin)
@@ -3651,7 +4394,7 @@ exit 0
             )
             config_root = root / "config"
             config_root.mkdir()
-            (config_root / "env").write_text(
+            self.write_private_file(config_root / "env",
                 "AGENTSDOCK_TEAM_HUB_MODE=host\n"
             )
             environment.update(
@@ -3707,7 +4450,7 @@ exit 0
 
     def test_managed_snapshot_is_fully_verified_before_dependency_staging(self):
         with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
+            root = Path(temporary).resolve()
             _home, fake_bin, install_root, environment = self.fake_linux_preinstall_environment(root)
             event_log = root / "events.log"
             self.write_json_health_curl(fake_bin)
@@ -3758,7 +4501,7 @@ exit 0
 
     def test_managed_dependency_failure_clears_exact_fence_without_activation(self):
         with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
+            root = Path(temporary).resolve()
             _home, fake_bin, install_root, environment = self.fake_linux_preinstall_environment(root)
             event_log = root / "events.log"
             self.write_json_health_curl(fake_bin)
@@ -3807,7 +4550,7 @@ exit 0
 
     def test_candidate_snapshot_verifier_runs_after_compile_before_activation(self):
         with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
+            root = Path(temporary).resolve()
             _home, fake_bin, install_root, environment = self.fake_linux_preinstall_environment(root)
             event_log = root / "events.log"
             self.write_exact_health_uv(fake_bin)
@@ -3861,7 +4604,7 @@ exit 0
 
     def test_managed_legacy_current_directory_is_rejected_and_clears_fence(self):
         with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
+            root = Path(temporary).resolve()
             _home, fake_bin, install_root, environment = self.fake_linux_preinstall_environment(root)
             current = install_root / "current"
             old_release = current.resolve()
@@ -3892,7 +4635,7 @@ exit 0
                 "AGENTSDOCK_TEAM_HUB_MODE=host\n"
                 "PRESERVED_SETTING=before-activation\n"
             )
-            env_file.write_text(original_env)
+            self.write_private_file(env_file, original_env)
             environment.update(
                 {
                     "FAKE_EVENT_LOG": str(event_log),
@@ -3924,9 +4667,9 @@ exit 0
             self.assertIn("clear-fence", events)
             self.assertFalse(any(" restart " in value for value in events))
 
-    def test_pre_candidate_service_config_failure_restores_symlink_env_and_fence(self):
+    def test_pre_candidate_service_config_failure_restores_symlink_env_and_leaves_fence_fail_closed(self):
         with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
+            root = Path(temporary).resolve()
             home, fake_bin, install_root, environment = self.fake_linux_preinstall_environment(root)
             event_log = root / "events.log"
             self.write_exact_health_uv(fake_bin)
@@ -3954,7 +4697,7 @@ exit 0
                 "AGENTSDOCK_TEAM_HUB_MODE=host\n"
                 "PRESERVED_SETTING=before-service-config\n"
             )
-            env_file.write_text(original_env)
+            self.write_private_file(env_file, original_env)
             systemd_root = home / ".config" / "systemd"
             systemd_root.mkdir(parents=True)
             (systemd_root / "user").write_text("blocks service directory creation\n")
@@ -3986,12 +4729,13 @@ exit 0
             self.assertFalse((install_root / "previous").exists())
             self.assertEqual(env_file.read_text(), original_env)
             events = event_log.read_text().splitlines()
-            self.assertIn("clear-fence", events)
+            self.assertNotIn("clear-fence", events)
+            self.assertTrue((hub_data / "maintenance-fence.json").is_file())
             self.assertFalse(any(" restart " in value for value in events))
 
     def test_managed_success_clears_exact_fence_after_candidate_health(self):
         with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
+            root = Path(temporary).resolve()
             _home, fake_bin, install_root, environment = self.fake_linux_preinstall_environment(root)
             event_log = root / "events.log"
             self.write_exact_health_uv(fake_bin)
@@ -4047,7 +4791,7 @@ exit 0
 
     def test_beta2_managed_update_without_transport_fields_is_bound_to_loopback(self):
         with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
+            root = Path(temporary).resolve()
             _home, fake_bin, install_root, environment = self.fake_linux_preinstall_environment(root)
             event_log = root / "events.log"
             self.write_exact_health_uv(fake_bin)
@@ -4068,7 +4812,7 @@ exit 0
             )
             config_root = root / "config"
             config_root.mkdir()
-            (config_root / "env").write_text("AGENTSDOCK_TEAM_HUB_MODE=host\n")
+            self.write_private_file(config_root / "env", "AGENTSDOCK_TEAM_HUB_MODE=host\n")
             environment.update(
                 {
                     "FAKE_EVENT_LOG": str(event_log),
@@ -4109,7 +4853,7 @@ exit 0
 
     def test_beta2_managed_update_cannot_implicitly_change_to_tailscale_serve(self):
         with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
+            root = Path(temporary).resolve()
             _home, fake_bin, install_root, environment = self.fake_linux_preinstall_environment(root)
             event_log = root / "events.log"
             self.write_exact_health_uv(fake_bin)
@@ -4134,7 +4878,7 @@ exit 0
                 "AGENTSDOCK_TEAM_HUB_TRANSPORT=tailscale_serve\n"
                 f"AGENTSDOCK_TEAM_HUB_URL={hub_url}\n"
             )
-            (config_root / "env").write_text(original_env)
+            self.write_private_file(config_root / "env", original_env)
             environment.update(
                 {
                     "FAKE_EVENT_LOG": str(event_log),
@@ -4167,7 +4911,7 @@ exit 0
 
     def test_explicit_tailscale_transport_is_verified_by_managed_install(self):
         with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
+            root = Path(temporary).resolve()
             _home, fake_bin, install_root, environment = self.fake_linux_preinstall_environment(root)
             event_log = root / "events.log"
             self.write_exact_health_uv(fake_bin)
@@ -4189,7 +4933,7 @@ exit 0
             )
             config_root = root / "config"
             config_root.mkdir()
-            (config_root / "env").write_text(
+            self.write_private_file(config_root / "env",
                 "AGENTSDOCK_AGENT_TOKEN=preserved_token_abcdefghijklmnopqrstuvwxyz0123456789\n"
                 "AGENTSDOCK_AGENT_PORT=7850\n"
                 "AGENTSDOCK_TEAM_HUB_MODE=host\n"
@@ -4236,7 +4980,7 @@ exit 0
 
     def test_managed_tailscale_transition_is_rejected_before_mutation(self):
         with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
+            root = Path(temporary).resolve()
             home, fake_bin, install_root, environment = self.fake_linux_preinstall_environment(root)
             event_log = root / "events.log"
             self.write_exact_health_uv(fake_bin)
@@ -4266,7 +5010,7 @@ exit 0
                 "AGENTSDOCK_TEAM_HUB_URL=\n"
             )
             env_file = config_root / "env"
-            env_file.write_text(original_env)
+            self.write_private_file(env_file, original_env)
             service_file = home / ".config" / "systemd" / "user" / "agents-server.service"
             service_file.parent.mkdir(parents=True)
             service_file.write_text("[Service]\nExecStart=/old/release/server\n")
@@ -4317,7 +5061,7 @@ exit 0
 
     def test_wrong_tailscale_candidate_url_restores_exact_existing_origin(self):
         with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
+            root = Path(temporary).resolve()
             home, fake_bin, install_root, environment = self.fake_linux_preinstall_environment(root)
             event_log = root / "events.log"
             self.write_exact_health_uv(fake_bin)
@@ -4348,8 +5092,7 @@ exit 0
                 f"AGENTSDOCK_TEAM_HUB_URL={hub_url}\n"
             )
             env_file = config_root / "env"
-            env_file.write_text(original_env)
-            env_file.chmod(0o644)
+            self.write_private_file(env_file, original_env)
             service_file = home / ".config" / "systemd" / "user" / "agents-server.service"
             service_file.parent.mkdir(parents=True)
             service_file.write_text("[Service]\nExecStart=/old/release/server\n")
@@ -4394,12 +5137,16 @@ exit 0
             self.assertTrue(any(value.startswith("restore:") for value in events))
             self.assertEqual(
                 events.count("systemctl:--user restart agents-server.service"),
-                2,
+                1,
+            )
+            self.assertEqual(
+                events.count("systemctl:--user start agents-server.service"),
+                1,
             )
 
     def test_managed_config_change_during_staging_aborts_before_activation(self):
         with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
+            root = Path(temporary).resolve()
             _home, fake_bin, install_root, environment = self.fake_linux_preinstall_environment(root)
             event_log = root / "events.log"
             self.write_exact_health_uv(fake_bin)
@@ -4421,19 +5168,17 @@ exit 0
             config_root = root / "config"
             config_root.mkdir()
             env_file = config_root / "env"
-            env_file.write_text(
+            self.write_private_file(env_file,
                 "AGENTSDOCK_AGENT_TOKEN=preserved_token_abcdefghijklmnopqrstuvwxyz0123456789\n"
                 "AGENTSDOCK_AGENT_PORT=7850\n"
                 "AGENTSDOCK_TEAM_HUB_MODE=host\n"
                 "AGENTSDOCK_TEAM_HUB_TRANSPORT=loopback\n"
                 "AGENTSDOCK_TEAM_HUB_URL=\n"
             )
+            (root / "mutate-config-path").write_text(str(env_file) + "\n")
             environment.update(
                 {
                     "FAKE_EVENT_LOG": str(event_log),
-                    "FAKE_MUTATE_CONFIG_ON_STAGE": "true",
-                    "FAKE_MUTATE_CONFIG_PATH": str(env_file),
-                    "FAKE_MUTATE_CONFIG_SENTINEL": str(root / "config-mutated"),
                     "FAKE_SERVER_IDENTITY": server_identity,
                     "FAKE_TEAM_HUB_ID": hub_id,
                     "FAKE_TEAM_HUB_MODE": "host",
@@ -4467,7 +5212,7 @@ exit 0
 
     def test_term_after_exact_clear_keeps_healthy_candidate_committed(self):
         with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
+            root = Path(temporary).resolve()
             _home, fake_bin, install_root, environment = self.fake_linux_preinstall_environment(root)
             event_log = root / "events.log"
             self.write_exact_health_uv(fake_bin)
@@ -4525,8 +5270,8 @@ exit 0
 
     def test_term_after_exact_restore_completes_old_release_recovery(self):
         with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            _home, fake_bin, install_root, environment = self.fake_linux_preinstall_environment(root)
+            root = Path(temporary).resolve()
+            home, fake_bin, install_root, environment = self.fake_linux_preinstall_environment(root)
             event_log = root / "events.log"
             self.write_exact_health_uv(fake_bin)
             self.write_json_health_curl(fake_bin)
@@ -4543,6 +5288,17 @@ exit 0
                 operation_id=operation_id,
                 server_identity=server_identity,
                 hub_id=hub_id,
+            )
+            service_file = home / ".config" / "systemd" / "user" / "agents-server.service"
+            service_file.parent.mkdir(parents=True)
+            service_file.write_text("[Service]\nExecStart=/old/release/server\n")
+            config_root = root / "config"
+            config_root.mkdir()
+            self.write_private_file(
+                config_root / "env",
+                "AGENTSDOCK_TEAM_HUB_MODE=host\n"
+                "AGENTSDOCK_TEAM_HUB_TRANSPORT=loopback\n"
+                "AGENTSDOCK_TEAM_HUB_URL=\n",
             )
             environment.update(
                 {
@@ -4579,12 +5335,16 @@ exit 0
             self.assertTrue(any(value.startswith("restore:") for value in events))
             self.assertEqual(
                 events.count("systemctl:--user restart agents-server.service"),
-                2,
+                1,
+            )
+            self.assertEqual(
+                events.count("systemctl:--user start agents-server.service"),
+                1,
             )
 
-    def test_managed_clear_failure_restores_linux_env_service_and_old_health(self):
+    def test_managed_clear_failure_keeps_candidate_and_resumes_committing_journal(self):
         with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
+            root = Path(temporary).resolve()
             home, fake_bin, install_root, environment = self.fake_linux_preinstall_environment(root)
             event_log = root / "events.log"
             self.write_exact_health_uv(fake_bin)
@@ -4612,7 +5372,7 @@ exit 0
                 "AGENTSDOCK_TEAM_HUB_MODE=host\n"
                 "PRESERVED_SETTING=old-value\n"
             )
-            env_file.write_text(original_env)
+            self.write_private_file(env_file, original_env)
             service_file = home / ".config" / "systemd" / "user" / "agents-server.service"
             service_file.parent.mkdir(parents=True)
             original_service = "[Service]\nExecStart=/old/release/server\nEnvironment=OLD_VALUE=yes\n"
@@ -4646,21 +5406,71 @@ exit 0
             )
 
             self.assertNotEqual(result.returncode, 0)
-            self.assertEqual(env_file.read_text(), original_env)
-            self.assertEqual(service_file.read_text(), original_service)
-            self.assertTrue((install_root / "current" / "runtime-marker").is_file())
+            self.assertIn(
+                "passed its commit boundary but finalization remains pending",
+                result.stderr,
+            )
+            installed_env = env_file.read_text()
+            self.assertIn("PRESERVED_SETTING=old-value\n", installed_env)
+            self.assertIn("AGENTSDOCK_AGENT_PORT=17850\n", installed_env)
+            self.assertIn("AGENTSDOCK_TEAM_HUB_MODE=host\n", installed_env)
+            self.assertIn("AGENTSDOCK_TEAM_HUB_TRANSPORT=loopback\n", installed_env)
+            self.assertNotEqual(installed_env, original_env)
+            installed_service = service_file.read_text()
+            self.assertIn(f"WorkingDirectory={install_root / 'current'}\n", installed_service)
+            self.assertIn("--port 17850\n", installed_service)
+            self.assertNotEqual(installed_service, original_service)
+            self.assertEqual(
+                (install_root / "current").resolve(),
+                install_root / "releases" / self.release_version(),
+            )
+            self.assertFalse((install_root / "current" / "runtime-marker").exists())
+            self.assertTrue((hub_data / "maintenance-fence.json").is_file())
+            transaction = install_root / ".activation-transaction"
+            self.assertTrue(transaction.is_dir())
+            manifest = json.loads((transaction / "manifest.json").read_text())
+            self.assertEqual(manifest["phase"], "committing")
+            self.assertEqual(manifest["intent"], "server-update")
             events = event_log.read_text().splitlines()
-            self.assertIn("clear-fence", events)
-            self.assertTrue(any(value.startswith("restore:") for value in events))
+            self.assertEqual(events.count("clear-fence"), 2)
+            self.assertFalse(any(value.startswith("restore:") for value in events))
             self.assertEqual(
                 events.count("systemctl:--user restart agents-server.service"),
-                2,
+                1,
+            )
+
+            environment["FAKE_CLEAR_FAILURE"] = "false"
+            resumed = subprocess.run(
+                self.managed_installer_command(
+                    server_identity,
+                    hub_id,
+                    snapshot,
+                    hub_data,
+                    operation_id,
+                ),
+                env=environment,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+
+            self.assertEqual(resumed.returncode, 0, resumed.stderr)
+            self.assertIn(
+                "Recovered and verified the previously committed AgentsServer",
+                resumed.stdout,
+            )
+            self.assertFalse(transaction.exists())
+            self.assertFalse((hub_data / "maintenance-fence.json").exists())
+            resumed_events = event_log.read_text().splitlines()
+            self.assertEqual(resumed_events.count("clear-fence"), 3)
+            self.assertFalse(
+                any(value.startswith("restore:") for value in resumed_events)
             )
 
     def test_managed_rollback_does_not_claim_wrong_old_hub_health(self):
         with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            _home, fake_bin, install_root, environment = self.fake_linux_preinstall_environment(root)
+            root = Path(temporary).resolve()
+            home, fake_bin, install_root, environment = self.fake_linux_preinstall_environment(root)
             event_log = root / "events.log"
             self.write_exact_health_uv(fake_bin)
             self.write_json_health_curl(fake_bin)
@@ -4678,6 +5488,17 @@ exit 0
                 server_identity=server_identity,
                 hub_id=hub_id,
             )
+            config_root = root / "config"
+            config_root.mkdir()
+            self.write_private_file(
+                config_root / "env",
+                "AGENTSDOCK_TEAM_HUB_MODE=host\n"
+                "AGENTSDOCK_TEAM_HUB_TRANSPORT=loopback\n"
+                "AGENTSDOCK_TEAM_HUB_URL=\n",
+            )
+            service_file = home / ".config" / "systemd" / "user" / "agents-server.service"
+            service_file.parent.mkdir(parents=True)
+            service_file.write_text("[Service]\nExecStart=/old/release/server\n")
             environment.update(
                 {
                     "FAKE_EVENT_LOG": str(event_log),
@@ -4711,9 +5532,9 @@ exit 0
             self.assertNotIn("The previous release was restored.", result.stderr)
             self.assertTrue((install_root / "current" / "runtime-marker").is_file())
 
-    def test_uv_bootstrap_curl_is_bounded_and_reports_recovery_steps(self):
+    def test_missing_uv_does_not_attempt_a_curl_bootstrap(self):
         with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
+            root = Path(temporary).resolve()
             home, fake_bin, install_root, environment = self.fake_linux_preinstall_environment(root)
             curl_log = root / "curl.log"
             self.write_executable(fake_bin / "curl", """#!/bin/sh
@@ -4741,18 +5562,14 @@ exit 28
             )
 
             self.assertNotEqual(result.returncode, 0)
-            invocation = curl_log.read_text()
-            self.assertIn("--connect-timeout 1", invocation)
-            self.assertIn("--max-time 2", invocation)
-            self.assertIn("--retry 2", invocation)
-            self.assertIn("--retry-delay 1", invocation)
-            self.assertIn("Could not download uv", result.stderr)
-            self.assertIn("Check DNS, proxy, firewall, and outbound HTTPS access", result.stderr)
+            self.assertFalse(curl_log.exists())
+            self.assertIn("Unavailable prerequisite: uv", result.stderr)
+            self.assertIn("Install the trusted uv package manager", result.stderr)
             self.assertTrue((install_root / "current" / "runtime-marker").is_file())
 
-    def test_uv_bootstrap_wget_fallback_is_bounded_and_retried(self):
+    def test_missing_uv_does_not_attempt_a_wget_bootstrap(self):
         with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
+            root = Path(temporary).resolve()
             home, fake_bin, install_root, environment = self.fake_linux_preinstall_environment(root)
             wget_log = root / "wget.log"
             self.write_executable(fake_bin / "curl", "#!/bin/sh\nexit 127\n")
@@ -4779,16 +5596,14 @@ exit 4
             )
 
             self.assertNotEqual(result.returncode, 0)
-            invocation = wget_log.read_text()
-            self.assertIn("--timeout=2", invocation)
-            self.assertIn("--tries=3", invocation)
-            self.assertIn("--waitretry=1", invocation)
-            self.assertIn("Could not download uv", result.stderr)
+            self.assertFalse(wget_log.exists())
+            self.assertIn("Unavailable prerequisite: uv", result.stderr)
+            self.assertIn("Install the trusted uv package manager", result.stderr)
             self.assertTrue((install_root / "current" / "runtime-marker").is_file())
 
     def test_dependency_sync_streams_progress_and_times_out_before_activation(self):
         with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
+            root = Path(temporary).resolve()
             home, fake_bin, install_root, environment = self.fake_linux_preinstall_environment(root)
             descendant_marker = root / "uv-descendant-survived"
             self.write_executable(fake_bin / "curl", """#!/bin/sh
@@ -4797,11 +5612,11 @@ for argument in "$@"; do
 done
 exit 22
 """)
-            self.write_executable(fake_bin / "uv", """#!/bin/sh
+            self.write_executable(fake_bin / "uv", f"""#!/bin/sh
 echo 'FAKE_UV_VISIBLE_PROGRESS'
 (
   /bin/sleep 2
-  echo survived > "$FAKE_DESCENDANT_MARKER"
+  echo survived > "{descendant_marker}"
 ) &
 wait
 """)
@@ -4835,12 +5650,15 @@ wait
 
     def test_active_install_lock_rejects_a_second_installer_without_mutation(self):
         with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
+            root = Path(temporary).resolve()
             home, fake_bin, install_root, environment = self.fake_linux_preinstall_environment(root)
             self.write_executable(fake_bin / "curl", "#!/bin/sh\nexit 0\n")
+            self.write_fake_uv(fake_bin)
             lock = install_root / ".install-lock"
-            lock.mkdir()
-            (lock / "pid").write_text(f"{os.getpid()}\n")
+            lock.mkdir(mode=0o700)
+            pid_file = lock / "pid"
+            pid_file.write_text(f"{os.getpid()}\n")
+            pid_file.chmod(0o600)
             before = self.snapshot_trees(install_root)
 
             result = subprocess.run(
@@ -4858,7 +5676,7 @@ wait
 
     def test_unavailable_systemd_user_domain_fails_without_mutation(self):
         with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
+            root = Path(temporary).resolve()
             home = root / "home"
             fake_bin = root / "bin"
             install_root = root / "install"
@@ -4871,7 +5689,7 @@ wait
             (release / "runtime-marker").write_text("keep runtime\n")
             (install_root / "current").symlink_to(release, target_is_directory=True)
             config_root.mkdir()
-            (config_root / "env").write_text("AGENTSDOCK_AGENT_TOKEN=keep-token\n")
+            self.write_private_file(config_root / "env", "AGENTSDOCK_AGENT_TOKEN=keep-token\n")
             state_root.mkdir()
             (state_root / "sessions.json").write_text('{"keep": true}\n')
             self.prepare_preflight_path(fake_bin, os_name="Linux", commands=("tmux", "curl"))
@@ -4909,7 +5727,7 @@ exit 97
 
     def test_saved_custom_path_is_used_for_prerequisite_discovery(self):
         with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
+            root = Path(temporary).resolve()
             home = root / "home"
             bootstrap_bin = root / "bootstrap-bin"
             custom_bin = root / "custom-bin"
@@ -4922,9 +5740,9 @@ exit 97
             self.prepare_preflight_path(bootstrap_bin, os_name="Linux", commands=())
             expected_tmux = custom_bin / "tmux"
             systemctl_log = root / "systemctl.log"
-            (config_root / "env").write_text(f"PATH={custom_bin}\n")
+            self.write_private_file(config_root / "env", f"PATH={custom_bin}\n")
             self.write_executable(expected_tmux, "#!/bin/sh\nexit 0\n")
-            self.write_executable(custom_bin / "curl", "#!/bin/sh\nexit 0\n")
+            self.write_json_health_curl(custom_bin)
             self.write_executable(custom_bin / "systemctl", """#!/bin/sh
 printf '%s\n' "$*" >> "$FAKE_SYSTEMCTL_LOG"
 if [ "$1" = "--user" ] && [ "$2" = "show-environment" ]; then
@@ -4938,7 +5756,7 @@ while [ "$#" -gt 0 ]; do
   if [ "$1" = "--project" ]; then project="$2"; shift 2; else shift; fi
 done
 mkdir -p "$project/.venv/bin"
-printf '#!/bin/sh\nexit 0\n' > "$project/.venv/bin/python"
+printf '#!/bin/sh\nexec "$REAL_PYTHON" "$@"\n' > "$project/.venv/bin/python"
 chmod 755 "$project/.venv/bin/python"
 """)
             environment = {
@@ -4948,8 +5766,14 @@ chmod 755 "$project/.venv/bin/python"
                 "AGENTS_SERVER_INSTALL_DIR": str(install_root),
                 "AGENTS_SERVER_CONFIG_DIR": str(config_root),
                 "AGENTSDOCK_STATE_DIR": str(root / "state"),
+                "FAKE_AUTHORITATIVE_SYSTEMCTL": "true",
                 "FAKE_SYSTEMCTL_LOG": str(systemctl_log),
                 "EXPECTED_TMUX": str(expected_tmux),
+                "REAL_PYTHON": sys.executable,
+                "FAKE_HEALTH_VERSION": self.release_version(),
+                "FAKE_SERVER_IDENTITY": "f6" * 12,
+                "FAKE_TEAM_HUB_MODE": "disabled",
+                "AGENTS_SERVER_HEALTH_CHECK_ATTEMPTS": "1",
             }
 
             result = subprocess.run(
@@ -4971,7 +5795,7 @@ chmod 755 "$project/.venv/bin/python"
 
     def test_uninstall_removes_runtime_and_config_but_preserves_state(self):
         with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
+            root = Path(temporary).resolve()
             home, fake_bin, install_root, config_root, state_root, service_file, environment = (
                 self.fake_linux_uninstall_environment(root)
             )
@@ -4998,7 +5822,7 @@ chmod 755 "$project/.venv/bin/python"
 
     def test_uninstall_purge_state_requires_interactive_exact_confirmation(self):
         with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
+            root = Path(temporary).resolve()
             home, fake_bin, install_root, config_root, state_root, service_file, environment = (
                 self.fake_linux_uninstall_environment(root)
             )
@@ -5022,7 +5846,7 @@ chmod 755 "$project/.venv/bin/python"
 
     def test_uninstall_refuses_broad_and_overlapping_managed_roots(self):
         with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
+            root = Path(temporary).resolve()
             home = root / "home"
             fake_bin = root / "bin"
             home.mkdir()
@@ -5074,7 +5898,7 @@ chmod 755 "$project/.venv/bin/python"
 
     def test_uninstall_refuses_active_install_lock_without_mutation(self):
         with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
+            root = Path(temporary).resolve()
             home, fake_bin, install_root, config_root, state_root, service_file, environment = (
                 self.fake_linux_uninstall_environment(root)
             )
@@ -5100,7 +5924,7 @@ chmod 755 "$project/.venv/bin/python"
 
     def test_uninstall_stop_failure_preserves_all_files(self):
         with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
+            root = Path(temporary).resolve()
             home, fake_bin, install_root, config_root, state_root, service_file, environment = (
                 self.fake_linux_uninstall_environment(root, stop_failure=True)
             )
@@ -5123,15 +5947,33 @@ chmod 755 "$project/.venv/bin/python"
 
     def test_darwin_restart_waits_for_bootout_and_retries_transient_bootstrap(self):
         with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
+            root = Path(temporary).resolve()
             home, fake_bin, install_root, environment = self.fake_darwin_environment(root)
+            self.write_json_health_curl(fake_bin)
+            launch_agents = home / "Library" / "LaunchAgents"
+            launch_agents.mkdir(parents=True)
+            (launch_agents / "com.agentsdock.server.plist").write_text(
+                "OLD_SERVICE_CONFIG\n"
+            )
+            server_identity = "0123456789abcdef01234567"
+            state_root = root / "state"
+            state_root.mkdir()
+            self.write_private_file(
+                state_root / "server-identity",
+                server_identity + "\n",
+            )
             launchctl_state = root / "launchctl-state"
             launchctl_log = root / "launchctl.log"
             transient_done = root / "transient-done"
+            server_name = "Sonic & </string><key>Injected</key>"
             launchctl_state.write_text("loaded\n")
             self.write_executable(fake_bin / "launchctl", """#!/bin/sh
 command="$1"
 case "$command" in
+  print-disabled)
+    printf '{ }\n'
+    exit 0
+    ;;
   print)
     state="$(cat "$FAKE_LAUNCHCTL_STATE")"
     printf 'print:%s\n' "$state" >> "$FAKE_LAUNCHCTL_LOG"
@@ -5144,14 +5986,19 @@ case "$command" in
           exit 0
         fi
         printf 'absent\n' > "$FAKE_LAUNCHCTL_STATE"
+        echo 'Could not find service' >&2
         exit 3
         ;;
-      *) exit 3 ;;
+      *) echo 'Could not find service' >&2; exit 3 ;;
     esac
     ;;
   bootout)
     printf 'bootout\n' >> "$FAKE_LAUNCHCTL_LOG"
     printf 'removing:2\n' > "$FAKE_LAUNCHCTL_STATE"
+    exit 0
+    ;;
+  enable|disable)
+    printf '%s\n' "$command" >> "$FAKE_LAUNCHCTL_LOG"
     exit 0
     ;;
   bootstrap)
@@ -5172,6 +6019,12 @@ exit 2
                 "FAKE_LAUNCHCTL_STATE": str(launchctl_state),
                 "FAKE_LAUNCHCTL_LOG": str(launchctl_log),
                 "FAKE_TRANSIENT_DONE": str(transient_done),
+                "FAKE_HEALTH_VERSION": self.release_version(),
+                "FAKE_SERVER_IDENTITY": server_identity,
+                "FAKE_TEAM_HUB_ID": "hub_darwin_bootstrap_12345678",
+                "FAKE_TEAM_HUB_MODE": "host",
+                "AGENTS_SERVER_HEALTH_CHECK_ATTEMPTS": "1",
+                "AGENTSDOCK_SERVER_NAME": server_name,
             })
 
             result = subprocess.run(
@@ -5196,21 +6049,115 @@ exit 2
             self.assertEqual(calls.count("bootstrap"), 2)
             self.assertEqual(launchctl_state.read_text().strip(), "loaded")
             self.assertTrue((install_root / "current" / "agent_server.py").is_file())
-            plist = (
+            plist_path = (
                 home
                 / "Library"
                 / "LaunchAgents"
                 / "com.agentsdock.server.plist"
-            ).read_text()
+            )
+            plist = plist_path.read_text()
             self.assertIn("<key>AGENTSDOCK_TEAM_HUB_MODE</key><string>host</string>", plist)
+            launchd = plistlib.loads(plist_path.read_bytes())
+            self.assertEqual(
+                launchd["EnvironmentVariables"]["AGENTSDOCK_SERVER_NAME"],
+                server_name,
+            )
+            self.assertNotIn("Injected", launchd)
+            self.assertIn("&lt;/string&gt;&lt;key&gt;Injected&lt;/key&gt;", plist)
+
+    def test_darwin_restart_allows_more_than_five_seconds_for_bootout(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            home, fake_bin, install_root, environment = self.fake_darwin_environment(root)
+            self.write_json_health_curl(fake_bin)
+            launch_agents = home / "Library" / "LaunchAgents"
+            launch_agents.mkdir(parents=True)
+            (launch_agents / "com.agentsdock.server.plist").write_text(
+                "OLD_SERVICE_CONFIG\n"
+            )
+            launchctl_state = root / "launchctl-state"
+            launchctl_log = root / "launchctl.log"
+            launchctl_state.write_text("loaded\n")
+            self.write_executable(fake_bin / "launchctl", """#!/bin/sh
+command="$1"
+case "$command" in
+  print-disabled)
+    printf '{ }\n'
+    exit 0
+    ;;
+  print)
+    state="$(cat "$FAKE_LAUNCHCTL_STATE")"
+    printf 'print:%s\n' "$state" >> "$FAKE_LAUNCHCTL_LOG"
+    case "$state" in
+      loaded) exit 0 ;;
+      removing:*)
+        remaining="${state#removing:}"
+        if [ "$remaining" -gt 0 ]; then
+          printf 'removing:%s\n' "$((remaining - 1))" > "$FAKE_LAUNCHCTL_STATE"
+          exit 0
+        fi
+        printf 'absent\n' > "$FAKE_LAUNCHCTL_STATE"
+        echo 'Could not find service' >&2
+        exit 3
+        ;;
+      *) echo 'Could not find service' >&2; exit 3 ;;
+    esac
+    ;;
+  bootout)
+    printf 'bootout\n' >> "$FAKE_LAUNCHCTL_LOG"
+    # The former 50 x 0.1 s budget failed before this ordinary slow shutdown.
+    printf 'removing:75\n' > "$FAKE_LAUNCHCTL_STATE"
+    exit 0
+    ;;
+  enable|disable)
+    printf '%s\n' "$command" >> "$FAKE_LAUNCHCTL_LOG"
+    exit 0
+    ;;
+  bootstrap)
+    printf 'bootstrap\n' >> "$FAKE_LAUNCHCTL_LOG"
+    printf 'loaded\n' > "$FAKE_LAUNCHCTL_STATE"
+    exit 0
+    ;;
+esac
+exit 2
+""")
+            environment.update({
+                "FAKE_LAUNCHCTL_STATE": str(launchctl_state),
+                "FAKE_LAUNCHCTL_LOG": str(launchctl_log),
+                "FAKE_HEALTH_VERSION": self.release_version(),
+                "FAKE_SERVER_IDENTITY": "server_darwin_slow_bootout_12345678",
+                "FAKE_TEAM_HUB_ID": "",
+                "AGENTS_SERVER_HEALTH_CHECK_ATTEMPTS": "1",
+            })
+
+            result = subprocess.run(
+                ["bash", str(INSTALLER), "--port", "17850", "--non-interactive"],
+                env=environment,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            calls = launchctl_log.read_text().splitlines()
+            self.assertGreater(calls.count("print:removing:75"), 0)
+            self.assertIn("print:removing:50", calls)
+            self.assertLess(calls.index("print:removing:0"), calls.index("bootstrap"))
+            self.assertEqual(launchctl_state.read_text().strip(), "loaded")
+            self.assertTrue((install_root / "current" / "agent_server.py").is_file())
 
     def test_darwin_nontransient_bootstrap_failure_restores_previous_service(self):
         with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
+            root = Path(temporary).resolve()
             home, fake_bin, install_root, environment = self.fake_darwin_environment(root)
+            self.write_json_health_curl(fake_bin)
             old_runtime = install_root / "current"
             old_runtime.mkdir(parents=True)
             (old_runtime / "old-runtime-marker").write_text("preserved\n")
+            (old_runtime / "VERSION").write_text("0.1.25-beta.1\n")
+            old_python = old_runtime / ".venv" / "bin" / "python"
+            old_python.parent.mkdir(parents=True)
+            self.write_executable(old_python, "#!/bin/sh\nexit 0\n")
             launch_agents = home / "Library" / "LaunchAgents"
             launch_agents.mkdir(parents=True)
             plist = launch_agents / "com.agentsdock.server.plist"
@@ -5221,15 +6168,26 @@ exit 2
             self.write_executable(fake_bin / "launchctl", """#!/bin/sh
 command="$1"
 case "$command" in
+  print-disabled)
+    printf '{ }\n'
+    exit 0
+    ;;
   print)
     state="$(cat "$FAKE_LAUNCHCTL_STATE")"
     printf 'print:%s\n' "$state" >> "$FAKE_LAUNCHCTL_LOG"
-    [ "$state" = "loaded" ]
-    exit $?
+    if [ "$state" = "loaded" ]; then
+      exit 0
+    fi
+    echo 'Could not find service' >&2
+    exit 3
     ;;
   bootout)
     printf 'bootout\n' >> "$FAKE_LAUNCHCTL_LOG"
     printf 'absent\n' > "$FAKE_LAUNCHCTL_STATE"
+    exit 0
+    ;;
+  enable|disable)
+    printf '%s\n' "$command" >> "$FAKE_LAUNCHCTL_LOG"
     exit 0
     ;;
   bootstrap)
@@ -5248,6 +6206,12 @@ exit 2
             environment.update({
                 "FAKE_LAUNCHCTL_STATE": str(launchctl_state),
                 "FAKE_LAUNCHCTL_LOG": str(launchctl_log),
+                "FAKE_EVENT_LOG": str(launchctl_log),
+                "FAKE_HEALTH_VERSION": "0.1.25-beta.1",
+                "FAKE_HEALTH_VERSION_AFTER_RESTORE": "0.1.25-beta.1",
+                "FAKE_SERVER_IDENTITY": "server_darwin_rollback_12345678",
+                "FAKE_TEAM_HUB_MODE": "disabled",
+                "AGENTS_SERVER_HEALTH_CHECK_ATTEMPTS": "1",
             })
 
             result = subprocess.run(
@@ -5275,7 +6239,10 @@ exit 2
         fake_bin.mkdir()
         home.mkdir()
         temporary.mkdir()
-        self.write_executable(fake_bin / "uname", "#!/bin/sh\necho Darwin\n")
+        self.write_executable(
+            fake_bin / "uname",
+            "#!/bin/sh\nif [ \"${1:-}\" = \"-m\" ]; then echo arm64; else echo Darwin; fi\n",
+        )
         self.write_executable(fake_bin / "curl", "#!/bin/sh\nexit 0\n")
         self.write_executable(fake_bin / "tmux", "#!/bin/sh\nexit 0\n")
         self.write_executable(fake_bin / "sleep", "#!/bin/sh\nprintf 'sleep:%s\\n' \"$1\" >> \"$FAKE_LAUNCHCTL_LOG\"\n")
@@ -5285,7 +6252,7 @@ while [ "$#" -gt 0 ]; do
   if [ "$1" = "--project" ]; then project="$2"; shift 2; else shift; fi
 done
 mkdir -p "$project/.venv/bin"
-printf '#!/bin/sh\nexit 0\n' > "$project/.venv/bin/python"
+printf '#!/bin/sh\nexec "$REAL_PYTHON" "$@"\n' > "$project/.venv/bin/python"
 chmod 755 "$project/.venv/bin/python"
 """)
         environment = {
@@ -5297,7 +6264,9 @@ chmod 755 "$project/.venv/bin/python"
             "AGENTS_SERVER_CONFIG_DIR": str(root / "config"),
             "AGENTSDOCK_STATE_DIR": str(root / "state"),
             "FAKE_LAUNCHCTL_LOG": str(root / "launchctl.log"),
+            "REAL_PYTHON": sys.executable,
         }
+        environment.pop("AGENTSDOCK_SERVER_NAME", None)
         return home, fake_bin, install_root, environment
 
     @staticmethod
@@ -5327,6 +6296,7 @@ chmod 755 "$project/.venv/bin/python"
         old_release = install_root / "releases" / "0.0.9"
         old_release.mkdir(parents=True)
         (old_release / "runtime-marker").write_text("preserved\n")
+        (old_release / "VERSION").write_text("0.0.9\n")
         (install_root / "current").symlink_to(old_release, target_is_directory=True)
         environment = {
             **os.environ,
@@ -5335,8 +6305,11 @@ chmod 755 "$project/.venv/bin/python"
             "AGENTS_SERVER_INSTALL_DIR": str(install_root),
             "AGENTS_SERVER_CONFIG_DIR": str(root / "config"),
             "AGENTSDOCK_STATE_DIR": str(root / "state"),
+            "FAKE_AUTHORITATIVE_SYSTEMCTL": "true",
+            "REAL_PYTHON": sys.executable,
         }
         for key in (
+            "AGENTSDOCK_SERVER_NAME",
             "AGENTSDOCK_TEAM_HUB_MODE",
             "AGENTSDOCK_TEAM_HUB_TRANSPORT",
             "AGENTSDOCK_TEAM_HUB_URL",
@@ -5344,6 +6317,116 @@ chmod 755 "$project/.venv/bin/python"
         ):
             environment.pop(key, None)
         return home, fake_bin, install_root, environment
+
+    @staticmethod
+    def write_running_systemd_service(home: Path) -> Path:
+        service_file = home / ".config" / "systemd" / "user" / "agents-server.service"
+        service_file.parent.mkdir(parents=True, exist_ok=True)
+        service_file.write_text("[Service]\nExecStart=/old/release/server\n")
+        return service_file
+
+    def configure_fake_darwin_managed_repair(
+        self,
+        root: Path,
+        home: Path,
+        fake_bin: Path,
+        install_root: Path,
+        environment: dict[str, str],
+    ) -> None:
+        """Exercise managed repair on macOS without weakening Linux cgroup proof."""
+        self.write_executable(
+            fake_bin / "uname",
+            "#!/bin/sh\nif [ \"${1:-}\" = \"-m\" ]; then echo arm64; else echo Darwin; fi\n",
+        )
+        old_release = install_root / "releases" / "0.0.9"
+        (old_release / "VERSION").write_text("0.0.9\n")
+        launch_agents = home / "Library" / "LaunchAgents"
+        launch_agents.mkdir(parents=True)
+        (launch_agents / "com.agentsdock.server.plist").write_text(
+            "OLD_SERVICE_CONFIG\n"
+        )
+        launchctl_state = root / "launchctl-state"
+        launchctl_state.write_text("loaded\n")
+        self.write_executable(
+            fake_bin / "launchctl",
+            """#!/bin/sh
+command="$1"
+target="${2:-}"
+case "$command" in
+  print-disabled)
+    printf '{ }\n'
+    exit 0
+    ;;
+  print)
+    case "$target" in
+      gui/*/com.agentsdock.server)
+        if [ "$(cat "$FAKE_LAUNCHCTL_STATE")" = "loaded" ]; then
+          exit 0
+        fi
+        echo 'Could not find service' >&2
+        exit 3
+        ;;
+      gui/*) exit 0 ;;
+    esac
+    ;;
+  enable|disable)
+    printf 'launchctl:%s\n' "$command" >> "$FAKE_EVENT_LOG"
+    exit 0
+    ;;
+  kickstart)
+    printf 'launchctl:kickstart\n' >> "$FAKE_EVENT_LOG"
+    printf 'loaded\n' > "$FAKE_LAUNCHCTL_STATE"
+    exit 0
+    ;;
+  bootout)
+    printf 'launchctl:bootout\n' >> "$FAKE_EVENT_LOG"
+    printf 'absent\n' > "$FAKE_LAUNCHCTL_STATE"
+    exit 0
+    ;;
+  bootstrap)
+    if grep -q OLD_SERVICE_CONFIG "$3" 2>/dev/null; then
+      printf 'launchctl:bootstrap:old\n' >> "$FAKE_EVENT_LOG"
+    else
+      printf 'launchctl:bootstrap:candidate\n' >> "$FAKE_EVENT_LOG"
+      if [ "${FAKE_MIGRATE_CANDIDATE_TEAM_HUB:-false}" = "true" ] \
+        && [ ! -e "$FAKE_CANDIDATE_MIGRATION_SENTINEL" ]; then
+        PYTHONPATH="$AGENTS_SERVER_INSTALL_DIR/current" "$REAL_PYTHON" - \
+          "$AGENTSDOCK_STATE_DIR/team-hub" "$FAKE_SERVER_IDENTITY" \
+          "$FAKE_TEAM_HUB_ID" <<'PYTHON'
+from pathlib import Path
+import os
+import sys
+from agentsdock_team_hub.store import HubStore
+
+store = HubStore(Path(sys.argv[1]), managed_host_identity=sys.argv[2])
+if store.hub_id != sys.argv[3]:
+    raise SystemExit(1)
+if os.environ.get("FAKE_CANDIDATE_TEAM_HUB_MUTATION") == "true":
+    connection = store.connect()
+    try:
+        connection.execute("CREATE TABLE candidate_only(value TEXT)")
+    finally:
+        connection.close()
+PYTHON
+        status=$?
+        [ "$status" -eq 0 ] || exit "$status"
+        : > "$FAKE_CANDIDATE_MIGRATION_SENTINEL"
+        printf 'candidate-hub-opened\n' >> "$FAKE_EVENT_LOG"
+      fi
+    fi
+    printf 'loaded\n' > "$FAKE_LAUNCHCTL_STATE"
+    exit 0
+    ;;
+esac
+exit 2
+""",
+        )
+        environment.update(
+            {
+                "FAKE_LAUNCHCTL_STATE": str(launchctl_state),
+                "FAKE_EVENT_LOG": str(root / "events.log"),
+            }
+        )
 
     def fake_linux_uninstall_environment(self, root: Path, *, stop_failure: bool = False):
         home = root / "home"
@@ -5357,7 +6440,7 @@ chmod 755 "$project/.venv/bin/python"
         config_root.mkdir()
         state_root.mkdir()
         (install_root / "runtime-marker").write_text("preserved runtime\n")
-        (config_root / "env").write_text(
+        self.write_private_file(config_root / "env",
             "AGENTSDOCK_AGENT_TOKEN=preserved_token_abcdefghijklmnopqrstuvwxyz0123456789\n"
         )
         (state_root / "sessions.json").write_text('{"keep": true}\n')
@@ -5400,7 +6483,7 @@ while [ "$#" -gt 0 ]; do
   if [ "$1" = "--project" ]; then project="$2"; shift 2; else shift; fi
 done
 mkdir -p "$project/.venv/bin"
-printf '#!/bin/sh\nexit 0\n' > "$project/.venv/bin/python"
+printf '#!/bin/sh\nexec "$REAL_PYTHON" "$@"\n' > "$project/.venv/bin/python"
 chmod 755 "$project/.venv/bin/python"
 """)
 
@@ -5412,9 +6495,12 @@ project=""
 while [ "$#" -gt 0 ]; do
   if [ "$1" = "--project" ]; then project="$2"; shift 2; else shift; fi
 done
-if [ "${FAKE_MUTATE_CONFIG_ON_STAGE:-false}" = "true" ] && [ ! -e "$FAKE_MUTATE_CONFIG_SENTINEL" ]; then
-  printf 'AGENTSDOCK_TEAM_HUB_MODE=disabled\nAGENTSDOCK_TEAM_HUB_TRANSPORT=loopback\nAGENTSDOCK_TEAM_HUB_URL=\n' > "$FAKE_MUTATE_CONFIG_PATH"
-  : > "$FAKE_MUTATE_CONFIG_SENTINEL"
+fixture_mutate_config_path_file="${0%/*}/../mutate-config-path"
+fixture_mutate_config_sentinel="${0%/*}/../config-mutated"
+if [ -f "$fixture_mutate_config_path_file" ] && [ ! -e "$fixture_mutate_config_sentinel" ]; then
+  fixture_mutate_config_path="$(cat "$fixture_mutate_config_path_file")"
+  printf 'AGENTSDOCK_TEAM_HUB_MODE=disabled\nAGENTSDOCK_TEAM_HUB_TRANSPORT=loopback\nAGENTSDOCK_TEAM_HUB_URL=\n' > "$fixture_mutate_config_path"
+  : > "$fixture_mutate_config_sentinel"
 fi
 mkdir -p "$project/.venv/bin"
 cat > "$project/.venv/bin/python" <<'PYTHON'
@@ -5423,13 +6509,47 @@ if [ "${1:-}" = "-" ]; then
   exec "$REAL_PYTHON" "$@"
 fi
 case "$*" in
+  *"-m activation_transaction "*)
+    exec "$REAL_PYTHON" "$@"
+    ;;
+  *"-m agentsdock_team_hub.cli begin-host-cold-handoff"*|*"-m agentsdock_team_hub.cli clear-host-cold-handoff"*|*"-m agentsdock_team_hub.cli adopt-host-reactivation-preflight"*|*"-m agentsdock_team_hub.cli abort-host-reactivation-preflight"*|*"-m agentsdock_team_hub.cli verify-server-identity"*)
+    exec "$REAL_PYTHON" "$@"
+    ;;
+  *"-m agentsdock_team_hub.cli publish-fenced-start-authority"*|*"-m agentsdock_team_hub.cli clear-fenced-start-authority"*)
+    if [ "${FAKE_REAL_CANDIDATE_TEAM_HUB_CONTROL:-false}" = "true" ]; then
+      exec "$REAL_PYTHON" "$@"
+    fi
+    case "$*" in
+      *"--expected-reason host-reactivation"*) exec "$REAL_PYTHON" "$@" ;;
+    esac
+    exit 0
+    ;;
+  *"-m agentsdock_team_hub.cli rebase-snapshot"*)
+    if [ "${FAKE_REAL_CANDIDATE_TEAM_HUB_CONTROL:-false}" = "true" ]; then
+      exec "$REAL_PYTHON" "$@"
+    fi
+    printf 'rebase:%s\n' "$*" >> "$FAKE_EVENT_LOG"
+    exit 0
+    ;;
+  *"-m agentsdock_team_hub.cli prepare-host-reactivation"*)
+    printf 'prepare-reactivation:%s\n' "$*" >> "$FAKE_EVENT_LOG"
+    exec "$REAL_PYTHON" "$@"
+    ;;
+  *"-m agentsdock_team_hub.cli verify-host-reactivation-snapshot"*)
+    printf 'verify-reactivation:%s\n' "$*" >> "$FAKE_EVENT_LOG"
+    exec "$REAL_PYTHON" "$@"
+    ;;
+  *"-m agentsdock_team_hub.cli restore-host-reactivation-snapshot"*)
+    printf 'restore-reactivation:%s\n' "$*" >> "$FAKE_EVENT_LOG"
+    exec "$REAL_PYTHON" "$@"
+    ;;
   *"maintenance_fence_matches_control"*)
     printf 'verify-fence\n' >> "$FAKE_EVENT_LOG"
     if [ "${FAKE_REAL_CANDIDATE_TEAM_HUB_CONTROL:-false}" = "true" ]; then
       exec "$REAL_PYTHON" "$@"
     fi
-    [ "${FAKE_FENCE_VERIFY_FAILURE:-false}" != "true" ]
-    exit $?
+    [ "${FAKE_FENCE_VERIFY_FAILURE:-false}" != "true" ] || exit $?
+    exec "$REAL_PYTHON" -c 'import os, sys; value = os.lstat(sys.argv[1] + "/maintenance-fence.json"); print(value.st_dev); print(value.st_ino)' "$3"
     ;;
   *"clear_maintenance_fence_control"*)
     printf 'clear-fence\n' >> "$FAKE_EVENT_LOG"
@@ -5440,6 +6560,7 @@ case "$*" in
     if [ "${FAKE_SIGNAL_AFTER_CLEAR:-false}" = "true" ]; then
       kill -TERM "$PPID"
     fi
+    rm -f -- "$3/maintenance-fence.json"
     exit 0
     ;;
   *"-m agentsdock_team_hub.cli verify-snapshot"*)
@@ -5458,6 +6579,29 @@ case "$*" in
     [ "${FAKE_RESTORE_FAILURE:-false}" != "true" ] || exit $?
     if [ "${FAKE_SIGNAL_AFTER_RESTORE:-false}" = "true" ]; then
       kill -TERM "$PPID"
+    fi
+    exit 0
+    ;;
+  *"-m agentsdock_team_hub.cli confirm-restored-host-reactivation-snapshot"*)
+    printf 'confirm-restore:%s\n' "$*" >> "$FAKE_EVENT_LOG"
+    exec "$REAL_PYTHON" "$@"
+    ;;
+  *"-m agentsdock_team_hub.cli confirm-restored-snapshot"*)
+    printf 'confirm-restore:%s\n' "$*" >> "$FAKE_EVENT_LOG"
+    if [ "${FAKE_REAL_CANDIDATE_TEAM_HUB_CONTROL:-false}" = "true" ]; then
+      exec "$REAL_PYTHON" "$@"
+    fi
+    [ "${FAKE_RESTORE_FAILURE:-false}" != "true" ] || exit $?
+    exit 0
+    ;;
+  *"-m agentsdock_team_hub.cli acknowledge-restored-host-reactivation-snapshot"*)
+    printf 'acknowledge-restore:%s\n' "$*" >> "$FAKE_EVENT_LOG"
+    exec "$REAL_PYTHON" "$@"
+    ;;
+  *"-m agentsdock_team_hub.cli acknowledge-restored-snapshot"*)
+    printf 'acknowledge-restore:%s\n' "$*" >> "$FAKE_EVENT_LOG"
+    if [ "${FAKE_REAL_CANDIDATE_TEAM_HUB_CONTROL:-false}" = "true" ]; then
+      exec "$REAL_PYTHON" "$@"
     fi
     exit 0
     ;;
@@ -5520,6 +6664,14 @@ if [ -n "$output" ]; then
   peer_extra_approved="${FAKE_SECURE_PEER_EXTRA_APPROVED:-false}"
   peer_active_connection="${FAKE_SECURE_PEER_ACTIVE_CONNECTION:-true}"
   peer_pending="${FAKE_SECURE_PEER_PENDING:-false}"
+  if [ -n "$health_server_identity" ] \
+    && [ -n "${AGENTSDOCK_STATE_DIR:-}" ] \
+    && [ ! -e "$AGENTSDOCK_STATE_DIR/server-identity" ]; then
+    mkdir -p "$AGENTSDOCK_STATE_DIR"
+    chmod 700 "$AGENTSDOCK_STATE_DIR"
+    printf '%s\n' "$health_server_identity" > "$AGENTSDOCK_STATE_DIR/server-identity"
+    chmod 600 "$AGENTSDOCK_STATE_DIR/server-identity"
+  fi
   after_restore="false"
   if [ -n "${FAKE_EVENT_LOG:-}" ]; then
     case "$request_path" in
@@ -5527,7 +6679,13 @@ if [ -n "$output" ]; then
       *) printf 'health\n' >> "$FAKE_EVENT_LOG" ;;
     esac
     restart_count="$(grep -c '^systemctl:--user restart agents-server.service$' "$FAKE_EVENT_LOG" || true)"
-    if grep -q '^restore:' "$FAKE_EVENT_LOG" || [ "$restart_count" -ge 2 ]; then
+    start_count="$(grep -c '^systemctl:--user start agents-server.service$' "$FAKE_EVENT_LOG" || true)"
+    if grep -q '^restore:' "$FAKE_EVENT_LOG" \
+      || grep -q '^restore-reactivation:' "$FAKE_EVENT_LOG" \
+      || grep -q '^launchctl:bootstrap:old$' "$FAKE_EVENT_LOG" \
+      || grep -q '^bootstrap:old$' "$FAKE_EVENT_LOG" \
+      || { [ "$restart_count" -ge 1 ] && [ "$start_count" -ge 1 ]; } \
+      || [ "$restart_count" -ge 2 ]; then
       after_restore="true"
       health_version="${FAKE_HEALTH_VERSION_AFTER_RESTORE:-$health_version}"
       health_server_identity="${FAKE_SERVER_IDENTITY_AFTER_RESTORE:-$health_server_identity}"
@@ -5550,7 +6708,9 @@ if [ -n "$output" ]; then
       peer_status_version="${FAKE_SECURE_PEER_STATUS_VERSION_AFTER_RESTORE:-$peer_status_version}"
       peer_extra_approved="${FAKE_SECURE_PEER_EXTRA_APPROVED_AFTER_RESTORE:-$peer_extra_approved}"
       peer_active_connection="${FAKE_SECURE_PEER_ACTIVE_CONNECTION_AFTER_RESTORE:-$peer_active_connection}"
-    elif grep -q '^systemctl:--user restart agents-server.service$' "$FAKE_EVENT_LOG"; then
+    elif grep -q '^systemctl:--user restart agents-server.service$' "$FAKE_EVENT_LOG" \
+      || grep -q '^launchctl:bootstrap:candidate$' "$FAKE_EVENT_LOG" \
+      || grep -q '^bootstrap:new$' "$FAKE_EVENT_LOG"; then
       health_team_hub_mode="${FAKE_TEAM_HUB_MODE_AFTER_RESTART:-$health_team_hub_mode}"
       health_connection_id="${FAKE_TEAM_HUB_CONNECTION_ID_AFTER_RESTART:-$health_connection_id}"
       health_hub_id="${FAKE_TEAM_HUB_ID_AFTER_RESTART:-$health_hub_id}"
@@ -5571,7 +6731,7 @@ if [ -n "$output" ]; then
       peer_extra_approved="${FAKE_SECURE_PEER_EXTRA_APPROVED_AFTER_RESTART:-$peer_extra_approved}"
       peer_active_connection="${FAKE_SECURE_PEER_ACTIVE_CONNECTION_AFTER_RESTART:-$peer_active_connection}"
     else
-      health_team_hub_mode="${FAKE_TEAM_HUB_MODE_BEFORE_RESTART:-$health_team_hub_mode}"
+      health_team_hub_mode="${FAKE_TEAM_HUB_MODE_BEFORE_RESTART:-disabled}"
       health_connection_id="${FAKE_TEAM_HUB_CONNECTION_ID_BEFORE_RESTART:-$health_connection_id}"
       health_hub_id="${FAKE_TEAM_HUB_ID_BEFORE_RESTART:-$health_hub_id}"
       health_host_server_identity="${FAKE_TEAM_HUB_HOST_SERVER_IDENTITY_BEFORE_RESTART:-$health_host_server_identity}"
@@ -5650,8 +6810,13 @@ EOF
           exit 93
         fi
       elif [ "$peer_active" = "false" ]; then
+        if [ "$health_team_hub_mode" = "host" ]; then
+          peer_host_json='{"available":true,"enabled":true,"listen_port":7851,"advertised_host":null,"advertised_hosts":[],"ca_fingerprint":"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","pairing_link":null,"certificate_expires_at":null,"error":null,"error_code":null,"action":null}'
+        else
+          peer_host_json='{"available":false,"enabled":false,"listen_port":7851,"advertised_host":null,"advertised_hosts":[],"ca_fingerprint":null,"pairing_link":null,"certificate_expires_at":null,"error":null,"error_code":null,"action":null}'
+        fi
         cat > "$output" <<EOF
-{"version":$peer_status_version,"heartbeat_interval_seconds":30,"lease_seconds":90,"server_identity":"$health_server_identity","server_instance_id":"instance_test_12345678","active_connection_id":null,"host":{"available":false,"enabled":false,"listen_port":7851,"advertised_host":null,"advertised_hosts":[],"ca_fingerprint":null,"pairing_link":null,"certificate_expires_at":null,"error":null,"error_code":null,"action":null},"pairings":[],"remote_routes":[],"published_routes":[],"remote_route_delivery_available":false,"connection_error":null,"delivery_error":null}
+{"version":$peer_status_version,"heartbeat_interval_seconds":30,"lease_seconds":90,"server_identity":"$health_server_identity","server_instance_id":"instance_test_12345678","active_connection_id":null,"host":$peer_host_json,"pairings":[],"remote_routes":[],"published_routes":[],"remote_route_delivery_available":false,"connection_error":null,"delivery_error":null}
 EOF
       else
         exit 95
@@ -5692,6 +6857,17 @@ EOF
     cat > "$output" <<EOF
 {"ok":true,"server_version":"$health_version","server_identity":"$health_server_identity","capabilities":{"team_hub_v1":{"available":true,"designated_host":true,"version":1,"base_path":"/api/team-hub","hub_id":"$health_hub_id","host_server_identity":"$health_server_identity","transport":"$health_transport","hub_url":$health_hub_url,"routes":$health_routes}$health_secure_capability}}
 EOF
+  elif [ "$health_team_hub_mode" = "failed_host" ]; then
+    health_transport="${FAKE_TEAM_HUB_TRANSPORT:-loopback}"
+    health_url="${FAKE_TEAM_HUB_URL:-}"
+    if [ -n "$health_url" ]; then
+      health_hub_url="$(printf '"%s"' "$health_url")"
+    else
+      health_hub_url="null"
+    fi
+    cat > "$output" <<EOF
+{"ok":true,"server_version":"$health_version","server_identity":"$health_server_identity","capabilities":{"team_hub_v1":{"available":false,"designated_host":true,"version":1,"base_path":"/api/team-hub","hub_id":null,"host_server_identity":"$health_server_identity","transport":"$health_transport","hub_url":$health_hub_url,"routes":[],"startup_failure_reason":"database unavailable"}$health_secure_capability}}
+EOF
   elif [ "$health_team_hub_mode" = "client" ]; then
     health_base_path="/api/team-hub-secure/$health_connection_id"
     cat > "$output" <<EOF
@@ -5719,12 +6895,19 @@ if [ "$*" = "--user restart agents-server.service" ] \
     "$AGENTSDOCK_STATE_DIR/team-hub" "$FAKE_SERVER_IDENTITY" \
     "$FAKE_TEAM_HUB_ID" <<'PYTHON'
 from pathlib import Path
+import os
 import sys
 from agentsdock_team_hub.store import HubStore
 
 store = HubStore(Path(sys.argv[1]), managed_host_identity=sys.argv[2])
 if store.hub_id != sys.argv[3]:
     raise SystemExit(1)
+if os.environ.get("FAKE_CANDIDATE_TEAM_HUB_MUTATION") == "true":
+    connection = store.connect()
+    try:
+        connection.execute("CREATE TABLE candidate_only(value TEXT)")
+    finally:
+        connection.close()
 PYTHON
   status=$?
   [ "$status" -eq 0 ] || exit "$status"
@@ -5750,7 +6933,9 @@ exit 0
         (snapshot / "team-hub.sqlite3").write_bytes(b"snapshot database\n")
         (snapshot / "access-token-signing.key").write_bytes(b"snapshot signing key\n")
         hub_data.mkdir(parents=True, exist_ok=True)
-        (hub_data / "maintenance-fence.json").write_text(
+        fence = hub_data / "maintenance-fence.json"
+        self.write_private_file(
+            fence,
             json.dumps(
                 {
                     "format": 1,
@@ -5762,7 +6947,7 @@ exit 0
                     "created_at": "2026-08-20T00:00:00Z",
                 }
             )
-            + "\n"
+            + "\n",
         )
         self.prepare_managed_runtime_fixture(
             install_root,
@@ -5791,18 +6976,38 @@ fi
 case "$*" in
   *"maintenance_fence_matches_control"*)
     printf 'verify-fence\n' >> "$FAKE_EVENT_LOG"
-    [ "${FAKE_FENCE_VERIFY_FAILURE:-false}" != "true" ]
-    exit $?
+    [ "${FAKE_FENCE_VERIFY_FAILURE:-false}" != "true" ] || exit $?
+    exec "$REAL_PYTHON" -c 'import os, sys; value = os.lstat(sys.argv[1] + "/maintenance-fence.json"); print(value.st_dev); print(value.st_ino)' "$3"
     ;;
   *"clear_maintenance_fence_control"*)
     printf 'clear-fence\n' >> "$FAKE_EVENT_LOG"
     [ "${FAKE_CLEAR_FAILURE:-false}" != "true" ]
-    exit $?
+    status=$?
+    [ "$status" -eq 0 ] || exit "$status"
+    rm -f -- "$3/maintenance-fence.json"
+    exit 0
     ;;
   *"-m agentsdock_team_hub.cli verify-snapshot"*)
     printf 'verify-snapshot:%s\n' "$*" >> "$FAKE_EVENT_LOG"
     [ "${FAKE_SNAPSHOT_VERIFY_FAILURE:-false}" != "true" ]
     exit $?
+    ;;
+  *"-m agentsdock_team_hub.cli restore-snapshot"*)
+    printf 'restore:%s\n' "$*" >> "$FAKE_EVENT_LOG"
+    [ "${FAKE_RESTORE_FAILURE:-false}" != "true" ] || exit $?
+    if [ "${FAKE_SIGNAL_AFTER_RESTORE:-false}" = "true" ]; then
+      kill -TERM "$PPID"
+    fi
+    exit 0
+    ;;
+  *"-m agentsdock_team_hub.cli confirm-restored-snapshot"*)
+    printf 'confirm-restore:%s\n' "$*" >> "$FAKE_EVENT_LOG"
+    [ "${FAKE_RESTORE_FAILURE:-false}" != "true" ] || exit $?
+    exit 0
+    ;;
+  *"-m agentsdock_team_hub.cli acknowledge-restored-snapshot"*)
+    printf 'acknowledge-restore:%s\n' "$*" >> "$FAKE_EVENT_LOG"
+    exit 0
     ;;
 esac
 exit 0
@@ -5819,7 +7024,24 @@ exit 0
             connection.execute("DROP TRIGGER network_agents_limit_per_server")
             connection.execute("DROP TRIGGER network_bulletin_body_limit_on_insert")
             connection.execute("DROP TRIGGER network_bulletin_body_limit_on_update")
+            for trigger in (
+                "human_admin_page_device_session_insert",
+                "human_admin_page_invitation_insert",
+                "human_admin_page_membership_insert",
+                "human_admin_page_entries_immutable",
+                "human_admin_page_entries_cannot_be_deleted",
+            ):
+                connection.execute(f"DROP TRIGGER {trigger}")
+            for index in (
+                "device_sessions_human_created_id_idx",
+                "invitations_pending_team_created_id_idx",
+                "memberships_active_team_created_principal_idx",
+                "memberships_manageable_team_created_principal_idx",
+            ):
+                connection.execute(f"DROP INDEX {index}")
             for table in (
+                # Migration 0011 (bounded human-administration paging).
+                "human_admin_page_entries",
                 # Migration 0010 (attachment orphan reclamation).
                 "team_attachment_cleanup_queue",
                 # Migration 0009 (Team Messages V2), children first.
@@ -5877,6 +7099,19 @@ exit 0
                 json.dumps(manifest, sort_keys=True, separators=(",", ":")) + "\n"
             )
             self.downgrade_database_to_schema4(store.database_path)
+            # The production fence binds the exact manifest digest.  This
+            # fixture intentionally synthesizes a legacy schema generation
+            # after creating a modern Store, so update that binding along with
+            # the fixture's manifest rather than leaving an impossible,
+            # self-invalidating maintenance generation.
+            fence = json.loads(store.maintenance_fence_path.read_text())
+            fence["snapshot_manifest_sha256"] = hashlib.sha256(
+                manifest_path.read_bytes()
+            ).hexdigest()
+            self.write_private_file(
+                store.maintenance_fence_path,
+                json.dumps(fence, sort_keys=True, separators=(",", ":")) + "\n",
+            )
         elif schema_version != 5:
             raise ValueError("test fixture schema must be 4 or 5")
         self.prepare_managed_runtime_fixture(
@@ -5887,9 +7122,39 @@ exit 0
 
     def write_health_curl(self, fake_bin: Path, *, conflict_port: int, healthy_port: int):
         self.write_executable(fake_bin / "curl", f"""#!/bin/sh
-case "$*" in
-  *":{conflict_port}/api/health"*) exit 22 ;;
-  *":{healthy_port}/api/health"*) exit 0 ;;
+output=""
+want_output="false"
+request_path=""
+for argument in "$@"; do
+  if [ "$want_output" = "true" ]; then
+    output="$argument"
+    want_output="false"
+    continue
+  fi
+  case "$argument" in
+    --version) exit 0 ;;
+    --output) want_output="true" ;;
+    http://127.0.0.1:*) request_path="$argument" ;;
+  esac
+done
+case "$request_path" in
+  *":{conflict_port}/api/health") exit 22 ;;
+  *":{healthy_port}/api/admin/secure-peers/v1/status")
+    if [ -n "$output" ]; then
+      cat > "$output" <<EOF
+{{"version":2,"heartbeat_interval_seconds":30,"lease_seconds":90,"server_identity":"$FAKE_SERVER_IDENTITY","server_instance_id":"instance_port_fixture_12345678","active_connection_id":null,"host":{{"available":false,"enabled":false,"listen_port":7851,"advertised_host":null,"advertised_hosts":[],"ca_fingerprint":null,"pairing_link":null,"certificate_expires_at":null,"error":null,"error_code":null,"action":null}},"pairings":[],"remote_routes":[],"published_routes":[],"remote_route_delivery_available":false,"connection_error":null,"delivery_error":null}}
+EOF
+    fi
+    exit 0
+    ;;
+  *":{healthy_port}/api/health")
+    if [ -n "$output" ]; then
+      cat > "$output" <<EOF
+{{"ok":true,"server_version":"$FAKE_HEALTH_VERSION","server_identity":"$FAKE_SERVER_IDENTITY","capabilities":{{"team_hub_v1":{{"available":false,"designated_host":false,"version":1,"base_path":null,"hub_id":null,"host_server_identity":null,"transport":null,"hub_url":null,"routes":[]}},"secure_peer_v1":{{"available":true,"state_available":true,"state_error_code":null,"required":false,"version":1,"control_path":"/api/admin/secure-peers/v1/status","proxy_prefix":"/api/team-hub-secure"}}}}}}
+EOF
+    fi
+    exit 0
+    ;;
 esac
 exit 0
 """)
@@ -6003,7 +7268,168 @@ exit 0
         return snapshot
 
     @staticmethod
+    def write_private_file(path: Path, source: str) -> None:
+        path.write_text(source)
+        path.chmod(0o600)
+
+    @staticmethod
     def write_executable(path: Path, source: str):
+        shebang, separator, body = source.partition("\n")
+        authoritative_systemctl_default = (
+            "true" if path.name == "systemctl" and body.strip() == "exit 0" else "false"
+        )
+        if path.name == "uv" and shebang.startswith("#!"):
+            source = (
+                shebang
+                + separator
+                + "if [ \"${1:-}\" = \"--version\" ]; then "
+                + "printf 'uv 0.10.10\\n'; exit 0; fi\n"
+                + "fixture_uv_project=''\n"
+                + "fixture_uv_want_project=false\n"
+                + "for fixture_uv_argument in \"$@\"; do\n"
+                + "  if [ \"$fixture_uv_want_project\" = true ]; then\n"
+                + "    fixture_uv_project=\"$fixture_uv_argument\"\n"
+                + "    fixture_uv_want_project=false\n"
+                + "  elif [ \"$fixture_uv_argument\" = --project ]; then\n"
+                + "    fixture_uv_want_project=true\n"
+                + "  fi\n"
+                + "done\n"
+                + "fixture_uv_environment=${UV_PROJECT_ENVIRONMENT:-"
+                + "${fixture_uv_project:+$fixture_uv_project/.venv}}\n"
+                + body
+                + "\nfixture_uv_status=$?\n"
+                + "if [ \"$fixture_uv_status\" -eq 0 ] "
+                + "&& [ -n \"$fixture_uv_environment\" ] "
+                + "&& [ -x \"$fixture_uv_environment/bin/python\" ]; then\n"
+                + "  mv \"$fixture_uv_environment/bin/python\" "
+                + "\"$fixture_uv_environment/bin/python.fixture-original\"\n"
+                + "  cat > \"$fixture_uv_environment/bin/python\" <<'PYTHON'\n"
+                + "#!/bin/sh\n"
+                + "original_python=\"${0%/*}/python.fixture-original\"\n"
+                + "if [ \"${1:-}\" = - ] && [ \"$#\" -eq 8 ] "
+                + "&& { [ \"${2:-}\" = Linux ] || [ \"${2:-}\" = Darwin ]; } "
+                + "&& [ \"${6:-}\" != \"${6#/}\" ]; then\n"
+                + "  fixture_health_host=$4\n"
+                + "  case \"$fixture_health_host\" in *:*) "
+                + "fixture_health_host=\"[$fixture_health_host]\" ;; esac\n"
+                + "  if [ \"$7\" = secure-peer ]; then\n"
+                + "    exec curl --output \"$8\" -H "
+                + "'X-AgentsDock-Token: fixture-token' "
+                + "\"http://$fixture_health_host:$5$6\"\n"
+                + "  fi\n"
+                + "  exec curl --output \"$8\" "
+                + "\"http://$fixture_health_host:$5$6\"\n"
+                + "fi\n"
+                + "exec \"$original_python\" \"$@\"\n"
+                + "PYTHON\n"
+                + "  chmod 755 \"$fixture_uv_environment/bin/python\"\n"
+                + "fi\n"
+                + "exit \"$fixture_uv_status\"\n"
+            )
+        elif path.name == "systemctl" and shebang.startswith("#!"):
+            source = (
+                shebang
+                + separator
+                + "if [ -n \"${FAKE_SERVER_IDENTITY:-}\" ] "
+                + "&& [ -n \"${AGENTSDOCK_STATE_DIR:-}\" ] "
+                + "&& [ ! -e \"$AGENTSDOCK_STATE_DIR/server-identity\" ]; then\n"
+                + "  mkdir -p \"$AGENTSDOCK_STATE_DIR\"\n"
+                + "  chmod 700 \"$AGENTSDOCK_STATE_DIR\"\n"
+                + "  printf '%s\\n' \"$FAKE_SERVER_IDENTITY\" "
+                + "> \"$AGENTSDOCK_STATE_DIR/server-identity\"\n"
+                + "  chmod 600 \"$AGENTSDOCK_STATE_DIR/server-identity\"\n"
+                + "fi\n"
+                + f"if [ \"${{FAKE_AUTHORITATIVE_SYSTEMCTL:-{authoritative_systemctl_default}}}\" = true ]; then\n"
+                + "  fixture_systemd_unit=''\n"
+                + "  for fixture_systemd_argument in \"$@\"; do\n"
+                + "    case \"$fixture_systemd_argument\" in *.service) "
+                + "fixture_systemd_unit=$fixture_systemd_argument ;; esac\n"
+                + "  done\n"
+                + "  fixture_systemd_config=$HOME/.config/systemd/user/$fixture_systemd_unit\n"
+                + "  fixture_systemd_last_action=''\n"
+                + "  if [ -n \"${FAKE_EVENT_LOG:-}\" ] "
+                + "&& [ -f \"$FAKE_EVENT_LOG\" ] "
+                + "&& [ -n \"$fixture_systemd_unit\" ]; then\n"
+                + "    fixture_systemd_last_action=$(grep -F "
+                + "\" $fixture_systemd_unit\" \"$FAKE_EVENT_LOG\" "
+                + "2>/dev/null | tail -n 1 || true)\n"
+                + "  fi\n"
+                + "  case \"$*\" in\n"
+                + "    *' show '*--property=LoadState*--value*)\n"
+                + "      if [ -f \"$fixture_systemd_config\" ]; then "
+                + "printf 'loaded\\n'; else printf 'not-found\\n'; fi\n"
+                + "      exit 0 ;;\n"
+                + "    *' show '*--property=ActiveState*--value*)\n"
+                + "      if [ ! -f \"$fixture_systemd_config\" ]; then "
+                + "printf 'inactive\\n'; "
+                + "elif case \"$fixture_systemd_last_action\" in "
+                + "*' stop '*|*' disable --now '*|*' kill '*) true ;; "
+                + "*) false ;; esac; then printf 'inactive\\n'; "
+                + "else printf 'active\\n'; fi\n"
+                + "      exit 0 ;;\n"
+                + "    *' is-enabled '*)\n"
+                + "      if case \"$fixture_systemd_last_action\" in "
+                + "*' disable '*|*' disable --now '*) true ;; "
+                + "*) false ;; esac; then printf 'disabled\\n'; exit 1; fi\n"
+                + "      if [ -f \"$fixture_systemd_config\" ]; then "
+                + "printf 'enabled\\n'; exit 0; fi\n"
+                + "      printf 'not-found\\n'; exit 1 ;;\n"
+                + "  esac\n"
+                + "fi\n"
+                + f"if [ {authoritative_systemctl_default} = true ] "
+                + "&& [ -n \"${FAKE_EVENT_LOG:-}\" ]; then\n"
+                + "  printf 'systemctl:%s\\n' \"$*\" >> \"$FAKE_EVENT_LOG\"\n"
+                + "fi\n"
+                + "case \"$*\" in\n"
+                + "  *' show '*--property=MainPID*--value*)\n"
+                + f"    if [ \"${{FAKE_AUTHORITATIVE_SYSTEMCTL:-{authoritative_systemctl_default}}}\" = true ] "
+                + "&& [ ! -f \"$fixture_systemd_config\" ]; then "
+                + "printf '0\\n'; else printf '%s\\n' \"${FAKE_SERVICE_MAIN_PID:-4242}\"; fi\n"
+                + "    exit 0 ;;\n"
+                + "esac\n"
+                + body
+            )
+        elif path.name == "launchctl" and shebang.startswith("#!"):
+            source = (
+                shebang
+                + separator
+                + "if [ -n \"${FAKE_SERVER_IDENTITY:-}\" ] "
+                + "&& [ -n \"${AGENTSDOCK_STATE_DIR:-}\" ] "
+                + "&& [ ! -e \"$AGENTSDOCK_STATE_DIR/server-identity\" ]; then\n"
+                + "  mkdir -p \"$AGENTSDOCK_STATE_DIR\"\n"
+                + "  chmod 700 \"$AGENTSDOCK_STATE_DIR\"\n"
+                + "  printf '%s\\n' \"$FAKE_SERVER_IDENTITY\" "
+                + "> \"$AGENTSDOCK_STATE_DIR/server-identity\"\n"
+                + "  chmod 600 \"$AGENTSDOCK_STATE_DIR/server-identity\"\n"
+                + "fi\n"
+                + "if [ \"${1:-}\" = print ] "
+                + "&& [ -n \"${FAKE_LAUNCHCTL_STATE:-}\" ] "
+                + "&& [ \"$(cat \"$FAKE_LAUNCHCTL_STATE\" 2>/dev/null)\" = loaded ]; then\n"
+                + "  case \"${2:-}\" in gui/*/com.agentsdock.server) "
+                + "printf 'pid = %s;\\n' \"${FAKE_SERVICE_MAIN_PID:-4242}\"; exit 0 ;; esac\n"
+                + "fi\n"
+                + body
+            )
+        elif path.name == "python" and shebang.startswith("#!"):
+            source = (
+                shebang
+                + separator
+                + "if [ \"${1:-}\" = - ] && [ \"$#\" -eq 8 ] "
+                + "&& { [ \"${2:-}\" = Linux ] || [ \"${2:-}\" = Darwin ]; } "
+                + "&& [ \"${6:-}\" != \"${6#/}\" ]; then\n"
+                + "  fixture_health_host=$4\n"
+                + "  case \"$fixture_health_host\" in *:*) "
+                + "fixture_health_host=\"[$fixture_health_host]\" ;; esac\n"
+                + "  if [ \"$7\" = secure-peer ]; then\n"
+                + "    exec curl --output \"$8\" -H "
+                + "'X-AgentsDock-Token: fixture-token' "
+                + "\"http://$fixture_health_host:$5$6\"\n"
+                + "  fi\n"
+                + "  exec curl --output \"$8\" "
+                + "\"http://$fixture_health_host:$5$6\"\n"
+                + "fi\n"
+                + body
+            )
         path.write_text(source)
         path.chmod(0o755)
 

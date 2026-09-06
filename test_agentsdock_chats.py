@@ -1,4 +1,5 @@
 import argparse
+import http.client
 import io
 import json
 import unittest
@@ -9,6 +10,15 @@ import agentsdock_chats
 
 
 class AgentsDockChatsCLITests(unittest.TestCase):
+    def test_helper_uses_only_the_canonical_provider_capability_header(self) -> None:
+        self.assertEqual(
+            agentsdock_chats.provider_headers("live-capability"),
+            {
+                "Accept": "application/json",
+                "X-AgentsDock-Provider-Capability": "live-capability",
+            },
+        )
+
     def test_post_retries_only_the_native_promotion_window(self) -> None:
         class FakeResponse:
             def __enter__(self):
@@ -73,6 +83,292 @@ class AgentsDockChatsCLITests(unittest.TestCase):
             payload,
         )
         sleep.assert_called_once_with(0.05)
+
+    def test_post_replays_identical_idempotent_request_after_lost_response(self) -> None:
+        class FakeResponse:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return None
+
+            def read(self):
+                return json.dumps({"ok": True, "accepted": True}).encode("utf-8")
+
+        class FakeOpener:
+            def __init__(self) -> None:
+                self.requests = []
+
+            def open(self, request, timeout):
+                self.requests.append((request, timeout))
+                if len(self.requests) == 1:
+                    raise urllib.error.URLError(TimeoutError("response lost"))
+                return FakeResponse()
+
+        opener = FakeOpener()
+        payload = {
+            "body": "hello",
+            "idempotency_key": "stable-key",
+        }
+        with (
+            patch.object(agentsdock_chats, "environment", return_value="http://127.0.0.1:7850"),
+            patch.object(agentsdock_chats.urllib.request, "build_opener", return_value=opener),
+            patch.object(agentsdock_chats.time, "sleep") as sleep,
+        ):
+            result = agentsdock_chats.post_json(
+                "/api/agent/cross-chat/handoffs",
+                payload,
+                "capability",
+            )
+
+        self.assertEqual(result, {"ok": True, "accepted": True})
+        self.assertEqual(len(opener.requests), 2)
+        self.assertIs(opener.requests[0][0], opener.requests[1][0])
+        self.assertEqual(opener.requests[0][0].data, opener.requests[1][0].data)
+        sleep.assert_called_once_with(0.1)
+
+    def test_post_replays_identical_request_after_truncated_success_body(self) -> None:
+        class FakeResponse:
+            def __init__(self, truncated: bool) -> None:
+                self.truncated = truncated
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return None
+
+            def read(self):
+                if self.truncated:
+                    raise http.client.IncompleteRead(b'{"ok":true')
+                return json.dumps({"ok": True, "accepted": True}).encode("utf-8")
+
+        class FakeOpener:
+            def __init__(self) -> None:
+                self.requests = []
+
+            def open(self, request, timeout):
+                self.requests.append((request, timeout))
+                return FakeResponse(len(self.requests) == 1)
+
+        opener = FakeOpener()
+        payload = {"body": "hello", "idempotency_key": "stable-key"}
+        with (
+            patch.object(agentsdock_chats, "environment", return_value="http://127.0.0.1:7850"),
+            patch.object(agentsdock_chats.urllib.request, "build_opener", return_value=opener),
+            patch.object(agentsdock_chats.time, "sleep") as sleep,
+        ):
+            result = agentsdock_chats.post_json(
+                "/api/agent/cross-chat/handoffs",
+                payload,
+                "capability",
+            )
+
+        self.assertEqual(result, {"ok": True, "accepted": True})
+        self.assertEqual(len(opener.requests), 2)
+        self.assertIs(opener.requests[0][0], opener.requests[1][0])
+        self.assertEqual(opener.requests[0][0].data, opener.requests[1][0].data)
+        sleep.assert_called_once_with(0.1)
+
+    def test_post_replays_identical_request_after_truncated_error_body(self) -> None:
+        class TruncatedHTTPError(urllib.error.HTTPError):
+            def read(self):
+                raise http.client.IncompleteRead(b'{"detail":')
+
+        class FakeResponse:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return None
+
+            def read(self):
+                return json.dumps({"ok": True, "accepted": True}).encode("utf-8")
+
+        class FakeOpener:
+            def __init__(self) -> None:
+                self.requests = []
+
+            def open(self, request, timeout):
+                self.requests.append((request, timeout))
+                if len(self.requests) == 1:
+                    raise TruncatedHTTPError(
+                        request.full_url,
+                        409,
+                        "Conflict",
+                        {},
+                        None,
+                    )
+                return FakeResponse()
+
+        opener = FakeOpener()
+        payload = {"body": "hello", "idempotency_key": "stable-key"}
+        with (
+            patch.object(agentsdock_chats, "environment", return_value="http://127.0.0.1:7850"),
+            patch.object(agentsdock_chats.urllib.request, "build_opener", return_value=opener),
+            patch.object(agentsdock_chats.time, "sleep") as sleep,
+        ):
+            result = agentsdock_chats.post_json(
+                "/api/agent/cross-chat/handoffs",
+                payload,
+                "capability",
+            )
+
+        self.assertEqual(result, {"ok": True, "accepted": True})
+        self.assertEqual(len(opener.requests), 2)
+        self.assertIs(opener.requests[0][0], opener.requests[1][0])
+        sleep.assert_called_once_with(0.1)
+
+    def test_post_reports_ambiguous_commit_without_inviting_reworded_retry(self) -> None:
+        class FakeOpener:
+            def open(self, _request, timeout):
+                raise urllib.error.URLError(TimeoutError("response lost"))
+
+        with (
+            patch.object(agentsdock_chats, "environment", return_value="http://127.0.0.1:7850"),
+            patch.object(agentsdock_chats.urllib.request, "build_opener", return_value=FakeOpener()),
+            patch.object(agentsdock_chats.time, "sleep"),
+        ):
+            with self.assertRaisesRegex(
+                agentsdock_chats.ChatsCLIError,
+                "do not resend it with different wording",
+            ):
+                agentsdock_chats.post_json(
+                    "/api/agent/cross-chat/handoffs",
+                    {"body": "hello", "idempotency_key": "stable-key"},
+                    "capability",
+                )
+
+    def test_get_replays_identical_live_lease_after_lost_response(self) -> None:
+        class FakeResponse:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return None
+
+            def read(self):
+                return json.dumps({"ok": True, "body": "answer"}).encode("utf-8")
+
+        class FakeOpener:
+            def __init__(self) -> None:
+                self.requests = []
+
+            def open(self, request, timeout):
+                self.requests.append((request, timeout))
+                if len(self.requests) == 1:
+                    raise urllib.error.URLError(ConnectionResetError("response lost"))
+                return FakeResponse()
+
+        opener = FakeOpener()
+        with (
+            patch.object(agentsdock_chats, "environment", return_value="http://127.0.0.1:7850"),
+            patch.object(agentsdock_chats.urllib.request, "build_opener", return_value=opener),
+            patch.object(agentsdock_chats.time, "sleep") as sleep,
+        ):
+            result = agentsdock_chats.get_json(
+                "/api/agent/cross-chat/exchanges/ex/legs/leg/live-response?lease_id=lease",
+                "capability",
+                timeout=90,
+            )
+
+        self.assertEqual(result, {"ok": True, "body": "answer"})
+        self.assertEqual(len(opener.requests), 2)
+        self.assertIs(opener.requests[0][0], opener.requests[1][0])
+        self.assertEqual(opener.requests[0][0].full_url, opener.requests[1][0].full_url)
+        sleep.assert_called_once_with(0.1)
+
+    def test_get_replays_identical_live_lease_after_truncated_json(self) -> None:
+        class FakeResponse:
+            def __init__(self, body: bytes) -> None:
+                self.body = body
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return None
+
+            def read(self):
+                return self.body
+
+        class FakeOpener:
+            def __init__(self) -> None:
+                self.requests = []
+
+            def open(self, request, timeout):
+                self.requests.append((request, timeout))
+                if len(self.requests) == 1:
+                    return FakeResponse(b'{"ok":true')
+                return FakeResponse(json.dumps({
+                    "ok": True,
+                    "body": "answer",
+                }).encode("utf-8"))
+
+        opener = FakeOpener()
+        with (
+            patch.object(agentsdock_chats, "environment", return_value="http://127.0.0.1:7850"),
+            patch.object(agentsdock_chats.urllib.request, "build_opener", return_value=opener),
+            patch.object(agentsdock_chats.time, "sleep") as sleep,
+        ):
+            result = agentsdock_chats.get_json(
+                "/api/agent/cross-chat/exchanges/ex/legs/leg/live-response?lease_id=lease",
+                "capability",
+                timeout=90,
+            )
+
+        self.assertEqual(result, {"ok": True, "body": "answer"})
+        self.assertEqual(len(opener.requests), 2)
+        self.assertIs(opener.requests[0][0], opener.requests[1][0])
+        sleep.assert_called_once_with(0.1)
+
+    def test_get_replays_identical_live_lease_after_truncated_error_body(self) -> None:
+        class TruncatedHTTPError(urllib.error.HTTPError):
+            def read(self):
+                raise http.client.IncompleteRead(b'{"detail":')
+
+        class FakeResponse:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return None
+
+            def read(self):
+                return json.dumps({"ok": True, "body": "answer"}).encode("utf-8")
+
+        class FakeOpener:
+            def __init__(self) -> None:
+                self.requests = []
+
+            def open(self, request, timeout):
+                self.requests.append((request, timeout))
+                if len(self.requests) == 1:
+                    raise TruncatedHTTPError(
+                        request.full_url,
+                        409,
+                        "Conflict",
+                        {},
+                        None,
+                    )
+                return FakeResponse()
+
+        opener = FakeOpener()
+        with (
+            patch.object(agentsdock_chats, "environment", return_value="http://127.0.0.1:7850"),
+            patch.object(agentsdock_chats.urllib.request, "build_opener", return_value=opener),
+            patch.object(agentsdock_chats.time, "sleep") as sleep,
+        ):
+            result = agentsdock_chats.get_json(
+                "/api/agent/cross-chat/exchanges/ex/legs/leg/live-response?lease_id=lease",
+                "capability",
+                timeout=90,
+            )
+
+        self.assertEqual(result, {"ok": True, "body": "answer"})
+        self.assertEqual(len(opener.requests), 2)
+        self.assertIs(opener.requests[0][0], opener.requests[1][0])
+        sleep.assert_called_once_with(0.1)
 
     def test_live_post_socket_timeout_outlives_server_lease(self) -> None:
         class FakeResponse:
@@ -144,7 +440,39 @@ class AgentsDockChatsCLITests(unittest.TestCase):
         self.assertIn("lease_id=lease_", wait_path)
         self.assertEqual(get.call_args.kwargs["timeout"], 90)
 
-    def test_ask_rejects_server_without_live_wait_support(self) -> None:
+    def test_route_ask_returns_after_durable_acceptance_without_live_wait(self) -> None:
+        route = "route_" + "a" * 32
+        receipt = {
+            "ok": True,
+            "route_id": route,
+            "action": "request_reply",
+            "accepted": True,
+        }
+        post = Mock(return_value=receipt)
+        get = Mock()
+        args = argparse.Namespace(
+            authority_file="authority.json",
+            route=route,
+            target=None,
+            message="Slow question",
+            idempotency_key=None,
+            timeout_seconds=75,
+            async_response=False,
+        )
+        with (
+            patch.object(agentsdock_chats, "authority", return_value="capability"),
+            patch.object(agentsdock_chats, "post_json", post),
+            patch.object(agentsdock_chats, "get_json", get),
+        ):
+            result = agentsdock_chats.ask(args)
+
+        self.assertEqual(result, receipt)
+        payload = post.call_args.args[1]
+        self.assertNotIn("wait_for_response", payload)
+        self.assertNotIn("response_timeout_seconds", payload)
+        get.assert_not_called()
+
+    def test_route_ask_accepts_minimal_async_receipt(self) -> None:
         args = argparse.Namespace(
             authority_file="authority.json",
             route="route_" + "a" * 32,
@@ -153,24 +481,21 @@ class AgentsDockChatsCLITests(unittest.TestCase):
             idempotency_key=None,
             timeout_seconds=75,
         )
+        receipt = {
+            "ok": True,
+            "route_id": args.route,
+            "action": "request_reply",
+            "accepted": True,
+        }
         with (
             patch.object(agentsdock_chats, "authority", return_value="capability"),
             patch.object(
                 agentsdock_chats,
                 "post_json",
-                return_value={
-                    "ok": True,
-                    "route_id": args.route,
-                    "action": "request_reply",
-                    "accepted": True,
-                },
+                return_value=receipt,
             ),
         ):
-            with self.assertRaisesRegex(
-                agentsdock_chats.ChatsCLIError,
-                "does not support a live response",
-            ):
-                agentsdock_chats.ask(args)
+            self.assertEqual(agentsdock_chats.ask(args), receipt)
 
     def test_secure_peer_ask_can_explicitly_use_async_response_delivery(self) -> None:
         args = argparse.Namespace(
@@ -336,6 +661,50 @@ class AgentsDockChatsCLITests(unittest.TestCase):
         ):
             with self.assertRaises(agentsdock_chats.ChatsCLIError):
                 agentsdock_chats.respond(args)
+
+    def test_followup_reports_timeout_fallback_as_accepted_async_delivery(self) -> None:
+        args = argparse.Namespace(
+            authority_file="authority.json",
+            exchange="exchange_deferred",
+            inbound_leg="leg_answer",
+            message="One more question",
+            request_response=True,
+            async_response=False,
+            idempotency_key=None,
+            timeout_seconds=75,
+        )
+        with (
+            patch.object(agentsdock_chats, "authority", return_value="capability"),
+            patch.object(
+                agentsdock_chats,
+                "post_json",
+                return_value={
+                    "ok": True,
+                    "action": "response",
+                    "accepted": True,
+                    "exchange_id": "exchange_deferred",
+                    "inbound_leg_id": "leg_followup",
+                    "live_response_lease_id": "lease_" + "c" * 32,
+                },
+            ),
+            patch.object(
+                agentsdock_chats,
+                "get_json",
+                return_value={
+                    "ok": True,
+                    "exchange_id": "exchange_deferred",
+                    "inbound_leg_id": "leg_followup",
+                    "deferred": True,
+                    "delivery": "asynchronous",
+                    "message": "The answer will be delivered asynchronously.",
+                },
+            ),
+        ):
+            result = agentsdock_chats.respond(args)
+
+        self.assertTrue(result["accepted"])
+        self.assertTrue(result["deferred"])
+        self.assertEqual(result["delivery"], "asynchronous")
 
     def test_secure_peer_followup_can_explicitly_remain_async(self) -> None:
         args = argparse.Namespace(

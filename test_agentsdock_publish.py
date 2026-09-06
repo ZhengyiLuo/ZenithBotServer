@@ -1,5 +1,6 @@
 import asyncio
 import contextlib
+import hashlib
 import io
 import json
 import tempfile
@@ -22,6 +23,15 @@ def request_for(
     provider_token: str = "provider-secret",
     retry: bool = False,
 ) -> Request:
+    sent = False
+
+    async def receive():
+        nonlocal sent
+        if sent:
+            return {"type": "http.disconnect"}
+        sent = True
+        return {"type": "http.request", "body": b"", "more_body": False}
+
     headers = [
         (b"x-agentsdock-provider-capability", provider_token.encode()),
     ]
@@ -36,7 +46,7 @@ def request_for(
         "scheme": "http",
         "server": ("127.0.0.1", 7850),
         "client": (host, 43210),
-    })
+    }, receive=receive)
 
 
 class FakeResponse:
@@ -294,6 +304,17 @@ class ArtifactPublisherServerTests(unittest.IsolatedAsyncioTestCase):
                 "source_run_id": run_id,
                 "actions": {"publish"},
             }),
+        ))
+        stack.enter_context(patch.object(
+            agent_server,
+            "CROSS_CHAT_CAPABILITIES",
+            {
+                hashlib.sha256(b"provider-secret").hexdigest(): {
+                    "source_session_id": session_id,
+                    "source_run_id": run_id,
+                    "actions": {"publish"},
+                }
+            },
         ))
         stack.enter_context(patch.object(agent_server, "EVENT_SEQ_CACHE", {}))
         stack.enter_context(patch.object(agent_server, "EVENT_DELIVERY_LOCKS", {}))

@@ -277,7 +277,7 @@ class SecurePeerHubAdapter:
     def _address(cls, value: Any) -> dict[str, str]:
         if not isinstance(value, dict) or set(value) != {"kind", "id"}:
             raise HubError("invalid_request", "Request body is invalid", 422)
-        if value.get("kind") not in {"server", "agent"}:
+        if value.get("kind") != "server":
             raise HubError("invalid_request", "Request body is invalid", 422)
         return {
             "kind": str(value["kind"]),
@@ -375,10 +375,11 @@ class SecurePeerHubAdapter:
             ),
         }
         from_agent = value.get("from_agent_id")
-        if from_agent is not None:
-            result["from_agent_id"] = cls._identifier(from_agent)
-        else:
-            result["from_agent_id"] = None
+        if mode in {"mailbox", "request", "reply"} and from_agent is not None:
+            # A secure peer speaks for its authenticated server identity.  It
+            # may not forge an agent sender, even when replaying a legacy body.
+            raise HubError("invalid_request", "Request body is invalid", 422)
+        result["from_agent_id"] = None
         if mode in {"mailbox", "request"}:
             result["to"] = cls._address(value.get("to"))
         if mode == "bulletin":
@@ -509,6 +510,9 @@ class SecurePeerHubAdapter:
                 raise HubError("invalid_request", "Query is invalid", 422)
         if "limit" in values and not 1 <= int(values["limit"]) <= 100:
             raise HubError("invalid_request", "Query is invalid", 422)
+        if "cursor" in values:
+            if re.fullmatch(r"v1\.[A-Za-z0-9_-]{38,500}", values["cursor"]) is None:
+                raise HubError("invalid_request", "Query is invalid", 422)
         for key in ("address_id", "from_id"):
             if key in values:
                 values[key] = SecurePeerHubAdapter._resource_id(values[key])
@@ -545,10 +549,7 @@ class SecurePeerHubAdapter:
             raise HubError("invalid_request", "Query is invalid", 422)
         if "limit" in values and not 1 <= int(values["limit"]) <= 100:
             raise HubError("invalid_request", "Query is invalid", 422)
-        if "address_kind" in values and values["address_kind"] not in {
-            "server",
-            "agent",
-        }:
+        if "address_kind" in values and values["address_kind"] != "server":
             raise HubError("invalid_request", "Query is invalid", 422)
         if "address_id" in values:
             values["address_id"] = SecurePeerHubAdapter._resource_id(
@@ -777,7 +778,16 @@ class SecurePeerHubAdapter:
                 if len(pieces) == 1:
                     result = self.store.get_team(claims, team_id)
                 elif len(pieces) == 2 and pieces[1] == "members":
-                    result = self.store.list_members(claims, team_id)
+                    values = self._query(request, allowed={"limit", "cursor"})
+                    result = self.store.list_members(
+                        claims,
+                        team_id,
+                        limit=int(values.get("limit", "50")),
+                        cursor=values.get("cursor"),
+                    )
+                elif len(pieces) == 3 and pieces[1] == "members":
+                    self._query(request, allowed=set())
+                    result = self.store.get_member(claims, team_id, pieces[2])
                 elif len(pieces) == 2 and pieces[1] == "nodes":
                     result = self.store.list_nodes(claims, team_id)
                 elif len(pieces) == 2 and pieces[1] == "channels":
@@ -791,6 +801,16 @@ class SecurePeerHubAdapter:
                         team_id,
                         after_server_id=values.get("after_server_id"),
                         limit=int(values.get("limit", "50")),
+                    )
+                elif (
+                    len(pieces) == 4
+                    and pieces[1:3] == [_NETWORK_CHILD, "servers"]
+                ):
+                    self._query(request, allowed=set())
+                    result = self.store.get_network_server(
+                        claims,
+                        team_id,
+                        self._resource_id(pieces[3]),
                     )
                 elif len(pieces) == 3 and pieces[1:] == [_NETWORK_CHILD, "bulletin"]:
                     values = self._query(
@@ -945,11 +965,40 @@ class SecurePeerHubAdapter:
                     and pieces[1:3] == [_NETWORK_CHILD, "requests"]
                     and pieces[4] == "replies"
                 ):
+                    request_id = self._resource_id(pieces[3])
+                    reply_body = self._network_text_body(request, mode="reply")
+                    existing_request = self.store.get_network_request(
+                        claims,
+                        team_id,
+                        request_id,
+                    )
+                    request_item = existing_request.get("item")
+                    sender = (
+                        request_item.get("from")
+                        if isinstance(request_item, dict)
+                        else None
+                    )
+                    recipient = (
+                        request_item.get("to")
+                        if isinstance(request_item, dict)
+                        else None
+                    )
+                    if (
+                        not isinstance(sender, dict)
+                        or not isinstance(recipient, dict)
+                        or sender.get("kind") == "agent"
+                        or recipient.get("kind") == "agent"
+                    ):
+                        raise HubError(
+                            "invalid_request",
+                            "Agent-addressed peer replies are retired",
+                            422,
+                        )
                     result = self.store.create_network_request_reply(
                         claims,
                         team_id,
-                        self._resource_id(pieces[3]),
-                        self._network_text_body(request, mode="reply"),
+                        request_id,
+                        reply_body,
                     )
                 elif len(pieces) == 3 and pieces[1:] == [_NETWORK_CHILD, "messages"]:
                     result = self.store.create_team_message(

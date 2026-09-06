@@ -1,12 +1,15 @@
 from __future__ import annotations
 
 from dataclasses import replace
+import errno
 import hashlib
+import io
 import json
 import os
 from pathlib import Path
 import shutil
 import sqlite3
+import stat
 import subprocess
 import sys
 import tempfile
@@ -16,7 +19,9 @@ from unittest import mock
 
 from fastapi.testclient import TestClient
 
+import agentsdock_team_hub.cli as team_hub_cli
 from agentsdock_team_hub.cli import main as cli_main
+from agentsdock_team_hub.database import MIGRATIONS, _statements
 from agentsdock_team_hub.service import (
     MANAGED_SERVER_SESSION_SCOPE_KEY,
     create_app,
@@ -29,6 +34,72 @@ HOST_B = "server-host-b-12345678"
 
 
 class ManagedHostTests(unittest.TestCase):
+    @staticmethod
+    def run_rebase_until_crash(
+        data_dir: Path,
+        snapshot: Path,
+        *,
+        hub_id: str,
+        operation_id: str,
+        crash_point: str,
+    ) -> subprocess.CompletedProcess[str]:
+        script = r"""
+import os
+from pathlib import Path
+import sys
+from unittest import mock
+
+from agentsdock_team_hub.store import HubStore
+
+root = Path(sys.argv[1])
+target = Path(sys.argv[2])
+crash_point = sys.argv[5]
+original_replace = os.replace
+
+def replace_then_crash(source, destination):
+    original_replace(source, destination)
+    source_path = Path(source)
+    destination_path = Path(destination)
+    if (
+        crash_point == "retired"
+        and destination_path.name.startswith(".snapshot-rebase-")
+    ):
+        os._exit(81)
+    if (
+        crash_point == "published"
+        and destination_path == target
+        and source_path.name.startswith("snapshot_")
+    ):
+        os._exit(82)
+
+with mock.patch("agentsdock_team_hub.store.os.replace", side_effect=replace_then_crash):
+    HubStore.rebase_maintenance_snapshot(
+        root,
+        target,
+        expected_host_identity=sys.argv[6],
+        expected_hub_id=sys.argv[3],
+        expected_operation_id=sys.argv[4],
+    )
+sys.exit(10)
+"""
+        return subprocess.run(
+            [
+                sys.executable,
+                "-c",
+                script,
+                str(data_dir),
+                str(snapshot),
+                hub_id,
+                operation_id,
+                crash_point,
+                HOST_A,
+            ],
+            cwd=Path(__file__).parent,
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+
     @staticmethod
     def run_restore_until_crash(
         data_dir: Path,
@@ -114,6 +185,43 @@ sys.exit(10)
         )
 
     @staticmethod
+    def run_restore_cleanup_until_crash(
+        data_dir: Path,
+        *,
+        target_name: str,
+    ) -> subprocess.CompletedProcess[str]:
+        script = r"""
+import os
+from pathlib import Path
+import sys
+from unittest import mock
+
+from agentsdock_team_hub.store import HubStore
+
+data_dir = Path(sys.argv[1])
+target_name = sys.argv[2]
+original_unlink = Path.unlink
+
+def unlink_then_crash(path, *args, **kwargs):
+    result = original_unlink(path, *args, **kwargs)
+    if path.parent == data_dir and path.name == target_name:
+        os._exit(76 if target_name == ".restore-transaction.json" else 77)
+    return result
+
+with mock.patch.object(Path, "unlink", side_effect=unlink_then_crash, autospec=True):
+    with HubStore.maintenance_control_lock(data_dir):
+        pass
+raise SystemExit(10)
+"""
+        return subprocess.run(
+            [sys.executable, "-c", script, str(data_dir), target_name],
+            cwd=Path(__file__).parent,
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+
+    @staticmethod
     def run_recovery_until_crash(data_dir: Path) -> subprocess.CompletedProcess[str]:
         script = r"""
 import os
@@ -145,6 +253,58 @@ sys.exit(10)
 """
         return subprocess.run(
             [sys.executable, "-c", script, str(data_dir), HOST_A],
+            cwd=Path(__file__).parent,
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+
+    @staticmethod
+    def run_reactivation_restore_until_fence_crash(
+        data_dir: Path,
+        snapshot: Path,
+        *,
+        hub_id: str,
+        operation_id: str,
+    ) -> subprocess.CompletedProcess[str]:
+        script = r"""
+import os
+from pathlib import Path
+import sys
+from unittest import mock
+
+from agentsdock_team_hub.store import HubStore
+
+data_dir = Path(sys.argv[1])
+
+def crash_before_journal(*_args, **_kwargs):
+    os._exit(76)
+
+with mock.patch.object(
+    HubStore,
+    "_write_restore_transaction_journal",
+    side_effect=crash_before_journal,
+):
+    HubStore.restore_host_reactivation_snapshot(
+        data_dir,
+        Path(sys.argv[2]),
+        expected_host_identity=sys.argv[4],
+        expected_hub_id=sys.argv[3],
+        expected_operation_id=sys.argv[5],
+    )
+sys.exit(10)
+"""
+        return subprocess.run(
+            [
+                sys.executable,
+                "-c",
+                script,
+                str(data_dir),
+                str(snapshot),
+                hub_id,
+                HOST_A,
+                operation_id,
+            ],
             cwd=Path(__file__).parent,
             text=True,
             capture_output=True,
@@ -199,6 +359,109 @@ sys.exit(10)
                 self.assertEqual(health.status_code, 200, health.text)
                 self.assertFalse(health.json()["server_session_available"])
 
+    def test_managed_host_display_name_migrates_node_and_principal_idempotently(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            data_dir = Path(temporary) / "hub"
+            legacy = HubStore(
+                data_dir,
+                managed_host_identity=HOST_A,
+                managed_server_instance_id="managed-instance-a",
+            )
+            proof = legacy.bootstrap_proof_path.read_text().strip()
+            bundle = legacy.bootstrap(
+                proof,
+                "owner@example.com",
+                "Owner",
+                "Owner Mac",
+            )
+            team_id = bundle["teams"][0]["id"]
+
+            connection = legacy.connect()
+            try:
+                original = connection.execute(
+                    """
+                    SELECT n.id,n.principal_id,n.display_name,n.last_seen_at,
+                           p.display_name AS principal_display_name,p.updated_at
+                    FROM nodes AS n
+                    JOIN principals AS p ON p.id=n.principal_id
+                    WHERE n.server_identity=?
+                    """,
+                    (HOST_A,),
+                ).fetchone()
+            finally:
+                connection.close()
+            self.assertIsNotNone(original)
+            self.assertEqual(original["display_name"], "Team Hub host")
+            self.assertEqual(original["principal_display_name"], "Team Hub host")
+
+            migration_timestamp = 2_000_000_000
+            migrated = HubStore(
+                data_dir,
+                now=migration_timestamp,
+                managed_host_identity=HOST_A,
+                managed_server_instance_id="managed-instance-a",
+                managed_host_display_name="  Sonic  ",
+            )
+            claims = migrated.managed_server_claims()
+            projection = migrated.get_network(claims, team_id)
+            host = next(server for server in projection["servers"] if server["is_host"])
+            self.assertEqual(host["display_name"], "Sonic")
+            self.assertEqual(
+                migrated.get_network_server(claims, team_id, host["id"])["server"],
+                host,
+            )
+
+            connection = migrated.connect()
+            try:
+                first = connection.execute(
+                    """
+                    SELECT n.id,n.principal_id,n.display_name,n.last_seen_at,
+                           p.display_name AS principal_display_name,p.updated_at
+                    FROM nodes AS n
+                    JOIN principals AS p ON p.id=n.principal_id
+                    WHERE n.server_identity=?
+                    """,
+                    (HOST_A,),
+                ).fetchone()
+            finally:
+                connection.close()
+            self.assertEqual(first["id"], original["id"])
+            self.assertEqual(first["principal_id"], original["principal_id"])
+            self.assertEqual(first["display_name"], "Sonic")
+            self.assertEqual(first["principal_display_name"], "Sonic")
+            self.assertEqual(first["last_seen_at"], migration_timestamp)
+            self.assertEqual(first["updated_at"], migration_timestamp)
+
+            HubStore(
+                data_dir,
+                now=migration_timestamp + 1,
+                managed_host_identity=HOST_A,
+                managed_server_instance_id="managed-instance-a",
+                managed_host_display_name="Sonic",
+            )
+            connection = migrated.connect()
+            try:
+                second = connection.execute(
+                    """
+                    SELECT n.display_name,n.last_seen_at,
+                           p.display_name AS principal_display_name,p.updated_at
+                    FROM nodes AS n
+                    JOIN principals AS p ON p.id=n.principal_id
+                    WHERE n.server_identity=?
+                    """,
+                    (HOST_A,),
+                ).fetchone()
+            finally:
+                connection.close()
+            self.assertEqual(dict(second), {
+                "display_name": "Sonic",
+                "last_seen_at": migration_timestamp,
+                "principal_display_name": "Sonic",
+                "updated_at": migration_timestamp,
+            })
+
     def test_managed_server_session_is_distinct_host_bound_and_write_capable(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             data_dir = Path(temporary) / "hub"
@@ -251,19 +514,19 @@ sys.exit(10)
                     "idempotency_key": "managed-server-agent-register-0001",
                 },
             )["agent"]
-            sent = store.create_network_mailbox_item(
-                claims,
-                team_id,
-                {
-                    "to": {"kind": "server", "id": host["id"]},
-                    "from_agent_id": agent["id"],
-                    "body": "Managed server mailbox write",
-                    "body_format": "plain",
-                    "idempotency_key": "managed-server-mailbox-0001",
-                },
-            )
-            self.assertEqual(sent["item"]["from"]["kind"], "agent")
-            self.assertEqual(sent["item"]["from"]["id"], agent["id"])
+            with self.assertRaises(HubError) as retired_agent_author:
+                store.create_network_mailbox_item(
+                    claims,
+                    team_id,
+                    {
+                        "to": {"kind": "server", "id": host["id"]},
+                        "from_agent_id": agent["id"],
+                        "body": "Managed server mailbox write",
+                        "body_format": "plain",
+                        "idempotency_key": "managed-server-mailbox-0001",
+                    },
+                )
+            self.assertEqual(retired_agent_author.exception.code, "invalid_request")
 
             bulletin = store.create_network_bulletin_post(
                 claims,
@@ -444,9 +707,22 @@ sys.exit(10)
                 "network_agents_limit_per_server",
                 "network_bulletin_body_limit_on_insert",
                 "network_bulletin_body_limit_on_update",
+                "human_admin_page_device_session_insert",
+                "human_admin_page_invitation_insert",
+                "human_admin_page_membership_insert",
+                "human_admin_page_entries_immutable",
+                "human_admin_page_entries_cannot_be_deleted",
             ):
                 connection.execute(f"DROP TRIGGER {trigger}")
+            for index in (
+                "device_sessions_human_created_id_idx",
+                "invitations_pending_team_created_id_idx",
+                "memberships_active_team_created_principal_idx",
+                "memberships_manageable_team_created_principal_idx",
+            ):
+                connection.execute(f"DROP INDEX {index}")
             for table in (
+                "human_admin_page_entries",
                 "team_attachment_cleanup_queue",
                 "team_skill_versions",
                 "team_attachments",
@@ -481,7 +757,23 @@ sys.exit(10)
             connection.execute("DROP TRIGGER network_agents_limit_per_server")
             connection.execute("DROP TRIGGER network_bulletin_body_limit_on_insert")
             connection.execute("DROP TRIGGER network_bulletin_body_limit_on_update")
+            for trigger in (
+                "human_admin_page_device_session_insert",
+                "human_admin_page_invitation_insert",
+                "human_admin_page_membership_insert",
+                "human_admin_page_entries_immutable",
+                "human_admin_page_entries_cannot_be_deleted",
+            ):
+                connection.execute(f"DROP TRIGGER {trigger}")
+            for index in (
+                "device_sessions_human_created_id_idx",
+                "invitations_pending_team_created_id_idx",
+                "memberships_active_team_created_principal_idx",
+                "memberships_manageable_team_created_principal_idx",
+            ):
+                connection.execute(f"DROP INDEX {index}")
             for table in (
+                "human_admin_page_entries",
                 "team_attachment_cleanup_queue",
                 "team_skill_versions",
                 "team_attachments",
@@ -533,8 +825,22 @@ sys.exit(10)
         manifest_path.write_text(
             json.dumps(manifest, sort_keys=True, separators=(",", ":")) + "\n"
         )
+        cls.rebind_snapshot_fence_digest(store, snapshot)
         cls.downgrade_database_to_schema4(store.database_path)
         return snapshot
+
+    @staticmethod
+    def rebind_snapshot_fence_digest(store: HubStore, snapshot: Path) -> None:
+        """Keep an intentionally rewritten fixture bound to its test fence."""
+
+        marker = json.loads(store.maintenance_fence_path.read_text())
+        marker["snapshot_manifest_sha256"] = hashlib.sha256(
+            (snapshot / "manifest.json").read_bytes()
+        ).hexdigest()
+        store.maintenance_fence_path.write_text(
+            json.dumps(marker, sort_keys=True, separators=(",", ":")) + "\n"
+        )
+        store.maintenance_fence_path.chmod(0o600)
 
     def test_concurrent_first_bind_has_one_winner_and_foreign_copy_is_unchanged(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -633,6 +939,34 @@ sys.exit(10)
             generations = list((data_dir / "maintenance-backups").glob("snapshot_*"))
             self.assertEqual(len(generations), 3)
 
+    def test_snapshot_preserves_fenced_generation_and_cleans_abandoned_temp(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            data_dir = Path(temporary) / "hub"
+            store = HubStore(data_dir, managed_host_identity=HOST_A)
+            fenced = store.maintenance_snapshot_and_fence(
+                "server-update",
+                operation_id="update-protected",
+                keep=3,
+            )
+            backups = data_dir / "maintenance-backups"
+            abandoned = backups / ".snapshot_00000000000000000001_0123456789abcdef.tmp"
+            abandoned.mkdir(mode=0o700)
+            orphan = abandoned / "orphan.bin"
+            orphan.write_bytes(b"unfinished")
+            orphan.chmod(0o600)
+            unrelated = backups / ".snapshot_not_a_generation.tmp"
+            unrelated.mkdir(mode=0o700)
+
+            for index in range(4):
+                store.maintenance_snapshot(f"forced-restart-{index}", keep=3)
+
+            self.assertTrue(fenced.is_dir())
+            self.assertFalse(abandoned.exists())
+            self.assertTrue(unrelated.is_dir())
+            generations = list(backups.glob("snapshot_*"))
+            self.assertEqual(len(generations), 4)
+            self.assertIn(fenced, generations)
+
     def test_snapshot_restores_ready_and_resumable_attachment_generation(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             data_dir = Path(temporary) / "hub"
@@ -719,7 +1053,10 @@ sys.exit(10)
 
             live_ready = data_dir / "attachments" / ready_digest[:2] / ready_digest
             live_pending = data_dir / "attachments" / "uploads" / f"{pending['id']}.part"
-            live_ready.write_bytes(b"x" * len(ready_bytes))
+            replacement_ready = live_ready.with_name(f".{live_ready.name}.replacement")
+            replacement_ready.write_bytes(b"x" * len(ready_bytes))
+            replacement_ready.chmod(0o600)
+            os.replace(replacement_ready, live_ready)
             live_pending.write_bytes(b"y" * len(prefix))
             extra = data_dir / "attachments" / "uploads" / "newer.part"
             extra.write_bytes(b"newer generation")
@@ -855,7 +1192,10 @@ sys.exit(10)
             live_path = data_dir / "attachments" / digest[:2] / digest
             changed = b"changed attachment!"
             self.assertEqual(len(changed), len(payload))
-            live_path.write_bytes(changed)
+            replacement = live_path.with_name(f".{live_path.name}.candidate")
+            replacement.write_bytes(changed)
+            replacement.chmod(0o600)
+            os.replace(replacement, live_path)
             live_before = {
                 "database": store.database_path.read_bytes(),
                 "key": store.signing_key_path.read_bytes(),
@@ -887,6 +1227,156 @@ sys.exit(10)
             self.assertEqual(store.maintenance_fence_path.read_bytes(), live_before["fence"])
             self.assertEqual(live_path.read_bytes(), live_before["attachment"])
             self.assertEqual(list(data_dir.glob(".restore-*")), [])
+
+    def test_ready_snapshot_uses_hardlink_but_partial_upload_is_independent(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            data_dir = Path(temporary) / "hub"
+            store = HubStore(data_dir, managed_host_identity=HOST_A)
+            proof = store.bootstrap_proof_path.read_text().strip()
+            bundle = store.bootstrap(
+                proof,
+                "owner@example.com",
+                "Owner",
+                "Owner Mac",
+            )
+            claims = store.verify_access(bundle["access_token"])
+            team_id = bundle["teams"][0]["id"]
+
+            ready_bytes = b"immutable ready attachment"
+            ready_digest = hashlib.sha256(ready_bytes).hexdigest()
+            ready = store.declare_team_attachment(
+                claims,
+                team_id,
+                {
+                    "file_name": "ready.txt",
+                    "media_type": "text/plain",
+                    "byte_size": len(ready_bytes),
+                    "sha256": ready_digest,
+                    "idempotency_key": "hardlink-ready-attachment",
+                },
+            )["attachment"]
+            store.write_team_attachment_chunk(
+                claims,
+                team_id,
+                ready["id"],
+                offset=0,
+                total=len(ready_bytes),
+                data=ready_bytes,
+            )
+
+            intended_partial = b"mutable partial upload that is not complete"
+            received_partial = intended_partial[:13]
+            partial_digest = hashlib.sha256(intended_partial).hexdigest()
+            partial = store.declare_team_attachment(
+                claims,
+                team_id,
+                {
+                    "file_name": "partial.txt",
+                    "media_type": "text/plain",
+                    "byte_size": len(intended_partial),
+                    "sha256": partial_digest,
+                    "idempotency_key": "copied-partial-attachment",
+                },
+            )["attachment"]
+            store.write_team_attachment_chunk(
+                claims,
+                team_id,
+                partial["id"],
+                offset=0,
+                total=len(intended_partial),
+                data=received_partial,
+            )
+
+            snapshot = store.maintenance_snapshot_and_fence(
+                "server-update",
+                operation_id="update-hardlink-attachments",
+            )
+            live_ready = data_dir / "attachments" / ready_digest[:2] / ready_digest
+            saved_ready = snapshot / "attachments" / ready_digest[:2] / ready_digest
+            live_partial = data_dir / "attachments" / "uploads" / f"{partial['id']}.part"
+            saved_partial = snapshot / "attachments" / "uploads" / f"{partial['id']}.part"
+
+            self.assertEqual(
+                (live_ready.stat().st_dev, live_ready.stat().st_ino),
+                (saved_ready.stat().st_dev, saved_ready.stat().st_ino),
+            )
+            self.assertGreaterEqual(live_ready.stat().st_nlink, 2)
+            self.assertNotEqual(
+                (live_partial.stat().st_dev, live_partial.stat().st_ino),
+                (saved_partial.stat().st_dev, saved_partial.stat().st_ino),
+            )
+
+            # Reclaiming the live content name only decrements the link count;
+            # the rollback generation remains complete and can recreate it.
+            store._unlink_team_attachment_cleanup_path("content", ready_digest)
+            self.assertFalse(live_ready.exists())
+            self.assertEqual(saved_ready.read_bytes(), ready_bytes)
+            HubStore.restore_maintenance_snapshot(
+                data_dir,
+                snapshot,
+                expected_host_identity=HOST_A,
+                expected_hub_id=store.hub_id,
+                expected_operation_id="update-hardlink-attachments",
+            )
+            self.assertEqual(live_ready.read_bytes(), ready_bytes)
+            self.assertEqual(
+                (live_ready.stat().st_dev, live_ready.stat().st_ino),
+                (saved_ready.stat().st_dev, saved_ready.stat().st_ino),
+            )
+            self.assertEqual(live_partial.read_bytes(), received_partial)
+            self.assertNotEqual(
+                (live_partial.stat().st_dev, live_partial.stat().st_ino),
+                (saved_partial.stat().st_dev, saved_partial.stat().st_ino),
+            )
+
+    def test_ready_snapshot_falls_back_to_copy_when_hardlinks_are_unavailable(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            data_dir = Path(temporary) / "hub"
+            store = HubStore(data_dir, managed_host_identity=HOST_A)
+            proof = store.bootstrap_proof_path.read_text().strip()
+            bundle = store.bootstrap(
+                proof,
+                "owner@example.com",
+                "Owner",
+                "Owner Mac",
+            )
+            claims = store.verify_access(bundle["access_token"])
+            team_id = bundle["teams"][0]["id"]
+            payload = b"copy fallback attachment"
+            digest = hashlib.sha256(payload).hexdigest()
+            attachment = store.declare_team_attachment(
+                claims,
+                team_id,
+                {
+                    "file_name": "fallback.txt",
+                    "media_type": "text/plain",
+                    "byte_size": len(payload),
+                    "sha256": digest,
+                    "idempotency_key": "hardlink-fallback-attachment",
+                },
+            )["attachment"]
+            store.write_team_attachment_chunk(
+                claims,
+                team_id,
+                attachment["id"],
+                offset=0,
+                total=len(payload),
+                data=payload,
+            )
+
+            with mock.patch(
+                "agentsdock_team_hub.store.os.link",
+                side_effect=OSError(errno.EXDEV, "cross-device link"),
+            ):
+                snapshot = store.maintenance_snapshot("hardlink-fallback")
+
+            live = data_dir / "attachments" / digest[:2] / digest
+            saved = snapshot / "attachments" / digest[:2] / digest
+            self.assertEqual(saved.read_bytes(), payload)
+            self.assertNotEqual(
+                (live.stat().st_dev, live.stat().st_ino),
+                (saved.stat().st_dev, saved.stat().st_ino),
+            )
 
     def test_restore_crash_recovery_rolls_back_or_commits_one_exact_generation(self) -> None:
         expected_exit = {"retire": 71, "install": 72, "commit": 73}
@@ -990,7 +1480,38 @@ sys.exit(10)
                         (data_dir / ".restore-transaction.json").exists()
                     )
 
-                recovered = HubStore(data_dir, managed_host_identity=HOST_A)
+                with HubStore.maintenance_control_lock(data_dir):
+                    pass
+                marker_path = data_dir / "maintenance-fence.json"
+                if marker_path.exists():
+                    marker = json.loads(marker_path.read_text())
+                    recovered = HubStore(
+                        data_dir,
+                        managed_host_identity=HOST_A,
+                        managed_update_hub_id=store.hub_id,
+                        managed_update_operation_id=operation_id,
+                        managed_update_snapshot=snapshot,
+                    )
+                else:
+                    with self.assertRaisesRegex(
+                        RuntimeError, "rollback settlement is pending"
+                    ):
+                        HubStore(data_dir, managed_host_identity=HOST_A)
+                    HubStore.confirm_restored_maintenance_snapshot(
+                        data_dir,
+                        snapshot,
+                        expected_host_identity=HOST_A,
+                        expected_hub_id=store.hub_id,
+                        expected_operation_id=operation_id,
+                    )
+                    HubStore.acknowledge_restored_maintenance_snapshot(
+                        data_dir,
+                        snapshot,
+                        expected_host_identity=HOST_A,
+                        expected_hub_id=store.hub_id,
+                        expected_operation_id=operation_id,
+                    )
+                    recovered = HubStore(data_dir, managed_host_identity=HOST_A)
                 connection = recovered.connect()
                 try:
                     attachment_ids = {
@@ -1026,10 +1547,88 @@ sys.exit(10)
 
                 # Recovery is a no-op after completion and cannot flip the
                 # chosen generation on a later open.
-                reopened = HubStore(data_dir, managed_host_identity=HOST_A)
+                if marker_path.exists():
+                    reopened = HubStore(
+                        data_dir,
+                        managed_host_identity=HOST_A,
+                        managed_update_hub_id=store.hub_id,
+                        managed_update_operation_id=operation_id,
+                        managed_update_snapshot=snapshot,
+                    )
+                else:
+                    reopened = HubStore(data_dir, managed_host_identity=HOST_A)
                 self.assertEqual(
                     reopened.maintenance_fence() is None,
                     crash_point == "commit",
+                )
+
+    def test_prepared_restore_cleanup_retires_journal_before_receipt(self) -> None:
+        cuts = {
+            ".restore-transaction.json": 76,
+            ".restore-completion.json": 77,
+        }
+        for target_name, expected_exit in cuts.items():
+            with self.subTest(target=target_name), tempfile.TemporaryDirectory() as temporary:
+                data_dir = Path(temporary) / "hub"
+                store = HubStore(data_dir, managed_host_identity=HOST_A)
+                operation_id = f"restore-cleanup-{expected_exit}"
+                snapshot = store.maintenance_snapshot_and_fence(
+                    "server-update",
+                    operation_id=operation_id,
+                )
+                crashed_restore = self.run_restore_until_crash(
+                    data_dir,
+                    snapshot,
+                    hub_id=store.hub_id,
+                    operation_id=operation_id,
+                    crash_point="retire",
+                )
+                self.assertEqual(crashed_restore.returncode, 71, crashed_restore.stderr)
+
+                crashed_cleanup = self.run_restore_cleanup_until_crash(
+                    data_dir,
+                    target_name=target_name,
+                )
+                self.assertEqual(
+                    crashed_cleanup.returncode,
+                    expected_exit,
+                    crashed_cleanup.stderr,
+                )
+                self.assertFalse(
+                    (data_dir / ".restore-transaction.json").exists()
+                )
+                self.assertEqual(
+                    (data_dir / ".restore-completion.json").exists(),
+                    target_name == ".restore-transaction.json",
+                )
+                self.assertTrue((data_dir / "maintenance-fence.json").exists())
+
+                # The exact retry either adopts the surviving prepared receipt
+                # or starts clean after both controls were durably retired.
+                HubStore.restore_maintenance_snapshot(
+                    data_dir,
+                    snapshot,
+                    expected_host_identity=HOST_A,
+                    expected_hub_id=store.hub_id,
+                    expected_operation_id=operation_id,
+                )
+                HubStore.confirm_restored_maintenance_snapshot(
+                    data_dir,
+                    snapshot,
+                    expected_host_identity=HOST_A,
+                    expected_hub_id=store.hub_id,
+                    expected_operation_id=operation_id,
+                )
+                HubStore.acknowledge_restored_maintenance_snapshot(
+                    data_dir,
+                    snapshot,
+                    expected_host_identity=HOST_A,
+                    expected_hub_id=store.hub_id,
+                    expected_operation_id=operation_id,
+                )
+                self.assertEqual(
+                    HubStore(data_dir, managed_host_identity=HOST_A).hub_id,
+                    store.hub_id,
                 )
 
     def test_invalid_restore_journal_fails_closed_before_database_preflight(self) -> None:
@@ -1080,13 +1679,52 @@ sys.exit(10)
             self.assertEqual(crashed.returncode, 75, crashed.stderr)
             self.assertFalse((data_dir / ".restore-transaction.json").exists())
             self.assertEqual(len(list(data_dir.glob(".restore-[0-9]*-*"))), 1)
-
-            recovered = HubStore(data_dir, managed_host_identity=HOST_A)
-            self.assertEqual(recovered.hub_id, hub_id)
             self.assertEqual(store.database_path.read_bytes(), live_before["database"])
             self.assertEqual(store.signing_key_path.read_bytes(), live_before["key"])
             self.assertEqual(store.bootstrap_proof_path.read_bytes(), live_before["proof"])
             self.assertEqual(store.maintenance_fence_path.read_bytes(), live_before["fence"])
+
+            with self.assertRaisesRegex(
+                RuntimeError, "rollback settlement is pending"
+            ):
+                HubStore(
+                    data_dir,
+                    managed_host_identity=HOST_A,
+                    managed_update_hub_id=hub_id,
+                    managed_update_operation_id=operation_id,
+                    managed_update_snapshot=snapshot,
+                )
+            HubStore.restore_maintenance_snapshot(
+                data_dir,
+                snapshot,
+                expected_host_identity=HOST_A,
+                expected_hub_id=hub_id,
+                expected_operation_id=operation_id,
+            )
+            HubStore.confirm_restored_maintenance_snapshot(
+                data_dir,
+                snapshot,
+                expected_host_identity=HOST_A,
+                expected_hub_id=hub_id,
+                expected_operation_id=operation_id,
+            )
+            HubStore.acknowledge_restored_maintenance_snapshot(
+                data_dir,
+                snapshot,
+                expected_host_identity=HOST_A,
+                expected_hub_id=hub_id,
+                expected_operation_id=operation_id,
+            )
+            recovered = HubStore(data_dir, managed_host_identity=HOST_A)
+            self.assertEqual(recovered.hub_id, hub_id)
+            manifest = json.loads((snapshot / "manifest.json").read_text())
+            self.assertEqual(
+                hashlib.sha256(store.database_path.read_bytes()).hexdigest(),
+                manifest["database_sha256"],
+            )
+            self.assertEqual(store.signing_key_path.read_bytes(), live_before["key"])
+            self.assertEqual(store.bootstrap_proof_path.read_bytes(), live_before["proof"])
+            self.assertFalse(store.maintenance_fence_path.exists())
             self.assertEqual(list(data_dir.glob(".restore-[0-9]*-*")), [])
 
             reopened = HubStore(data_dir, managed_host_identity=HOST_A)
@@ -1231,9 +1869,91 @@ sys.exit(10)
             self.assertFalse((data_dir / "team-hub.sqlite3-wal").exists())
             self.assertFalse((data_dir / "team-hub.sqlite3-shm").exists())
             self.assertFalse(store.maintenance_fence_path.exists())
+            with self.assertRaisesRegex(
+                RuntimeError, "rollback settlement is pending"
+            ):
+                HubStore(data_dir, managed_host_identity=HOST_A)
+            HubStore.confirm_restored_maintenance_snapshot(
+                data_dir,
+                snapshot,
+                expected_host_identity=HOST_A,
+                expected_hub_id=hub_id,
+                expected_operation_id="update-restore",
+            )
+            HubStore.acknowledge_restored_maintenance_snapshot(
+                data_dir,
+                snapshot,
+                expected_host_identity=HOST_A,
+                expected_hub_id=hub_id,
+                expected_operation_id="update-restore",
+            )
             restored = HubStore(data_dir, managed_host_identity=HOST_A)
             self.assertEqual(restored.hub_id, hub_id)
             self.assertTrue(restored.health()["bootstrap_required"])
+
+    def test_restore_receipt_is_exact_generation_bound_and_idempotently_acknowledged(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            data_dir = Path(temporary) / "hub"
+            store = HubStore(data_dir, managed_host_identity=HOST_A)
+            operation_id = "update-receipt-exact"
+            snapshot = store.maintenance_snapshot_and_fence(
+                "server-update",
+                operation_id=operation_id,
+            )
+            HubStore.restore_maintenance_snapshot(
+                data_dir,
+                snapshot,
+                expected_host_identity=HOST_A,
+                expected_hub_id=store.hub_id,
+                expected_operation_id=operation_id,
+            )
+            receipt_path = data_dir / ".restore-completion.json"
+            receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+            self.assertEqual(receipt["state"], "committed")
+            self.assertEqual(receipt["operation_id"], operation_id)
+            self.assertEqual(receipt["snapshot"], snapshot.name)
+            self.assertEqual(
+                receipt["snapshot_manifest_sha256"],
+                hashlib.sha256((snapshot / "manifest.json").read_bytes()).hexdigest(),
+            )
+            with self.assertRaisesRegex(RuntimeError, "does not match"):
+                HubStore.confirm_restored_maintenance_snapshot(
+                    data_dir,
+                    snapshot,
+                    expected_host_identity=HOST_A,
+                    expected_hub_id=store.hub_id,
+                    expected_operation_id="update-receipt-foreign",
+                )
+            self.assertTrue(receipt_path.exists())
+            HubStore.confirm_restored_maintenance_snapshot(
+                data_dir,
+                snapshot,
+                expected_host_identity=HOST_A,
+                expected_hub_id=store.hub_id,
+                expected_operation_id=operation_id,
+            )
+            HubStore.acknowledge_restored_maintenance_snapshot(
+                data_dir,
+                snapshot,
+                expected_host_identity=HOST_A,
+                expected_hub_id=store.hub_id,
+                expected_operation_id=operation_id,
+            )
+            self.assertFalse(receipt_path.exists())
+            HubStore.acknowledge_restored_maintenance_snapshot(
+                data_dir,
+                snapshot,
+                expected_host_identity=HOST_A,
+                expected_hub_id=store.hub_id,
+                expected_operation_id=operation_id,
+                allow_missing=True,
+            )
+            self.assertEqual(
+                HubStore(data_dir, managed_host_identity=HOST_A).hub_id,
+                store.hub_id,
+            )
 
     def test_schema4_snapshot_verifies_restores_exactly_then_migrates_safely(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -1295,13 +2015,27 @@ sys.exit(10)
             finally:
                 legacy.close()
 
+            HubStore.confirm_restored_maintenance_snapshot(
+                data_dir,
+                snapshot,
+                expected_host_identity=HOST_A,
+                expected_hub_id=hub_id,
+                expected_operation_id=operation_id,
+            )
+            HubStore.acknowledge_restored_maintenance_snapshot(
+                data_dir,
+                snapshot,
+                expected_host_identity=HOST_A,
+                expected_hub_id=hub_id,
+                expected_operation_id=operation_id,
+            )
             migrated = HubStore(data_dir, managed_host_identity=HOST_A)
             self.assertEqual(migrated.hub_id, hub_id)
             self.assertEqual(migrated.signing_key_path.read_bytes(), expected_key)
             self.assertEqual(migrated.bootstrap_proof_path.read_bytes(), expected_proof)
             connection = migrated.connect()
             try:
-                self.assertEqual(connection.execute("PRAGMA user_version").fetchone()[0], 10)
+                self.assertEqual(connection.execute("PRAGMA user_version").fetchone()[0], 11)
                 self.assertEqual(
                     connection.execute(
                         "SELECT count(*) FROM bootstrap_delegations"
@@ -1395,7 +2129,7 @@ sys.exit(10)
                 try:
                     self.assertEqual(
                         connection.execute("PRAGMA user_version").fetchone()[0],
-                        10,
+                        11,
                     )
                     preserved = connection.execute(
                         "SELECT * FROM channels WHERE id=?", (old_board_id,)
@@ -1589,6 +2323,7 @@ sys.exit(10)
             manifest_path.write_text(
                 json.dumps(manifest, sort_keys=True, separators=(",", ":")) + "\n"
             )
+            self.rebind_snapshot_fence_digest(store, snapshot)
 
             with self.assertRaisesRegex(
                 RuntimeError,
@@ -1734,6 +2469,596 @@ sys.exit(10)
                     ]
                 )
             self.assertEqual(allowed, 0)
+
+    def test_schema4_reactivation_and_failed_start_repair_snapshot_without_migration(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            data_dir = Path(temporary) / "hub"
+            store = HubStore(data_dir, managed_host_identity=HOST_A)
+            hub_id = store.hub_id
+            expected_key = store.signing_key_path.read_bytes()
+            expected_proof = store.bootstrap_proof_path.read_bytes()
+            self.downgrade_database_to_schema4(store.database_path)
+            expected_database = store.database_path.read_bytes()
+
+            (
+                prepared_hub_id,
+                snapshot,
+                operation_id,
+                _fence_device,
+                _fence_inode,
+            ) = HubStore.prepare_managed_host_reactivation(
+                data_dir,
+                expected_host_identity=HOST_A,
+            )
+            HubStore.adopt_prepared_host_reactivation(
+                data_dir,
+                expected_host_identity=HOST_A,
+                expected_hub_id=hub_id,
+                expected_operation_id=operation_id,
+                expected_snapshot=snapshot,
+                expected_device=_fence_device,
+                expected_inode=_fence_inode,
+            )
+
+            self.assertEqual(prepared_hub_id, hub_id)
+            self.assertEqual(store.database_path.read_bytes(), expected_database)
+            self.assertEqual(store.signing_key_path.read_bytes(), expected_key)
+            self.assertEqual(store.bootstrap_proof_path.read_bytes(), expected_proof)
+            manifest = json.loads((snapshot / "manifest.json").read_text())
+            self.assertEqual(manifest["schema_version"], 4)
+            self.assertEqual(manifest["reason"], "host-reactivation")
+            self.assertEqual(
+                (snapshot / "proofs" / "bootstrap-owner.proof").read_bytes(),
+                expected_proof,
+            )
+            snapshot_database = sqlite3.connect(
+                f"file:{snapshot / 'team-hub.sqlite3'}?mode=ro&immutable=1",
+                uri=True,
+            )
+            try:
+                self.assertEqual(
+                    snapshot_database.execute("PRAGMA user_version").fetchone()[0],
+                    4,
+                )
+                self.assertIsNone(
+                    snapshot_database.execute(
+                        "SELECT 1 FROM sqlite_master WHERE type='table' "
+                        "AND name='bootstrap_delegations'"
+                    ).fetchone()
+                )
+            finally:
+                snapshot_database.close()
+            HubStore.verify_host_reactivation_snapshot(
+                data_dir,
+                snapshot,
+                expected_host_identity=HOST_A,
+                expected_hub_id=hub_id,
+                expected_operation_id=operation_id,
+            )
+
+    def test_rejected_reactivation_never_publishes_or_prunes_backup_history(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            data_dir = Path(temporary) / "hub"
+            store = HubStore(data_dir, managed_host_identity=HOST_A)
+            for index in range(3):
+                store.maintenance_snapshot(f"known-good-{index}", keep=3)
+            backups = data_dir / "maintenance-backups"
+            before = {
+                path.relative_to(backups).as_posix(): path.read_bytes()
+                for path in backups.rglob("*")
+                if path.is_file()
+            }
+            self.assertEqual(
+                len({name.split("/", 1)[0] for name in before}),
+                3,
+            )
+            connection = sqlite3.connect(store.database_path, isolation_level=None)
+            try:
+                connection.execute(
+                    "UPDATE schema_migrations SET sha256=? WHERE version=4",
+                    ("0" * 64,),
+                )
+                connection.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+            finally:
+                connection.close()
+
+            for _attempt in range(5):
+                with self.assertRaisesRegex(
+                    RuntimeError, "snapshot migration ledger is invalid"
+                ):
+                    HubStore.prepare_managed_host_reactivation(
+                        data_dir,
+                        expected_host_identity=HOST_A,
+                    )
+                self.assertEqual(
+                    {
+                        path.relative_to(backups).as_posix(): path.read_bytes()
+                        for path in backups.rglob("*")
+                        if path.is_file()
+                    },
+                    before,
+                )
+                self.assertFalse(
+                    any(path.name.startswith(".snapshot_") for path in backups.iterdir())
+                )
+
+    def test_explicit_host_reactivation_verifies_binding_and_snapshots_first(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            state_dir = root / "state"
+            state_dir.mkdir(mode=0o700)
+            identity = "a" * 24
+            identity_path = state_dir / "server-identity"
+            identity_path.write_text(identity + "\n")
+            identity_path.chmod(0o600)
+            data_dir = state_dir / "team-hub"
+            store = HubStore(data_dir, managed_host_identity=identity)
+
+            output = io.StringIO()
+            with mock.patch("sys.stdout", output):
+                result = cli_main(
+                    [
+                        "prepare-host-reactivation",
+                        "--data-dir",
+                        str(data_dir),
+                        "--server-state-dir",
+                        str(state_dir),
+                    ]
+                )
+            self.assertEqual(result, 0)
+            lines = output.getvalue().splitlines()
+            self.assertEqual(lines[0], identity)
+            self.assertEqual(lines[1], store.hub_id)
+            operation_id = lines[2]
+            self.assertRegex(operation_id, r"^host-reactivation-[0-9a-f]{24}$")
+            snapshot = Path(lines[3])
+            self.assertTrue(snapshot.is_dir())
+            manifest = json.loads((snapshot / "manifest.json").read_text())
+            self.assertEqual(manifest["reason"], "host-reactivation")
+            self.assertEqual(manifest["host_server_identity"], identity)
+            marker = store.maintenance_fence()
+            self.assertIsNotNone(marker)
+            self.assertEqual(marker["reason"], "host-reactivation")
+            self.assertEqual(marker["operation_id"], operation_id)
+            self.assertEqual(marker["snapshot"], snapshot.name)
+
+            # The snapshot and its source generation are one fenced unit.
+            # A supported local-control mutation after preflight must not mint
+            # state that a later rollback could silently erase/resurrect.
+            database_before_control = store.database_path.read_bytes()
+            proof_before_control = store.bootstrap_proof_path.read_bytes()
+            with mock.patch("sys.stderr"):
+                control_denied = cli_main(
+                    [
+                        "bootstrap-proof",
+                        "--data-dir",
+                        str(data_dir),
+                    ]
+                )
+            self.assertEqual(control_denied, 2)
+            self.assertEqual(store.database_path.read_bytes(), database_before_control)
+            self.assertEqual(store.bootstrap_proof_path.read_bytes(), proof_before_control)
+
+            foreign_dir = root / "foreign-hub"
+            foreign = HubStore(
+                foreign_dir,
+                managed_host_identity="b" * 24,
+            )
+            database_before = foreign.database_path.read_bytes()
+            generations_before = list(
+                (foreign_dir / "maintenance-backups").glob("snapshot_*")
+            ) if (foreign_dir / "maintenance-backups").exists() else []
+            with mock.patch("sys.stderr"):
+                denied = cli_main(
+                    [
+                        "prepare-host-reactivation",
+                        "--data-dir",
+                        str(foreign_dir),
+                        "--server-state-dir",
+                        str(state_dir),
+                    ]
+                )
+            self.assertEqual(denied, 2)
+            self.assertEqual(foreign.database_path.read_bytes(), database_before)
+            generations_after = list(
+                (foreign_dir / "maintenance-backups").glob("snapshot_*")
+            ) if (foreign_dir / "maintenance-backups").exists() else []
+            self.assertEqual(generations_after, generations_before)
+
+    def test_reactivation_preflight_failure_never_leaks_an_unowned_fence(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            state_dir = root / "state"
+            state_dir.mkdir(mode=0o700)
+            identity = "c" * 24
+            identity_path = state_dir / "server-identity"
+            identity_path.write_text(identity + "\n")
+            identity_path.chmod(0o600)
+            data_dir = state_dir / "team-hub"
+            HubStore(data_dir, managed_host_identity=identity)
+
+            original_fsync = HubStore._fsync_directory
+            injected = False
+
+            def fail_first_marker_fsync(path):
+                nonlocal injected
+                candidate = Path(path)
+                if (
+                    not injected
+                    and candidate == data_dir
+                    and (data_dir / "maintenance-fence.json").exists()
+                ):
+                    injected = True
+                    raise OSError("injected marker directory fsync failure")
+                return original_fsync(path)
+
+            with mock.patch.object(
+                HubStore,
+                "_fsync_directory",
+                side_effect=fail_first_marker_fsync,
+            ):
+                with self.assertRaisesRegex(OSError, "marker directory fsync"):
+                    HubStore.prepare_managed_host_reactivation(
+                        data_dir,
+                        expected_host_identity=identity,
+                    )
+            self.assertTrue(injected)
+            self.assertFalse((data_dir / "maintenance-fence.json").exists())
+
+            with mock.patch.object(
+                HubStore,
+                "_maintenance_fence_control_unlocked",
+                side_effect=RuntimeError("injected marker verification failure"),
+            ):
+                with self.assertRaisesRegex(RuntimeError, "marker verification"):
+                    HubStore.prepare_managed_host_reactivation(
+                        data_dir,
+                        expected_host_identity=identity,
+                    )
+            self.assertFalse((data_dir / "maintenance-fence.json").exists())
+
+            with (
+                mock.patch.object(
+                    team_hub_cli,
+                    "_persist_server_identity",
+                    side_effect=RuntimeError("injected identity persistence failure"),
+                ),
+                mock.patch("sys.stderr"),
+            ):
+                self.assertEqual(
+                    cli_main(
+                        [
+                            "prepare-host-reactivation",
+                            "--data-dir",
+                            str(data_dir),
+                            "--server-state-dir",
+                            str(state_dir),
+                        ]
+                    ),
+                    2,
+                )
+            self.assertFalse((data_dir / "maintenance-fence.json").exists())
+
+    def test_host_reactivation_seeds_the_matching_legacy_server_identity(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            state_dir = Path(temporary) / "state"
+            state_dir.mkdir(mode=0o700)
+            identity = team_hub_cli._legacy_server_identity(state_dir)
+            data_dir = state_dir / "team-hub"
+            HubStore(data_dir, managed_host_identity=identity)
+
+            with mock.patch("sys.stdout", io.StringIO()):
+                result = cli_main(
+                    [
+                        "prepare-host-reactivation",
+                        "--data-dir",
+                        str(data_dir),
+                        "--server-state-dir",
+                        str(state_dir),
+                    ]
+                )
+            self.assertEqual(result, 0)
+            identity_path = state_dir / "server-identity"
+            self.assertEqual(identity_path.read_text().strip(), identity)
+            self.assertEqual(stat.S_IMODE(identity_path.stat().st_mode), 0o600)
+
+    def test_server_identity_persistence_overrides_restrictive_umask(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            state_dir = Path(temporary) / "state"
+            state_dir.mkdir(mode=0o700)
+            identity_path = state_dir / "server-identity"
+            identity = "a" * 24
+            prior_umask = os.umask(0o777)
+            try:
+                persisted = team_hub_cli._persist_server_identity(
+                    identity_path,
+                    identity,
+                )
+            finally:
+                os.umask(prior_umask)
+
+            self.assertEqual(persisted, identity)
+            self.assertEqual(identity_path.read_text().strip(), identity)
+            self.assertEqual(stat.S_IMODE(identity_path.stat().st_mode), 0o600)
+
+            failed_path = state_dir / "failed-server-identity"
+            with mock.patch.object(
+                team_hub_cli,
+                "_read_server_identity_file",
+                side_effect=PermissionError("forced validation failure"),
+            ):
+                with self.assertRaisesRegex(
+                    PermissionError,
+                    "forced validation failure",
+                ):
+                    team_hub_cli._persist_server_identity(
+                        failed_path,
+                        "b" * 24,
+                    )
+            self.assertFalse(failed_path.exists())
+            self.assertEqual(list(state_dir.glob(".failed-server-identity.*.tmp")), [])
+
+    def test_host_reactivation_snapshots_legacy_wal_without_migrating_source(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            state_dir = Path(temporary) / "state"
+            state_dir.mkdir(mode=0o700)
+            identity = "c" * 24
+            identity_path = state_dir / "server-identity"
+            identity_path.write_text(identity + "\n")
+            identity_path.chmod(0o600)
+            data_dir = state_dir / "team-hub"
+            data_dir.mkdir(mode=0o700)
+            database = data_dir / "team-hub.sqlite3"
+            connection = sqlite3.connect(database, isolation_level=None)
+            try:
+                connection.execute("PRAGMA journal_mode = WAL")
+                connection.execute("PRAGMA wal_autocheckpoint = 0")
+                connection.execute(
+                    """
+                    CREATE TABLE schema_migrations (
+                        version INTEGER PRIMARY KEY,
+                        name TEXT NOT NULL,
+                        sha256 TEXT NOT NULL CHECK(length(sha256) = 64),
+                        applied_at INTEGER NOT NULL
+                    )
+                    """
+                )
+                connection.execute("BEGIN IMMEDIATE")
+                for migration in MIGRATIONS[:5]:
+                    for statement in _statements(migration.source):
+                        connection.execute(statement)
+                    connection.execute(
+                        """
+                        INSERT INTO schema_migrations(version,name,sha256,applied_at)
+                        VALUES (?,?,?,1)
+                        """,
+                        (migration.version, migration.name, migration.sha256),
+                    )
+                    connection.execute(f"PRAGMA user_version = {migration.version}")
+                hub_id = "hub_legacy_reactivation_12345678"
+                connection.execute(
+                    "INSERT INTO hub_metadata(singleton,hub_id,created_at) VALUES (1,?,1)",
+                    (hub_id,),
+                )
+                connection.execute(
+                    """
+                    INSERT INTO managed_host_bindings(
+                        singleton,hub_id,server_identity,created_at
+                    ) VALUES (1,?,?,1)
+                    """,
+                    (hub_id, identity),
+                )
+                connection.execute("COMMIT")
+                database.chmod(0o600)
+                wal = data_dir / "team-hub.sqlite3-wal"
+                wal.chmod(0o600)
+                key = data_dir / "access-token-signing.key"
+                key.write_bytes(os.urandom(32))
+                key.chmod(0o600)
+                database_before = database.read_bytes()
+                wal_before = wal.read_bytes()
+
+                with self.assertRaisesRegex(RuntimeError, "different AgentsServer"):
+                    HubStore.prepare_managed_host_reactivation(
+                        data_dir,
+                        expected_host_identity="d" * 24,
+                    )
+                self.assertEqual(database.read_bytes(), database_before)
+                self.assertEqual(wal.read_bytes(), wal_before)
+
+                output = io.StringIO()
+                with mock.patch("sys.stdout", output):
+                    result = cli_main(
+                        [
+                            "prepare-host-reactivation",
+                            "--data-dir",
+                            str(data_dir),
+                            "--server-state-dir",
+                            str(state_dir),
+                        ]
+                    )
+                self.assertEqual(result, 0)
+                (
+                    result_identity,
+                    result_hub,
+                    operation_id,
+                    raw_snapshot,
+                    raw_fence_device,
+                    raw_fence_inode,
+                ) = output.getvalue().splitlines()
+                self.assertEqual(result_identity, identity)
+                self.assertEqual(result_hub, hub_id)
+                self.assertEqual(database.read_bytes(), database_before)
+                self.assertEqual(wal.read_bytes(), wal_before)
+                snapshot = Path(raw_snapshot)
+                self.assertGreaterEqual(int(raw_fence_device), 0)
+                self.assertGreater(int(raw_fence_inode), 0)
+                manifest = json.loads((snapshot / "manifest.json").read_text())
+                self.assertEqual(manifest["schema_version"], 5)
+                self.assertEqual(manifest["reason"], "host-reactivation")
+                self.assertEqual(
+                    connection.execute("PRAGMA user_version").fetchone()[0],
+                    5,
+                )
+                self.assertIsNone(
+                    connection.execute(
+                        "SELECT 1 FROM sqlite_master WHERE name='team_messages'"
+                    ).fetchone()
+                )
+            finally:
+                connection.close()
+
+    def test_host_reactivation_snapshot_restores_candidate_mutation(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            state_dir = Path(temporary) / "state"
+            state_dir.mkdir(mode=0o700)
+            identity = "e" * 24
+            data_dir = state_dir / "team-hub"
+            store = HubStore(data_dir, managed_host_identity=identity)
+            (
+                hub_id,
+                snapshot,
+                operation_id,
+                _fence_device,
+                _fence_inode,
+            ) = HubStore.prepare_managed_host_reactivation(
+                data_dir,
+                expected_host_identity=identity,
+            )
+            HubStore.adopt_prepared_host_reactivation(
+                data_dir,
+                expected_host_identity=identity,
+                expected_hub_id=hub_id,
+                expected_operation_id=operation_id,
+                expected_snapshot=snapshot,
+                expected_device=_fence_device,
+                expected_inode=_fence_inode,
+            )
+            for _ in range(5):
+                store.maintenance_snapshot("server-shutdown")
+            self.assertTrue(snapshot.is_dir())
+            connection = store.connect()
+            try:
+                connection.execute("CREATE TABLE candidate_only(value TEXT)")
+            finally:
+                connection.close()
+
+            HubStore.restore_host_reactivation_snapshot(
+                data_dir,
+                snapshot,
+                expected_host_identity=identity,
+                expected_hub_id=hub_id,
+                expected_operation_id=operation_id,
+            )
+
+            connection = store.connect()
+            try:
+                self.assertIsNone(
+                    connection.execute(
+                        "SELECT 1 FROM sqlite_master WHERE name='candidate_only'"
+                    ).fetchone()
+                )
+            finally:
+                connection.close()
+            self.assertFalse((data_dir / "maintenance-fence.json").exists())
+
+    def test_host_reactivation_restore_fence_crash_recovers_before_open(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            data_dir = Path(temporary) / "hub"
+            store = HubStore(data_dir, managed_host_identity=HOST_A)
+            (
+                hub_id,
+                snapshot,
+                operation_id,
+                _fence_device,
+                _fence_inode,
+            ) = HubStore.prepare_managed_host_reactivation(
+                data_dir,
+                expected_host_identity=HOST_A,
+            )
+            HubStore.adopt_prepared_host_reactivation(
+                data_dir,
+                expected_host_identity=HOST_A,
+                expected_hub_id=hub_id,
+                expected_operation_id=operation_id,
+                expected_snapshot=snapshot,
+                expected_device=_fence_device,
+                expected_inode=_fence_inode,
+            )
+            database_before = store.database_path.read_bytes()
+            key_before = store.signing_key_path.read_bytes()
+
+            crashed = self.run_reactivation_restore_until_fence_crash(
+                data_dir,
+                snapshot,
+                hub_id=hub_id,
+                operation_id=operation_id,
+            )
+            self.assertEqual(crashed.returncode, 76, crashed.stderr)
+            marker = json.loads(store.maintenance_fence_path.read_text())
+            self.assertEqual(marker["format"], 1)
+            self.assertEqual(marker["reason"], "host-reactivation")
+            self.assertEqual(marker["operation_id"], operation_id)
+            self.assertFalse((data_dir / ".restore-transaction.json").exists())
+            self.assertEqual(len(list(data_dir.glob(".restore-[0-9]*-*"))), 1)
+            self.assertEqual(store.database_path.read_bytes(), database_before)
+            self.assertEqual(store.signing_key_path.read_bytes(), key_before)
+
+            with self.assertRaisesRegex(
+                RuntimeError, "rollback settlement is pending"
+            ):
+                HubStore(data_dir, managed_host_identity=HOST_A)
+            HubStore.restore_host_reactivation_snapshot(
+                data_dir,
+                snapshot,
+                expected_host_identity=HOST_A,
+                expected_hub_id=hub_id,
+                expected_operation_id=operation_id,
+            )
+            HubStore.confirm_restored_maintenance_snapshot(
+                data_dir,
+                snapshot,
+                expected_host_identity=HOST_A,
+                expected_hub_id=hub_id,
+                expected_operation_id=operation_id,
+                expected_reason="host-reactivation",
+            )
+            HubStore.acknowledge_restored_maintenance_snapshot(
+                data_dir,
+                snapshot,
+                expected_host_identity=HOST_A,
+                expected_hub_id=hub_id,
+                expected_operation_id=operation_id,
+                expected_reason="host-reactivation",
+            )
+            recovered = HubStore(data_dir, managed_host_identity=HOST_A)
+            self.assertIsNone(recovered.maintenance_fence())
+
+            # Ordinary durable update fences use format 1 and must never be
+            # mistaken for an abandoned private restore owner.
+            update_snapshot = recovered.maintenance_snapshot_and_fence(
+                "server-update",
+                operation_id="update-after-reactivation-crash",
+            )
+            fence_before = recovered.maintenance_fence_path.read_bytes()
+            with self.assertRaisesRegex(RuntimeError, "startup authority"):
+                HubStore(data_dir, managed_host_identity=HOST_A)
+            reopened = HubStore(
+                data_dir,
+                managed_host_identity=HOST_A,
+                managed_update_hub_id=hub_id,
+                managed_update_operation_id="update-after-reactivation-crash",
+                managed_update_snapshot=update_snapshot,
+            )
+            self.assertEqual(reopened.maintenance_fence_path.read_bytes(), fence_before)
+            self.assertEqual(reopened.maintenance_fence()["reason"], "server-update")
+            self.assertTrue(
+                reopened.clear_maintenance_fence(
+                    expected_reason="server-update",
+                    expected_operation_id="update-after-reactivation-crash",
+                    expected_snapshot=update_snapshot,
+                )
+            )
 
     def test_maintenance_fence_clear_is_bound_to_operation_and_snapshot(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

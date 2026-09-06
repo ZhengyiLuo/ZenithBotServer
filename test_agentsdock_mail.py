@@ -299,6 +299,46 @@ class ProviderTeamMailTests(unittest.IsolatedAsyncioTestCase):
             await agent_server.list_provider_team_mail_routes(self.request())
         self.assertEqual(raised.exception.status_code, 403)
 
+    async def test_routes_filter_legacy_agent_profiles_and_project_server_only(self) -> None:
+        server = self.profile()
+        agent = {
+            **self.profile(),
+            "destination_kind": "agent",
+            "destination_id": "agent_private",
+            "display_name": "Remote agent",
+            "backend": "codex",
+        }
+        with patch.object(
+            agent_server.SECURE_PEER_RUNTIME,
+            "agent_mail_route_profiles",
+            return_value=[agent, server],
+        ):
+            listed = await agent_server.list_provider_team_mail_routes(self.request())
+        self.assertEqual(len(listed["routes"]), 1)
+        self.assertEqual(listed["routes"][0]["kind"], "server")
+        self.assertIsNone(listed["routes"][0]["backend"])
+
+        capability = agent_server.CROSS_CHAT_CAPABILITIES[self.token_hash]
+        frozen = capability["team_mail_routes"]
+        self.assertTrue(frozen)
+        self.assertTrue(
+            all(
+                profile["destination_kind"] == "server"
+                for profile in frozen.values()
+            )
+        )
+        frozen["mail_" + ("f" * 32)] = agent
+        relisted = await agent_server.list_provider_team_mail_routes(self.request())
+        self.assertEqual(len(relisted["routes"]), 1)
+        self.assertEqual(relisted["routes"][0]["kind"], "server")
+
+        forged_projection = agent_server.provider_team_mail_route_projection(
+            "mail_" + ("a" * 32),
+            agent,
+        )
+        self.assertEqual(forged_projection["kind"], "server")
+        self.assertIsNone(forged_projection["backend"])
+
     async def test_route_list_rejects_missing_capability_and_non_loopback_client(self) -> None:
         missing = Request({
             "type": "http",
@@ -541,6 +581,54 @@ class ProviderTeamMailTests(unittest.IsolatedAsyncioTestCase):
         capability = agent_server.CROSS_CHAT_CAPABILITIES[self.token_hash]
         self.assertNotIn("team_mail", capability["actions"])
         self.assertEqual(capability["team_mail_routes"], {})
+
+    async def test_send_rejects_forged_agent_profile_before_reservation(self) -> None:
+        with patch.object(
+            agent_server.SECURE_PEER_RUNTIME,
+            "agent_mail_route_profiles",
+            return_value=[self.profile()],
+        ):
+            snapshot = await agent_server.provider_team_mail_routes(self.request())
+        route_id = next(iter(snapshot[2]))
+        forged = {
+            **snapshot[2][route_id],
+            "destination_kind": "agent",
+            "destination_id": "agent_private",
+            "backend": "codex",
+        }
+        capability = agent_server.CROSS_CHAT_CAPABILITIES[self.token_hash]
+        capability["team_mail_routes"] = {route_id: forged}
+        forged_snapshot = (
+            snapshot[0],
+            snapshot[1],
+            {route_id: forged},
+            snapshot[3],
+            snapshot[4],
+        )
+        with (
+            patch.object(
+                agent_server,
+                "provider_team_mail_routes",
+                return_value=forged_snapshot,
+            ),
+            patch.object(
+                agent_server.SECURE_PEER_RUNTIME,
+                "send_agent_mail",
+            ) as send,
+        ):
+            with self.assertRaises(HTTPException) as rejected:
+                await agent_server.send_provider_team_mail(
+                    route_id,
+                    agent_server.AgentTeamMailRequest(
+                        message="must not target an agent",
+                        idempotency_key="forged.agent.0001",
+                    ),
+                    self.request("POST", f"/api/agent/team-mail/routes/{route_id}"),
+                )
+        self.assertEqual(rejected.exception.status_code, 409)
+        send.assert_not_called()
+        self.assertEqual(int(capability.get("team_mail_send_count") or 0), 0)
+        self.assertFalse(capability.get("team_mail_consumed"))
 
     async def test_send_rejects_route_generation_or_strict_binding_relaxation(self) -> None:
         await self.activate_strict_command("/mail server MBA exact body")
@@ -982,12 +1070,18 @@ class ProviderTeamMailTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertNotIn("MBA", allowed_path.read_text())
         self.assertNotIn("exact body", allowed_path.read_text())
-        self.assertIn("explicitly opened this turn", provider_prompt)
-        self.assertIn("pre-bound by AgentsServer", provider_prompt)
+        # The per-turn block is compact: it names the pre-bound mail grant,
+        # while the usage rules live once in the thread-level instructions.
+        self.assertIn("team_mail=prebound", provider_prompt)
+        self.assertIn("/mail server MBA exact body", provider_prompt)
+        self.assertIn(
+            "pre-bound",
+            agent_server.PROVIDER_AUTHORITY_USAGE_INSTRUCTIONS,
+        )
 
 
 class LocalAgentMailClaimsTests(unittest.TestCase):
-    def test_local_agent_mail_is_host_scoped_and_owned_agent_authorship_is_exact(self) -> None:
+    def test_local_agent_mail_is_host_scoped_and_agent_authorship_is_retired(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             store = HubStore(
                 Path(temporary),
@@ -1043,12 +1137,12 @@ class LocalAgentMailClaimsTests(unittest.TestCase):
             })
             self.assertEqual(sent["item"]["from"]["kind"], "server")
             self.assertEqual(sent["item"]["from"]["id"], host["id"])
-            claimed = store.create_network_mailbox_item(claims, team_id, {
-                "to": {"kind": "server", "id": peer["id"]},
-                "from_agent_id": host_agent["id"],
-                "body": "Owned host agent mail",
-                "body_format": "plain",
-                "idempotency_key": "local-host-mail-0002",
-            })
-            self.assertEqual(claimed["item"]["from"]["kind"], "agent")
-            self.assertEqual(claimed["item"]["from"]["id"], host_agent["id"])
+            with self.assertRaises(HubError) as retired_agent_author:
+                store.create_network_mailbox_item(claims, team_id, {
+                    "to": {"kind": "server", "id": peer["id"]},
+                    "from_agent_id": host_agent["id"],
+                    "body": "Owned host agent mail",
+                    "body_format": "plain",
+                    "idempotency_key": "local-host-mail-0002",
+                })
+            self.assertEqual(retired_agent_author.exception.code, "invalid_request")

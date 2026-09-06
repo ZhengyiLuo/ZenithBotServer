@@ -14,6 +14,7 @@ from pathlib import Path
 
 
 FILES = (
+    "activation_transaction.py",
     "agent_server.py",
     "team_hub_host.py",
     "secure_peer_runtime.py",
@@ -59,6 +60,7 @@ DIRECTORY_FILES = {
         "migrations/0008_managed_server_session.sql",
         "migrations/0009_team_messages.sql",
         "migrations/0010_team_attachment_orphan_reclamation.sql",
+        "migrations/0011_human_admin_paging.sql",
     ),
 }
 DIRECTORIES = tuple(DIRECTORY_FILES)

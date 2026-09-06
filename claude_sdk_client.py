@@ -826,6 +826,7 @@ class ClaudeSDKSupervisor:
         configuration_key: str,
         client_factory: ClientFactory = default_claude_sdk_client_factory,
         is_result_message: ResultPredicate = default_is_result_message,
+        connect_timeout_seconds: float = 30.0,
         disconnect_timeout_seconds: float = 2.0,
         ack_timeout_seconds: float = 60.0,
         query_delivery_timeout_seconds: float = 10.0,
@@ -841,6 +842,9 @@ class ClaudeSDKSupervisor:
         bind_permission_owner(self.options, self.ownership_token)
         self._client_factory = client_factory
         self._is_result_message = is_result_message
+        if connect_timeout_seconds <= 0:
+            raise ValueError("connect_timeout_seconds must be positive")
+        self._connect_timeout_seconds = float(connect_timeout_seconds)
         if disconnect_timeout_seconds <= 0:
             raise ValueError("disconnect_timeout_seconds must be positive")
         self._disconnect_timeout_seconds = float(disconnect_timeout_seconds)
@@ -858,6 +862,8 @@ class ClaudeSDKSupervisor:
         self._actor_task: asyncio.Task[None] | None = None
         self._client: ClaudeSDKClientProtocol | None = None
         self._connecting_client: ClaudeSDKClientProtocol | None = None
+        self._connect_task: asyncio.Task[None] | None = None
+        self._late_connect_cleanup_tasks: set[asyncio.Task[None]] = set()
         self._receiver_task: asyncio.Task[None] | None = None
         self._ack_timeout_task: asyncio.Task[None] | None = None
         self._active_run: ClaudeSDKRunHandle | None = None
@@ -1148,33 +1154,95 @@ class ClaudeSDKSupervisor:
         task.add_done_callback(consume_result)
         return False
 
+    async def _disconnect_connecting_client(self) -> None:
+        """Fence and clean up the exact client used by a cold connect attempt."""
+
+        client = self._connecting_client
+        task = self._connect_task
+        self._connecting_client = None
+        self._connect_task = None
+        task_was_pending = task is not None and not task.done()
+        if task_was_pending:
+            assert task is not None
+            task.cancel()
+        if client is not None:
+            await self._disconnect_client(client)
+        if task is not None:
+            if task_was_pending and client is not None:
+                async def disconnect_after_late_connect() -> None:
+                    await asyncio.gather(task, return_exceptions=True)
+                    # A cancellation-hostile connect can establish its
+                    # transport after the first disconnect already returned.
+                    # Retire the exact client a second time once connect
+                    # finally settles so no late CLI process is orphaned.
+                    await self._disconnect_client(client)
+
+                cleanup_task = asyncio.create_task(
+                    disconnect_after_late_connect(),
+                    name=f"claude-sdk-late-connect-cleanup:{self.chat_id}",
+                )
+                self._late_connect_cleanup_tasks.add(cleanup_task)
+
+                def cleanup_finished(completed: asyncio.Task[None]) -> None:
+                    self._late_connect_cleanup_tasks.discard(completed)
+                    if not completed.cancelled():
+                        with suppress(BaseException):
+                            completed.exception()
+
+                cleanup_task.add_done_callback(cleanup_finished)
+                await self._cancel_task_bounded(task)
+                await asyncio.wait(
+                    {cleanup_task},
+                    timeout=self._disconnect_timeout_seconds,
+                )
+            else:
+                await self._cancel_task_bounded(task)
+
+    def late_connect_cleanup_tasks(self) -> set[asyncio.Task[None]]:
+        """Return cleanup owners retained after exact supervisor retirement."""
+
+        return set(self._late_connect_cleanup_tasks)
+
     async def _new_client(self) -> ClaudeSDKClientProtocol:
         client: ClaudeSDKClientProtocol | None = None
         try:
             candidate = self._client_factory(self.options)
             client = await candidate if inspect.isawaitable(candidate) else candidate
             self._connecting_client = client
-            await client.connect()
+            connect_task = asyncio.create_task(
+                client.connect(),
+                name=f"claude-sdk-connect:{self.chat_id}",
+            )
+            self._connect_task = connect_task
+            done, _pending = await asyncio.wait(
+                {connect_task},
+                timeout=self._connect_timeout_seconds,
+            )
+            if connect_task not in done:
+                raise TimeoutError(
+                    f"connect timed out after {self._connect_timeout_seconds:g}s"
+                )
+            await connect_task
             if self._closed or self._connecting_client is not client:
-                await self._disconnect_client(client)
                 raise ClaudeSDKSupervisorClosed(
                     f"Claude SDK supervisor for {self.chat_id} closed while connecting"
                 )
         except asyncio.CancelledError:
-            if client is not None:
-                await self._disconnect_client(client)
+            await self._disconnect_connecting_client()
             raise
         except (ClaudeSDKUnavailable, ClaudeSDKSupervisorClosed):
+            await self._disconnect_connecting_client()
             raise
         except Exception as exc:
-            if client is not None:
-                await self._disconnect_client(client)
+            await self._disconnect_connecting_client()
             raise ClaudeSDKUnavailable(
                 f"Claude SDK could not connect for chat {self.chat_id}: {exc}"
             ) from exc
         finally:
             if self._connecting_client is client:
                 self._connecting_client = None
+            if self._connect_task is not None and self._connect_task.done():
+                self._connect_task = None
         self._generation += 1
         self._client = client
         self._connected = True
@@ -1898,6 +1966,7 @@ class ClaudeSDKSupervisorManager:
         is_result_message: ResultPredicate = default_is_result_message,
         max_clients: int = 12,
         idle_ttl_seconds: float | None = 15 * 60,
+        connect_timeout_seconds: float = 30.0,
         disconnect_timeout_seconds: float = 2.0,
         ack_timeout_seconds: float = 60.0,
         query_delivery_timeout_seconds: float = 10.0,
@@ -1911,6 +1980,9 @@ class ClaudeSDKSupervisorManager:
         self._is_result_message = is_result_message
         self._max_clients = int(max_clients)
         self._idle_ttl_seconds = idle_ttl_seconds
+        if connect_timeout_seconds <= 0:
+            raise ValueError("connect_timeout_seconds must be positive")
+        self._connect_timeout_seconds = float(connect_timeout_seconds)
         if disconnect_timeout_seconds <= 0:
             raise ValueError("disconnect_timeout_seconds must be positive")
         self._disconnect_timeout_seconds = float(disconnect_timeout_seconds)
@@ -1928,6 +2000,7 @@ class ClaudeSDKSupervisorManager:
         self._supervisors: OrderedDict[str, ClaudeSDKSupervisor] = OrderedDict()
         self._pins: dict[str, int] = {}
         self._evicting: dict[str, asyncio.Task[None]] = {}
+        self._retired_cleanup_tasks: set[asyncio.Task[None]] = set()
         self._reaper_task: asyncio.Task[None] | None = None
         self._closed = False
 
@@ -2012,6 +2085,7 @@ class ClaudeSDKSupervisorManager:
                 configuration_key=configuration_key,
                 client_factory=self._client_factory,
                 is_result_message=self._is_result_message,
+                connect_timeout_seconds=self._connect_timeout_seconds,
                 disconnect_timeout_seconds=self._disconnect_timeout_seconds,
                 ack_timeout_seconds=self._ack_timeout_seconds,
                 query_delivery_timeout_seconds=self._query_delivery_timeout_seconds,
@@ -2087,6 +2161,7 @@ class ClaudeSDKSupervisorManager:
             self._pins[clean_chat_id] = self._pins.get(clean_chat_id, 0) + 1
         if old_to_close is not None:
             await old_to_close.close()
+        retire = False
         try:
             return await supervisor.start_run(
                 prompt,
@@ -2094,16 +2169,30 @@ class ClaudeSDKSupervisorManager:
                 query_session_id=query_session_id,
                 on_supervisor_ready=on_supervisor_ready,
             )
+        except (ClaudeSDKUnavailable, asyncio.CancelledError):
+            # A cold-connect failure or a Stop that cancels start_run before
+            # on_supervisor_ready has published an ownership token must evict
+            # this exact owner. Otherwise its actor can retain a wedged
+            # connect command and every later turn queues behind it forever.
+            retire = True
+            raise
         finally:
-            async with self._lock:
-                count = self._pins.get(clean_chat_id, 0) - 1
-                if count > 0:
-                    self._pins[clean_chat_id] = count
-                else:
-                    self._pins.pop(clean_chat_id, None)
-                if self._supervisors.get(clean_chat_id) is supervisor:
-                    self._supervisors.move_to_end(clean_chat_id)
-            await self.evict_idle(exclude={clean_chat_id})
+            if retire:
+                await self._retire_exact_supervisor(
+                    clean_chat_id,
+                    supervisor,
+                    task_name_prefix="claude-sdk-start-retire",
+                )
+            else:
+                async with self._lock:
+                    count = self._pins.get(clean_chat_id, 0) - 1
+                    if count > 0:
+                        self._pins[clean_chat_id] = count
+                    else:
+                        self._pins.pop(clean_chat_id, None)
+                    if self._supervisors.get(clean_chat_id) is supervisor:
+                        self._supervisors.move_to_end(clean_chat_id)
+                await self.evict_idle(exclude={clean_chat_id})
 
     def owns_active_run(
         self,
@@ -2229,12 +2318,14 @@ class ClaudeSDKSupervisorManager:
                 self._pins.pop(clean_chat_id, None)
             self._supervisors.move_to_end(clean_chat_id)
 
-    async def _retire_exact_mcp_supervisor(
+    async def _retire_exact_supervisor(
         self,
         chat_id: str,
         supervisor: ClaudeSDKSupervisor,
+        *,
+        task_name_prefix: str = "claude-sdk-mcp-retire",
     ) -> None:
-        """Remove and abort only the owner involved in a failed MCP request."""
+        """Remove and abort only the owner involved in a failed operation."""
 
         assert self._lock is not None
         clean_chat_id = str(chat_id)
@@ -2245,9 +2336,18 @@ class ClaudeSDKSupervisorManager:
             self._pins.pop(clean_chat_id, None)
             close_task = asyncio.create_task(
                 supervisor.abort(),
-                name=f"claude-sdk-mcp-retire:{clean_chat_id}",
+                name=f"{task_name_prefix}:{clean_chat_id}",
             )
             self._evicting[clean_chat_id] = close_task
+
+        def track_late_cleanup(_completed: asyncio.Task[None]) -> None:
+            for cleanup_task in supervisor.late_connect_cleanup_tasks():
+                self._retired_cleanup_tasks.add(cleanup_task)
+                cleanup_task.add_done_callback(
+                    self._retired_cleanup_tasks.discard
+                )
+
+        close_task.add_done_callback(track_late_cleanup)
         try:
             await asyncio.shield(close_task)
         finally:
@@ -2299,7 +2399,7 @@ class ClaudeSDKSupervisorManager:
             return dict(status), str(generation)
         finally:
             if retire:
-                await self._retire_exact_mcp_supervisor(
+                await self._retire_exact_supervisor(
                     clean_chat_id,
                     supervisor,
                 )
@@ -2354,7 +2454,7 @@ class ClaudeSDKSupervisorManager:
             return dict(status), str(generation)
         finally:
             if retire:
-                await self._retire_exact_mcp_supervisor(
+                await self._retire_exact_supervisor(
                     clean_chat_id,
                     supervisor,
                 )
@@ -2479,6 +2579,18 @@ class ClaudeSDKSupervisorManager:
             )
         if eviction_tasks:
             await asyncio.gather(*eviction_tasks, return_exceptions=False)
+        for supervisor in supervisors:
+            for cleanup_task in supervisor.late_connect_cleanup_tasks():
+                self._retired_cleanup_tasks.add(cleanup_task)
+                cleanup_task.add_done_callback(
+                    self._retired_cleanup_tasks.discard
+                )
+        retired_cleanup_tasks = tuple(self._retired_cleanup_tasks)
+        if retired_cleanup_tasks:
+            await asyncio.wait(
+                retired_cleanup_tasks,
+                timeout=self._disconnect_timeout_seconds,
+            )
         async with self._lock:
             self._evicting.clear()
 

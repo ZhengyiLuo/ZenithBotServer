@@ -69,8 +69,15 @@ machine paths.
 
 ## Requirements
 
-- Linux or macOS host with Python 3.10+.
-- `uv` recommended for the runtime environment.
+- Linux or Apple silicon (arm64) macOS host. The trusted `uv` runtime below
+  provisions the release's isolated Python 3.10+ environment. Intel macOS is
+  unsupported because the patched cryptography runtime no longer publishes or
+  supports x86_64 macOS wheels; `install.sh` rejects that architecture before
+  changing state, releases, configuration, or services.
+- A trusted, preinstalled `uv` on `PATH` is required for the isolated runtime.
+  On macOS, install it with `brew install uv`; on Linux, use your trusted OS or
+  package-management environment. The installer never downloads and executes
+  a mutable bootstrap script.
 - Claude CLI and/or Codex CLI installed and authenticated on the agent host.
 - Optional: `tmux`, for the persistent chat terminal, tmux-pane inspection,
   and in-app managed updates. Everything else (chats, turns, jobs, files)
@@ -127,7 +134,7 @@ cd AgentsServer
 ```
 
 Before changing state, releases, configuration, or services, the installer
-checks for either `curl` or `wget` and the platform service command
+checks for a working, preinstalled `uv` and the platform service command
 (`launchctl` on macOS or `systemctl` on Linux), and verifies that the current
 user's service domain responds. Missing tools or an unavailable user service
 session produce platform-specific guidance and stop the install. The preflight
@@ -139,7 +146,7 @@ a host without Homebrew all just print the manual `tmux` install command and
 continue — tmux is optional, so its absence never blocks setup. See
 [Optional: tmux](#optional-tmux) below for what it enables.
 
-After that preflight, the installer uses `uv`, installs a user-level service,
+After that preflight, the installer uses the trusted `uv`, installs a user-level service,
 creates a private access token, verifies authenticated health, and preserves
 existing `~/.agentsdock` chat state on every update. Network downloads retry
 with bounded timeouts, and the longer runtime/dependency stages print output
@@ -230,9 +237,10 @@ messages are plaintext in transit. Literal IP shape is not proof of Tailscale
 or identity. The route must be canonical
 `http://<literal-ip>:<AgentsServer-port>/api/team-hub`; it cannot use a
 hostname, loopback, another port/path, credentials, query or fragment. The
-desktop labels AgentsServer control and Teamspace separately and requires an
-explicit Direct-IP choice plus an additional Start confirmation. Automatic
-selection continues to use the advertised Serve primary.
+AgentsServer retains this legacy transport for manual host configuration and
+rollback continuity. The current desktop filters and refuses Direct-IP routes
+instead of offering them for selection; use secure pairing or private Tailscale
+Serve. Automatic selection continues to use the advertised Serve primary.
 
 If the host install fails or you abandon this setup, remove only that listener:
 
@@ -243,11 +251,22 @@ tailscale serve --https=8444 off
 The host choice and exact primary/Direct-IP routes are preserved by managed
 updates and rollback. A fresh server with no Hub database may be designated
 directly.
-Direct adoption or reactivation of existing Hub state is refused unless the
-operation has the snapshot-bound rollback contract. `--no-team-hub-host`
-stops serving an existing Hub but preserves its data; use it only when you
-intend to keep the Hub offline pending a signed managed recovery or
-support-assisted restoration.
+`--no-team-hub-host` stops serving an existing Hub but preserves its data and
+managed host binding. It is never silently reactivated. To bring that exact
+preserved host back on the same AgentsServer, request the guarded transition:
+
+```bash
+./install.sh --non-interactive --reactivate-team-hub-host
+```
+
+The installer requires disabled mode, verifies the stored Hub binding against
+this server's durable identity without migrating the source database, and
+writes and re-verifies a complete pre-reactivation snapshot before changing
+configuration or service state. A candidate failure restores that snapshot.
+Foreign, unbound, fenced, missing, or concurrently changed state is refused.
+The Tailscale Serve or Direct-IP options may be supplied with the explicit
+reactivation flag when retaining the corresponding supported origin; ordinary
+`--team-hub-host` remains the fresh-state path.
 
 Adding or changing Direct IP on an existing live Hub is intentionally rejected
 by the ordinary installer, including a same-version reinstall. That change
@@ -295,6 +314,21 @@ PYTHONPATH=~/.local/share/agents-server/current \
   --email member@example.com --device-label "Member Mac"
 ```
 
+Issuing a device-recovery proof immediately revokes every existing device
+session and live refresh token for that person. Deliver and redeem the printed
+proof path on the replacement device within ten minutes.
+
+Authenticated human owners can list and revoke pending invitations and can
+change, suspend, reactivate, or permanently revoke non-owner human memberships;
+owner, automation, and self rows are not mutable through this API. Human users
+can list and revoke only their own device sessions. Device revocation takes
+effect on the next authenticated request and revokes every still-live refresh
+token for that device. These controls keep invitation, membership, session, and
+audit ledger rows rather than deleting security history. The member,
+pending-invitation, and device-session inventory endpoints use opaque,
+authenticated keyset cursors with a default page size of 50 and a maximum of
+100; callers follow `next_cursor` only while `has_more` is true.
+
 If you override the install or state directory, use the exact operator commands
 printed by `install.sh` at the end of a host-mode install.
 
@@ -314,12 +348,15 @@ default-deny: only an ordinary user prompt whose first token is exactly
 `/mail` receives a short-lived provider capability. The helper freezes at most
 512 currently visible destinations as opaque run-local routes, accepts at most
 four sends, and reads the UTF-8 body from stdin so message content does not
-appear in process arguments. It creates a passive Team Network Inbox item; it
-never starts or steers a chat or agent. Scheduled jobs, synthetic handoffs, and
-near-matches such as `/mailbox` do not receive this authority. The provider
-mail harness creates message items only; it cannot create new Team Network
-requests. Existing request records and the separate Team Hub request lifecycle
-remain readable for backward data compatibility.
+appear in process arguments. Every listed destination is an active, non-owned
+server and every new item is addressed to that server's passive Team Network
+Inbox; `/mail` never targets, starts, or steers a remote agent. Scheduled jobs,
+synthetic handoffs, and near-matches such as `/mailbox` do not receive this
+authority. The provider mail harness creates message items only; it cannot
+create new Team Network requests. Legacy agent-addressed mail and request
+records remain readable through compatibility APIs, but provider and secure-
+peer mail paths cannot create new ones. The separate Team Hub request lifecycle
+also remains readable for backward data compatibility.
 
 The additive strict form `/mail server NAME MESSAGE` treats `NAME` as one
 case-sensitive token and the remainder as the exact normalized message body.
@@ -328,7 +365,7 @@ whose raw display name exactly equals `NAME`. Zero matches fail as not found;
 multiple matches, including equal names on different Team Networks, fail as
 ambiguous. A successful strict command exposes only that one opaque route and
 permits exactly one idempotent `kind=message` effect with the exact body. It
-cannot fall back to an agent destination, a case-insensitive name, a request,
+cannot target an agent destination, use a case-insensitive name, create a request,
 rewritten content, or a second send. Legacy `/mail` remains available for
 older clients. Health advertises the strict syntax and feature flags inside
 `agent_team_mail_v1`, so clients can discover it without a global API-contract
@@ -474,10 +511,40 @@ JSON body containing a UUID `request_id`, the exact
 Replaying the same request ID is idempotent; another pending or recently
 completed request is rejected.
 
-Restart admission is fail-closed while an active update, active turn, provisional
-queue write, provider background task, lifecycle operation, or HTTP mutation
-is in flight. Durable queued turns remain queued for recovery after relaunch.
-There is no force mode and unmanaged processes cannot use this control.
+A cooperative restart is fail-closed while an active update, active turn,
+provisional queue write, provider background task, lifecycle operation, or
+HTTP mutation is in flight. Durable queued turns remain queued for recovery
+after relaunch. Unmanaged processes cannot use this control.
+
+### Forced (emergency) restart
+
+Adding `force: true` and `force_confirmed: true` to the POST body requests an
+emergency restart. It exists for the case where the server is wedged, so it
+never refuses or waits on server state beyond authentication, the managed
+service proof, and the exact `expected_server_identity` /
+`expected_server_instance_id` pair:
+
+- Cooldowns, a pending or stale restart record, an active managed update,
+  safety-critical work (Codex maintenance, session deletions, in-flight HTTP
+  mutations, goal reconfiguration), and Team Hub snapshot failures are
+  overridden and recorded in `forced_audit` instead of rejected.
+- `expected_blocker_revision` is optional. A stale or omitted revision is
+  audited (`blockers_changed_after_confirmation`, `blocker_revision_omitted`)
+  rather than refused, because a wedged server may be unable to serve a fresh
+  blocker snapshot at all.
+- Every admission lock and probe on the forced path is bounded by a short
+  timeout. If one cannot be obtained the audit snapshot is marked
+  `snapshot_degraded` and the restart still proceeds. `GET /api/admin/restart`
+  and `/api/health` use the same bounded snapshot so they cannot hang.
+- The restart journal is best effort: if it cannot be written the restart
+  still proceeds.
+- SIGTERM is sent from a dedicated thread after the `202` response, and a
+  hard-kill watchdog sends SIGKILL a few seconds later if graceful shutdown
+  has not finished, so the user service always relaunches the server.
+
+Forced restarts interrupt active agent turns and can leave provider children
+to be reaped by the relaunched server; use the cooperative restart when the
+server is healthy.
 
 ## Remote Access With Tailscale
 
@@ -557,6 +624,10 @@ and manual restart remain available while the reservation is pending. The
 server begins maintenance only when one shared-lock snapshot proves it is
 actually idle; that same atomic transition closes new-work admission. A
 pending reservation survives a manual restart and is re-armed after startup.
+While it is pending it fences nothing: new turns, Force Send, scheduled jobs,
+and provider controls are all admitted, and the update simply waits for the
+next moment nothing is running. (Releases before 0.1.26-beta.31 parked new
+turns behind the reservation; that behavior is gone.)
 
 ## Uninstalling AgentsServer
 
@@ -570,7 +641,9 @@ making changes unless `--yes` is passed. Chat history, jobs, files, and
 terminals under the state directory (`~/.agentsdock` by default) are kept by
 default, so a later `./install.sh` picks the same ordinary AgentsServer history
 back up. Preserved Team Hub state is intentionally not auto-reactivated in this
-beta; it requires a signed managed recovery or support-assisted restoration.
+beta; re-enable an exact same-server preserved host explicitly with
+`./install.sh --reactivate-team-hub-host`, which verifies its durable binding
+and takes a rollback snapshot first.
 Passing `--purge-state` permanently deletes that too, but always requires an
 interactive exact-path confirmation that `--yes` cannot bypass. Before any
 change, the uninstaller rejects root, home, broad system/user directories,
@@ -835,20 +908,30 @@ represent second 60.
 
 ## Cross-chat handoffs
 
-### Current route-hint contract (API contract 25, capability v8)
+### Current route-hint contract (API contract 27, capability v11)
 
 An inline structured `@Chat` is an optional target hint. It never forwards the
 raw user prompt. On successful ordinary-turn admission, an exact local
 single-`@Chat` reference authored by a v2 client with `grant_intent: true`
 idempotently creates or refreshes a durable directional source-to-target
 grant. Subsequent turns receive only that source chat's current grants; there
-is no ambient all-chat authority. The agent decides whether to `send` a
-prepared instruction, `ask` for an asynchronous correlated reply, or make no
-contact. Every accepted configured-route Send carries one optional terminal
+is no ambient all-chat authority. An explicit user request to send, ask, tell,
+or contact a named chat requires the agent to use the matching helper; passive
+mentions remain optional. Every accepted configured-route Send carries one optional terminal
 reply path back to its immutable source; it creates no reply obligation, never
 automatically relays the target's ordinary final answer, cannot request a
 follow-up, and grants no durable reverse route. Ask explicitly requests one
-asynchronous terminal answer over the same exchange-scoped return mechanism.
+terminal answer over the same exchange-scoped return mechanism. It commits
+immediately as a durable two-leg agent message; the answer returns later as a
+normal queued delivery in the source chat, without holding either provider
+call open.
+
+Active agent messaging is strictly same-server: Studio chats can address only
+Studio chats, and Sonic chats can address only Sonic chats. Communication
+between servers uses passive Team Network Inbox messages (`server`, `human`,
+or `all` recipients); it never wakes an agent or creates an active cross-chat
+exchange.
+
 `/chat` is a composer alias for selecting the same structured hint.
 
 Scheduled runs never inherit the source chat's grants. Each job stores its own
@@ -856,12 +939,13 @@ exact route selection, authorized by route ID in the job editor/helper flow,
 and revalidates its target, revision, and action on every firing. Its prompt
 contains the corresponding exact single `@Chat` marker for display and
 binding; no `@@` authoring syntax is required. The health surface advertises
-cross-chat version 8, `durable_route_grants`, configured-route
-`instruction_reply_once`,
+cross-chat version 11, `durable_route_grants`, configured-route
+`instruction_reply_once`, `live_wait_async_fallback`,
 `agent_ambient_local_handoffs: false`, scheduled Jobs version 5, and global
-API contract 25.
+API contract 27. Capability v11 additionally advertises
+`configured_route_async_request_reply`.
 
-Capability v8 intentionally applies this reply-once behavior to existing
+Capability v10 retains this reply-once behavior for existing
 configured `instruction` grants as well as newly created ones. The return path
 is a property of each accepted delivery, not a new durable target grant: it is
 bound to the original source, delivery run, exchange generation, two-leg
@@ -878,8 +962,9 @@ and final-result obligations retain their separate exact authorization and
 lifecycle fences.
 
 For a current ordinary turn, the provider-authority block exposes only opaque
-route IDs. The agent lists the available routes, then decides whether to Send,
-Ask, or make no contact:
+route IDs. The agent lists the available routes, then sends or asks when the
+user explicitly requests contact (and may otherwise decide no contact is
+warranted):
 
 ```bash
 "$AGENTSDOCK_CHATS_CLI" --authority-file /path/from/turn.json list
@@ -896,8 +981,8 @@ message. Send creates a correlated two-leg exchange with one optional terminal
 reply capability available only to its exact delivery run. If the target does
 not deliberately use that capability, its ordinary final stays local and the
 exchange closes without sending anything back. Ask creates the same bounded
-exchange but explicitly requests that the terminal answer or failure status
-return asynchronously to the source chat.
+two-leg exchange, returns an accepted receipt immediately, and delivers the
+answer or failure status asynchronously to the source chat.
 
 ### Historical action-specific grants (v1-v2)
 
@@ -1068,6 +1153,28 @@ Workspace-files capability v4 adds no-overwrite creation. Post
 `{path, kind: "directory"}` to create one directory. Creation is
 descriptor-relative, rejects symlinked parents and existing destinations, and
 is unavailable for archived chats.
+
+## Imported provider history
+
+Opening a chat catches its timeline up with messages added to the provider
+transcript outside AgentsDock. The sync anchors on the newest timeline
+messages, skips the parse when the transcript file is unchanged, refuses to
+import a transcript that matches nothing on a populated timeline, and closes
+every import batch with a `turn_finished` marked `imported: true`. Imported
+turns never set a chat's active run, so replayed history can never make a
+stopped chat look busy.
+
+Servers before 0.1.26-beta.30 could append the same transcript tail on every
+open. To remove those duplicates from a chat's event log:
+
+```text
+POST /api/sessions/{session_id}/history/prune-duplicates
+{"dry_run": true}
+```
+
+The default dry run reports how many events and import runs would be
+removed; `{"dry_run": false}` rewrites the log atomically while the chat is
+idle, keeping the first occurrence of every message.
 
 ## Whole-History Search
 

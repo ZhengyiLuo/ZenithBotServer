@@ -24,14 +24,53 @@ class CrossChatStoreTests(unittest.IsolatedAsyncioTestCase):
         self.original_current_turns = agent_server.CURRENT_TURNS
         self.original_queued_turns = agent_server.QUEUED_TURNS
         self.original_agent_token = agent_server.AGENT_TOKEN
+        self.original_agent_relay_enabled = (
+            agent_server.SECURE_PEER_AGENT_RELAY_ENABLED
+        )
         self.original_busy_sessions = set(agent_server.BUSY_SESSIONS)
         self.original_run_now_turns = agent_server.RUN_NOW_TURNS
         self.original_queue_start_tasks = agent_server.QUEUE_START_TASKS
         self.original_cross_chat_event_type_cache = agent_server.CROSS_CHAT_EVENT_TYPE_CACHE
         self.original_session_lifecycle_locks = agent_server.SESSION_LIFECYCLE_LOCKS
+        self.original_cross_chat_lifecycle_locks = (
+            agent_server.CROSS_CHAT_LIFECYCLE_LOCKS
+        )
+        self.original_cross_chat_lifecycle_lock_refcounts = (
+            agent_server.CROSS_CHAT_LIFECYCLE_LOCK_REFCOUNTS
+        )
+        self.original_cross_chat_exchange_locks = (
+            agent_server.CROSS_CHAT_EXCHANGE_LOCKS
+        )
+        self.original_cross_chat_exchange_lock_refcounts = (
+            agent_server.CROSS_CHAT_EXCHANGE_LOCK_REFCOUNTS
+        )
+        self.original_exchange_leg_admission_locks = (
+            agent_server.CROSS_CHAT_EXCHANGE_LEG_ADMISSION_LOCKS
+        )
+        self.original_exchange_leg_admission_owners = (
+            agent_server.CROSS_CHAT_EXCHANGE_LEG_ADMISSION_OWNERS
+        )
+        self.original_exchange_leg_admission_refcounts = (
+            agent_server.CROSS_CHAT_EXCHANGE_LEG_ADMISSION_REFCOUNTS
+        )
+        self.original_delivery_admission_locks = (
+            agent_server.CROSS_CHAT_DELIVERY_ADMISSION_LOCKS
+        )
+        self.original_delivery_admission_owners = (
+            agent_server.CROSS_CHAT_DELIVERY_ADMISSION_OWNERS
+        )
+        self.original_delivery_admission_refcounts = (
+            agent_server.CROSS_CHAT_DELIVERY_ADMISSION_REFCOUNTS
+        )
         self.original_live_lease_locks = agent_server.CROSS_CHAT_LIVE_LEASE_LOCKS
+        self.original_live_lease_lock_refcounts = (
+            agent_server.CROSS_CHAT_LIVE_LEASE_LOCK_REFCOUNTS
+        )
         self.original_live_response_waiters = agent_server.CROSS_CHAT_LIVE_RESPONSE_WAITERS
         agent_server.AGENT_TOKEN = "test-admin-token"
+        # Retain explicit coverage of the legacy relay protocol while normal
+        # AgentsServer production keeps it disabled.
+        agent_server.SECURE_PEER_AGENT_RELAY_ENABLED = True
         agent_server.CROSS_CHAT = agent_server.CrossChatStore(self.root / "cross-chat.sqlite3")
         await agent_server.CROSS_CHAT.initialize()
         agent_server.CROSS_CHAT_AUTHORITY_ROOT = self.root / "authority"
@@ -45,7 +84,18 @@ class CrossChatStoreTests(unittest.IsolatedAsyncioTestCase):
         agent_server.QUEUE_START_TASKS = {}
         agent_server.CROSS_CHAT_EVENT_TYPE_CACHE = OrderedDict()
         agent_server.SESSION_LIFECYCLE_LOCKS = {}
+        agent_server.CROSS_CHAT_LIFECYCLE_LOCKS = {}
+        agent_server.CROSS_CHAT_LIFECYCLE_LOCK_REFCOUNTS = {}
+        agent_server.CROSS_CHAT_EXCHANGE_LOCKS = {}
+        agent_server.CROSS_CHAT_EXCHANGE_LOCK_REFCOUNTS = {}
+        agent_server.CROSS_CHAT_EXCHANGE_LEG_ADMISSION_LOCKS = {}
+        agent_server.CROSS_CHAT_EXCHANGE_LEG_ADMISSION_OWNERS = {}
+        agent_server.CROSS_CHAT_EXCHANGE_LEG_ADMISSION_REFCOUNTS = {}
+        agent_server.CROSS_CHAT_DELIVERY_ADMISSION_LOCKS = {}
+        agent_server.CROSS_CHAT_DELIVERY_ADMISSION_OWNERS = {}
+        agent_server.CROSS_CHAT_DELIVERY_ADMISSION_REFCOUNTS = {}
         agent_server.CROSS_CHAT_LIVE_LEASE_LOCKS = {}
+        agent_server.CROSS_CHAT_LIVE_LEASE_LOCK_REFCOUNTS = {}
         agent_server.CROSS_CHAT_LIVE_RESPONSE_WAITERS = {}
         agent_server.BUSY_SESSIONS.clear()
         agent_server.CROSS_CHAT_CAPABILITIES.clear()
@@ -61,11 +111,47 @@ class CrossChatStoreTests(unittest.IsolatedAsyncioTestCase):
         agent_server.QUEUE_START_TASKS = self.original_queue_start_tasks
         agent_server.CROSS_CHAT_EVENT_TYPE_CACHE = self.original_cross_chat_event_type_cache
         agent_server.SESSION_LIFECYCLE_LOCKS = self.original_session_lifecycle_locks
+        agent_server.CROSS_CHAT_LIFECYCLE_LOCKS = (
+            self.original_cross_chat_lifecycle_locks
+        )
+        agent_server.CROSS_CHAT_LIFECYCLE_LOCK_REFCOUNTS = (
+            self.original_cross_chat_lifecycle_lock_refcounts
+        )
+        agent_server.CROSS_CHAT_EXCHANGE_LOCKS = (
+            self.original_cross_chat_exchange_locks
+        )
+        agent_server.CROSS_CHAT_EXCHANGE_LOCK_REFCOUNTS = (
+            self.original_cross_chat_exchange_lock_refcounts
+        )
+        agent_server.CROSS_CHAT_EXCHANGE_LEG_ADMISSION_LOCKS = (
+            self.original_exchange_leg_admission_locks
+        )
+        agent_server.CROSS_CHAT_EXCHANGE_LEG_ADMISSION_OWNERS = (
+            self.original_exchange_leg_admission_owners
+        )
+        agent_server.CROSS_CHAT_EXCHANGE_LEG_ADMISSION_REFCOUNTS = (
+            self.original_exchange_leg_admission_refcounts
+        )
+        agent_server.CROSS_CHAT_DELIVERY_ADMISSION_LOCKS = (
+            self.original_delivery_admission_locks
+        )
+        agent_server.CROSS_CHAT_DELIVERY_ADMISSION_OWNERS = (
+            self.original_delivery_admission_owners
+        )
+        agent_server.CROSS_CHAT_DELIVERY_ADMISSION_REFCOUNTS = (
+            self.original_delivery_admission_refcounts
+        )
         agent_server.CROSS_CHAT_LIVE_LEASE_LOCKS = self.original_live_lease_locks
+        agent_server.CROSS_CHAT_LIVE_LEASE_LOCK_REFCOUNTS = (
+            self.original_live_lease_lock_refcounts
+        )
         agent_server.CROSS_CHAT_LIVE_RESPONSE_WAITERS = self.original_live_response_waiters
         agent_server.BUSY_SESSIONS.clear()
         agent_server.BUSY_SESSIONS.update(self.original_busy_sessions)
         agent_server.AGENT_TOKEN = self.original_agent_token
+        agent_server.SECURE_PEER_AGENT_RELAY_ENABLED = (
+            self.original_agent_relay_enabled
+        )
         self.temporary.cleanup()
 
     async def create_exchange(
@@ -92,6 +178,28 @@ class CrossChatStoreTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertTrue(created)
         return exchange, leg
+
+    async def admit_exchange_test_start(
+        self,
+        session_id: str,
+        request: agent_server.TurnRequest,
+        *,
+        run_id: str,
+    ) -> dict:
+        self.assertEqual(session_id, "target")
+        agent_server.CURRENT_TURNS[session_id] = {
+            "run_id": run_id,
+            "cross_chat_exchange_id": request.cross_chat_exchange_id,
+            "cross_chat_exchange_leg_id": request.cross_chat_exchange_leg_id,
+        }
+        admitted = await agent_server.admit_cross_chat_delivery_run(
+            None,
+            exchange_leg_id=request.cross_chat_exchange_leg_id,
+            queued_id=None,
+            run_id=run_id,
+        )
+        self.assertIsNotNone(admitted)
+        return {"queued": False}
 
     @staticmethod
     def direct_grant_handle(
@@ -128,6 +236,82 @@ class CrossChatStoreTests(unittest.IsolatedAsyncioTestCase):
             actions={"publish"},
         )
         return json.loads(authority.read_text())["provider_capability"]
+
+    async def create_live_waiter(
+        self,
+        exchange_id: str,
+        source_run_id: str,
+    ) -> tuple[dict, dict, dict]:
+        source_token = await self.issue_live_waiter_owner(
+            "source",
+            source_run_id,
+        )
+        await agent_server.CROSS_CHAT.create_exchange_obligation(
+            exchange_id=exchange_id,
+            requester_session_id="source",
+            authorization_source_run_id=source_run_id,
+            responder_session_id="target",
+            max_legs=6,
+            expires_at="2099-01-01T00:00:00Z",
+        )
+        exchange, inbound, _created = (
+            await agent_server.CROSS_CHAT.create_initial_exchange_leg(
+                exchange_id=exchange_id,
+                source_session_id="source",
+                source_run_id=source_run_id,
+                target_session_id="target",
+                body="Wait for this answer",
+                idempotency_key=f"live:{exchange_id}",
+                live_response_lease=True,
+            )
+        )
+        async with agent_server.cross_chat_live_lease_lock(exchange_id):
+            waiter = await agent_server.register_cross_chat_live_waiter_locked(
+                exchange,
+                inbound,
+                owner_session_id="source",
+                owner_run_id=source_run_id,
+                capability_token=source_token,
+            )
+        return exchange, inbound, waiter
+
+    async def deliver_terminal_live_answer(
+        self,
+        exchange: dict,
+        inbound: dict,
+        waiter: dict,
+        *,
+        body: str,
+    ) -> tuple[dict, dict]:
+        target_run_id = f"run_target_{exchange['id']}"
+        await agent_server.CROSS_CHAT.update_exchange_leg(
+            inbound["id"],
+            expected={"registered"},
+            status="running",
+            target_run_id=target_run_id,
+        )
+        async with agent_server.cross_chat_live_lease_lock(exchange["id"]):
+            exchange, outbound, _created = (
+                await agent_server.CROSS_CHAT.commit_exchange_response(
+                    exchange_id=exchange["id"],
+                    inbound_leg_id=inbound["id"],
+                    source_session_id="target",
+                    source_run_id=target_run_id,
+                    body=body,
+                    request_response=False,
+                    idempotency_key=f"answer:{exchange['id']}",
+                    automatic=False,
+                )
+            )
+            exchange, outbound, next_waiter = (
+                await agent_server.deliver_cross_chat_live_response_locked(
+                    exchange,
+                    outbound,
+                )
+            )
+        self.assertIsNone(next_waiter)
+        self.assertTrue(waiter["future"].done())
+        return exchange, outbound
 
     async def test_instruction_idempotency_rejects_payload_change(self) -> None:
         first, created = await agent_server.CROSS_CHAT.create_instruction(
@@ -2632,7 +2816,14 @@ class CrossChatStoreTests(unittest.IsolatedAsyncioTestCase):
             "".join(json.dumps(event, separators=(",", ":")) + "\n" for event in events),
             encoding="utf-8",
         )
-        with patch.object(agent_server, "events_path", return_value=event_file):
+        with (
+            patch.object(agent_server, "events_path", return_value=event_file),
+            patch.object(
+                agent_server,
+                "reconcile_idle_queue_session_from_snapshot",
+                new_callable=AsyncMock,
+            ),
+        ):
             page = agent_server.read_client_events_page("target", limit=2)
             self.assertEqual([event["seq"] for event in page[0]], [1, 3])
             self.assertEqual(page[1], 5)
@@ -3015,6 +3206,1286 @@ class CrossChatStoreTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("artifact_created", types)
         self.assertIn("turn_finished", types)
 
+    async def test_exchange_submission_owner_fences_reconcile_before_durable_claim(self) -> None:
+        exchange, leg = await self.create_exchange("exchange_admission_owner_first")
+        owner_before_claim = asyncio.Event()
+        release_owner = asyncio.Event()
+        reconcile_entered = asyncio.Event()
+        original_get_leg = agent_server.CROSS_CHAT.get_exchange_leg
+        original_reconcile_leg = agent_server.reconcile_cross_chat_exchange_leg
+        submission: asyncio.Task | None = None
+        reconciliation: asyncio.Task | None = None
+        paused_once = False
+
+        async def pause_owner_get(leg_id):
+            nonlocal paused_once
+            if asyncio.current_task() is submission and not paused_once:
+                paused_once = True
+                owner_before_claim.set()
+                await release_owner.wait()
+            return await original_get_leg(leg_id)
+
+        async def observe_reconcile(snapshot):
+            reconcile_entered.set()
+            return await original_reconcile_leg(snapshot)
+
+        async def start_delivery(session_id, request):
+            return await self.admit_exchange_test_start(
+                session_id,
+                request,
+                run_id="run_owner_first",
+            )
+
+        try:
+            with (
+                patch.object(
+                    agent_server.CROSS_CHAT,
+                    "get_exchange_leg",
+                    side_effect=pause_owner_get,
+                ),
+                patch.object(
+                    agent_server,
+                    "reconcile_cross_chat_exchange_leg",
+                    side_effect=observe_reconcile,
+                ),
+                patch.object(
+                    agent_server,
+                    "cross_chat_delivery_client_capabilities",
+                    return_value=[],
+                ),
+                patch.object(
+                    agent_server,
+                    "append_cross_chat_exchange_leg_lifecycle",
+                    AsyncMock(),
+                ),
+                patch.object(
+                    agent_server,
+                    "start_turn_durably",
+                    AsyncMock(side_effect=start_delivery),
+                ) as start,
+            ):
+                submission = asyncio.create_task(
+                    agent_server.submit_cross_chat_exchange_leg(exchange, leg)
+                )
+                await asyncio.wait_for(owner_before_claim.wait(), timeout=1)
+                durable = await original_get_leg(leg["id"])
+                self.assertEqual(durable["status"], "registered")
+                self.assertIs(
+                    agent_server.CROSS_CHAT_EXCHANGE_LEG_ADMISSION_OWNERS[leg["id"]],
+                    submission,
+                )
+
+                reconciliation = asyncio.create_task(
+                    agent_server.reconcile_cross_chat_exchanges()
+                )
+                await asyncio.wait_for(reconcile_entered.wait(), timeout=1)
+                await asyncio.sleep(0)
+                self.assertFalse(reconciliation.done())
+
+                release_owner.set()
+                await asyncio.wait_for(submission, timeout=1)
+                recovered = await asyncio.wait_for(reconciliation, timeout=1)
+
+            self.assertEqual(recovered, 1)
+            start.assert_awaited_once()
+            durable = await original_get_leg(leg["id"])
+            self.assertEqual(durable["status"], "running")
+            self.assertEqual(durable["target_run_id"], "run_owner_first")
+            self.assertNotIn(
+                leg["id"],
+                agent_server.CROSS_CHAT_EXCHANGE_LEG_ADMISSION_OWNERS,
+            )
+        finally:
+            release_owner.set()
+            pending = [
+                task
+                for task in (submission, reconciliation)
+                if task is not None and not task.done()
+            ]
+            for task in pending:
+                task.cancel()
+            if pending:
+                await asyncio.gather(*pending, return_exceptions=True)
+
+    async def test_bare_exchange_turn_reservation_is_not_a_live_run(self) -> None:
+        _exchange, leg = await self.create_exchange("exchange_bare_reservation")
+        agent_server.CURRENT_TURNS["target"] = {
+            "run_id": None,
+            "cross_chat_exchange_leg_id": leg["id"],
+        }
+        self.assertIsNone(
+            await agent_server.live_cross_chat_exchange_leg_state(
+                "target",
+                leg["id"],
+            )
+        )
+
+        agent_server.CURRENT_TURNS["target"]["run_id"] = "run_reserved"
+        self.assertEqual(
+            await agent_server.live_cross_chat_exchange_leg_state(
+                "target",
+                leg["id"],
+            ),
+            {"status": "running", "target_run_id": "run_reserved"},
+        )
+
+    async def test_cancelled_exchange_claim_settles_before_fence_release(self) -> None:
+        exchange, leg = await self.create_exchange("exchange_cancelled_claim")
+        claim_entered = asyncio.Event()
+        release_claim = asyncio.Event()
+        reconcile_entered = asyncio.Event()
+        original_update_leg = agent_server.CROSS_CHAT.update_exchange_leg
+        original_reconcile_leg = agent_server.reconcile_cross_chat_exchange_leg
+        submission: asyncio.Task | None = None
+        reconciliation: asyncio.Task | None = None
+        paused_once = False
+
+        async def pause_claim(leg_id, *args, **kwargs):
+            nonlocal paused_once
+            if (
+                kwargs.get("expected") == {"registered"}
+                and kwargs.get("status") == "submitting"
+                and not paused_once
+            ):
+                paused_once = True
+                claim_entered.set()
+                await release_claim.wait()
+            return await original_update_leg(leg_id, *args, **kwargs)
+
+        async def observe_reconcile(snapshot):
+            reconcile_entered.set()
+            return await original_reconcile_leg(snapshot)
+
+        async def start_delivery(session_id, request):
+            return await self.admit_exchange_test_start(
+                session_id,
+                request,
+                run_id="run_after_cancelled_claim",
+            )
+
+        try:
+            with (
+                patch.object(
+                    agent_server.CROSS_CHAT,
+                    "update_exchange_leg",
+                    side_effect=pause_claim,
+                ),
+                patch.object(
+                    agent_server,
+                    "reconcile_cross_chat_exchange_leg",
+                    side_effect=observe_reconcile,
+                ),
+                patch.object(
+                    agent_server,
+                    "cross_chat_delivery_client_capabilities",
+                    return_value=[],
+                ),
+                patch.object(
+                    agent_server,
+                    "append_cross_chat_exchange_leg_lifecycle",
+                    AsyncMock(),
+                ),
+                patch.object(
+                    agent_server,
+                    "start_turn_durably",
+                    AsyncMock(side_effect=start_delivery),
+                ) as start,
+            ):
+                submission = asyncio.create_task(
+                    agent_server.submit_cross_chat_exchange_leg(exchange, leg)
+                )
+                await asyncio.wait_for(claim_entered.wait(), timeout=1)
+                submission.cancel()
+
+                reconciliation = asyncio.create_task(
+                    agent_server.reconcile_cross_chat_exchanges()
+                )
+                await asyncio.wait_for(reconcile_entered.wait(), timeout=1)
+                await asyncio.sleep(0)
+                self.assertFalse(reconciliation.done())
+                self.assertIs(
+                    agent_server.CROSS_CHAT_EXCHANGE_LEG_ADMISSION_OWNERS[leg["id"]],
+                    submission,
+                )
+
+                release_claim.set()
+                with self.assertRaises(asyncio.CancelledError):
+                    await submission
+                recovered = await asyncio.wait_for(reconciliation, timeout=1)
+
+            self.assertEqual(recovered, 1)
+            start.assert_awaited_once()
+            durable = await agent_server.CROSS_CHAT.get_exchange_leg(leg["id"])
+            self.assertEqual(durable["status"], "running")
+            self.assertEqual(durable["target_run_id"], "run_after_cancelled_claim")
+        finally:
+            release_claim.set()
+            pending = [
+                task
+                for task in (submission, reconciliation)
+                if task is not None and not task.done()
+            ]
+            for task in pending:
+                task.cancel()
+            if pending:
+                await asyncio.gather(*pending, return_exceptions=True)
+
+    async def test_exchange_reconcile_fences_retry_before_submitting_reset(self) -> None:
+        exchange, leg = await self.create_exchange("exchange_reconcile_owner_first")
+        leg = await agent_server.CROSS_CHAT.update_exchange_leg(
+            leg["id"],
+            expected={"registered"},
+            status="submitting",
+        )
+        self.assertIsNotNone(leg)
+        reset_observed = asyncio.Event()
+        release_reset = asyncio.Event()
+        original_update_leg = agent_server.CROSS_CHAT.update_exchange_leg
+        reconciliation: asyncio.Task | None = None
+        retry: asyncio.Task | None = None
+        paused_once = False
+
+        async def pause_reconcile_reset(leg_id, *args, **kwargs):
+            nonlocal paused_once
+            if (
+                asyncio.current_task() is reconciliation
+                and kwargs.get("expected") == {"submitting"}
+                and kwargs.get("status") == "registered"
+                and not paused_once
+            ):
+                paused_once = True
+                reset_observed.set()
+                await release_reset.wait()
+            return await original_update_leg(leg_id, *args, **kwargs)
+
+        async def start_delivery(session_id, request):
+            return await self.admit_exchange_test_start(
+                session_id,
+                request,
+                run_id="run_reconcile_owner_first",
+            )
+
+        try:
+            with (
+                patch.object(
+                    agent_server.CROSS_CHAT,
+                    "update_exchange_leg",
+                    side_effect=pause_reconcile_reset,
+                ),
+                patch.object(
+                    agent_server,
+                    "cross_chat_delivery_client_capabilities",
+                    return_value=[],
+                ),
+                patch.object(
+                    agent_server,
+                    "append_cross_chat_exchange_leg_lifecycle",
+                    AsyncMock(),
+                ),
+                patch.object(
+                    agent_server,
+                    "start_turn_durably",
+                    AsyncMock(side_effect=start_delivery),
+                ) as start,
+            ):
+                reconciliation = asyncio.create_task(
+                    agent_server.reconcile_cross_chat_exchanges()
+                )
+                await asyncio.wait_for(reset_observed.wait(), timeout=1)
+                retry = asyncio.create_task(
+                    agent_server.submit_cross_chat_exchange_leg(exchange, leg)
+                )
+                await asyncio.sleep(0)
+                self.assertFalse(retry.done())
+                self.assertIs(
+                    agent_server.CROSS_CHAT_EXCHANGE_LEG_ADMISSION_OWNERS[leg["id"]],
+                    reconciliation,
+                )
+
+                release_reset.set()
+                recovered = await asyncio.wait_for(reconciliation, timeout=1)
+                await asyncio.wait_for(retry, timeout=1)
+
+            self.assertEqual(recovered, 1)
+            start.assert_awaited_once()
+            durable = await agent_server.CROSS_CHAT.get_exchange_leg(leg["id"])
+            self.assertEqual(durable["status"], "running")
+            self.assertEqual(
+                durable["target_run_id"],
+                "run_reconcile_owner_first",
+            )
+        finally:
+            release_reset.set()
+            pending = [
+                task
+                for task in (reconciliation, retry)
+                if task is not None and not task.done()
+            ]
+            for task in pending:
+                task.cancel()
+            if pending:
+                await asyncio.gather(*pending, return_exceptions=True)
+
+    async def test_exchange_submission_keeps_fence_through_cancel_cleanup(self) -> None:
+        exchange, leg = await self.create_exchange("exchange_cancelled_admission")
+        start_entered = asyncio.Event()
+        finalizer_entered = asyncio.Event()
+        release_finalizer = asyncio.Event()
+        reconcile_entered = asyncio.Event()
+        original_reconcile_leg = agent_server.reconcile_cross_chat_exchange_leg
+        submission: asyncio.Task | None = None
+        reconciliation: asyncio.Task | None = None
+        start_calls = 0
+
+        async def observe_reconcile(snapshot):
+            reconcile_entered.set()
+            return await original_reconcile_leg(snapshot)
+
+        async def start_delivery(session_id, request):
+            nonlocal start_calls
+            start_calls += 1
+            if start_calls == 1:
+                start_entered.set()
+                try:
+                    await asyncio.Future()
+                finally:
+                    finalizer_entered.set()
+                    await release_finalizer.wait()
+            return await self.admit_exchange_test_start(
+                session_id,
+                request,
+                run_id="run_after_cancelled_owner",
+            )
+
+        try:
+            with (
+                patch.object(
+                    agent_server,
+                    "reconcile_cross_chat_exchange_leg",
+                    side_effect=observe_reconcile,
+                ),
+                patch.object(
+                    agent_server,
+                    "cross_chat_delivery_client_capabilities",
+                    return_value=[],
+                ),
+                patch.object(
+                    agent_server,
+                    "append_cross_chat_exchange_leg_lifecycle",
+                    AsyncMock(),
+                ),
+                patch.object(
+                    agent_server,
+                    "start_turn_durably",
+                    AsyncMock(side_effect=start_delivery),
+                ) as start,
+            ):
+                submission = asyncio.create_task(
+                    agent_server.submit_cross_chat_exchange_leg(exchange, leg)
+                )
+                await asyncio.wait_for(start_entered.wait(), timeout=1)
+                submission.cancel()
+                await asyncio.wait_for(finalizer_entered.wait(), timeout=1)
+
+                reconciliation = asyncio.create_task(
+                    agent_server.reconcile_cross_chat_exchanges()
+                )
+                await asyncio.wait_for(reconcile_entered.wait(), timeout=1)
+                await asyncio.sleep(0)
+                self.assertFalse(reconciliation.done())
+                self.assertIs(
+                    agent_server.CROSS_CHAT_EXCHANGE_LEG_ADMISSION_OWNERS[leg["id"]],
+                    submission,
+                )
+
+                release_finalizer.set()
+                with self.assertRaises(asyncio.CancelledError):
+                    await submission
+                recovered = await asyncio.wait_for(reconciliation, timeout=1)
+
+            self.assertEqual(recovered, 1)
+            self.assertEqual(start.await_count, 2)
+            durable = await agent_server.CROSS_CHAT.get_exchange_leg(leg["id"])
+            self.assertEqual(durable["status"], "running")
+            self.assertEqual(durable["target_run_id"], "run_after_cancelled_owner")
+            self.assertNotIn(
+                leg["id"],
+                agent_server.CROSS_CHAT_EXCHANGE_LEG_ADMISSION_OWNERS,
+            )
+        finally:
+            release_finalizer.set()
+            pending = [
+                task
+                for task in (submission, reconciliation)
+                if task is not None and not task.done()
+            ]
+            for task in pending:
+                task.cancel()
+            if pending:
+                await asyncio.gather(*pending, return_exceptions=True)
+
+    async def test_exchange_queue_promotion_owner_fences_reconcile_after_pop(
+        self,
+    ) -> None:
+        exchange, leg = await self.create_exchange(
+            "exchange_queued_promotion_owner"
+        )
+        leg = await agent_server.CROSS_CHAT.update_exchange_leg(
+            leg["id"],
+            expected={"registered"},
+            status="submitting",
+        )
+        self.assertIsNotNone(leg)
+        leg = await agent_server.CROSS_CHAT.update_exchange_leg(
+            leg["id"],
+            expected={"submitting"},
+            status="queued",
+            queued_id="queued_promotion_owner",
+            queue_position=1,
+        )
+        self.assertIsNotNone(leg)
+        agent_server.QUEUED_TURNS["target"] = deque([{
+            "queued_id": "queued_promotion_owner",
+            "prompt": "Deliver this exchange exactly once",
+            "file_ids": [],
+            "purpose": "cross_chat_handoff_delivery",
+            "source_session_id": "source",
+            "target_session_id": "target",
+            "cross_chat_exchange_id": exchange["id"],
+            "cross_chat_exchange_leg_id": leg["id"],
+            "client_capabilities": [],
+        }])
+        promotion_entered = asyncio.Event()
+        release_promotion = asyncio.Event()
+        promotion: asyncio.Task | None = None
+        start_calls = 0
+
+        async def pause_then_admit(session_id, request, **kwargs):
+            nonlocal start_calls
+            start_calls += 1
+            promotion_entered.set()
+            await release_promotion.wait()
+            run_id = "run_queued_promotion_owner"
+            agent_server.CURRENT_TURNS[session_id] = {
+                "run_id": run_id,
+                "cross_chat_exchange_id": request.cross_chat_exchange_id,
+                "cross_chat_exchange_leg_id": (
+                    request.cross_chat_exchange_leg_id
+                ),
+            }
+            admitted = await agent_server.admit_cross_chat_delivery_run(
+                None,
+                exchange_leg_id=request.cross_chat_exchange_leg_id,
+                queued_id=str(kwargs.get("queued_id") or ""),
+                run_id=run_id,
+            )
+            self.assertIsNotNone(admitted)
+            return {"queued": False, "run_id": run_id}
+
+        try:
+            with (
+                patch.object(
+                    agent_server,
+                    "reconcile_idle_queue_session",
+                    AsyncMock(),
+                ),
+                patch.object(
+                    agent_server,
+                    "_start_turn_locked",
+                    AsyncMock(side_effect=pause_then_admit),
+                ) as start,
+                patch.object(
+                    agent_server,
+                    "cross_chat_delivery_client_capabilities",
+                    return_value=[],
+                ),
+                patch.object(
+                    agent_server,
+                    "append_cross_chat_exchange_leg_lifecycle",
+                    AsyncMock(),
+                ),
+            ):
+                promotion = asyncio.create_task(
+                    agent_server.start_next_queued_turn("target")
+                )
+                await asyncio.wait_for(promotion_entered.wait(), timeout=1)
+                self.assertNotIn("target", agent_server.QUEUED_TURNS)
+                self.assertIs(
+                    agent_server.QUEUE_START_TASKS.get("target"),
+                    promotion,
+                )
+                self.assertEqual(
+                    getattr(
+                        promotion,
+                        "_agentsdock_cross_chat_exchange_leg_id",
+                    ),
+                    leg["id"],
+                )
+
+                # A stale direct retry takes the per-leg admission lock while
+                # promotion owns the session lifecycle lock. It must observe
+                # the exact promotion owner and return without trying to take
+                # the lifecycle lock in the opposite order or starting a
+                # duplicate turn.
+                _retry_exchange, retry_leg = await asyncio.wait_for(
+                    agent_server.submit_cross_chat_exchange_leg(exchange, leg),
+                    timeout=1,
+                )
+                self.assertEqual(retry_leg["status"], "queued")
+                self.assertEqual(start.await_count, 1)
+
+                recovered = await asyncio.wait_for(
+                    agent_server.reconcile_cross_chat_exchange_leg(leg),
+                    timeout=1,
+                )
+                durable = await agent_server.CROSS_CHAT.get_exchange_leg(
+                    leg["id"]
+                )
+                self.assertEqual(recovered, 1)
+                self.assertEqual(durable["status"], "queued")
+                self.assertEqual(
+                    durable["queued_id"],
+                    "queued_promotion_owner",
+                )
+                self.assertFalse(promotion.done())
+
+                release_promotion.set()
+                await asyncio.wait_for(promotion, timeout=1)
+
+            start.assert_awaited_once()
+            self.assertEqual(start_calls, 1)
+            durable = await agent_server.CROSS_CHAT.get_exchange_leg(leg["id"])
+            self.assertEqual(durable["status"], "running")
+            self.assertEqual(
+                durable["target_run_id"],
+                "run_queued_promotion_owner",
+            )
+        finally:
+            release_promotion.set()
+            if promotion is not None and not promotion.done():
+                promotion.cancel()
+                await asyncio.gather(promotion, return_exceptions=True)
+
+    async def test_admission_lock_registries_retire_after_waiter_cancellation(
+        self,
+    ) -> None:
+        registries = (
+            (
+                "direct_registry_cleanup",
+                agent_server.cross_chat_delivery_admission,
+                agent_server.CROSS_CHAT_DELIVERY_ADMISSION_LOCKS,
+                agent_server.CROSS_CHAT_DELIVERY_ADMISSION_OWNERS,
+                agent_server.CROSS_CHAT_DELIVERY_ADMISSION_REFCOUNTS,
+            ),
+            (
+                "exchange_registry_cleanup",
+                agent_server.cross_chat_exchange_leg_admission,
+                agent_server.CROSS_CHAT_EXCHANGE_LEG_ADMISSION_LOCKS,
+                agent_server.CROSS_CHAT_EXCHANGE_LEG_ADMISSION_OWNERS,
+                agent_server.CROSS_CHAT_EXCHANGE_LEG_ADMISSION_REFCOUNTS,
+            ),
+        )
+        for key, admission, locks, owners, refcounts in registries:
+            entered = asyncio.Event()
+            release = asyncio.Event()
+
+            async def hold_owner() -> None:
+                async with admission(key):
+                    entered.set()
+                    await release.wait()
+
+            async def wait_for_owner() -> None:
+                async with admission(key):
+                    self.fail("cancelled admission waiter acquired the fence")
+
+            owner = asyncio.create_task(hold_owner())
+            waiter: asyncio.Task | None = None
+            try:
+                await asyncio.wait_for(entered.wait(), timeout=1)
+                retained_lock = locks[key]
+                self.assertIs(owners.get(key), owner)
+                self.assertEqual(refcounts.get(key), 1)
+
+                waiter = asyncio.create_task(wait_for_owner())
+                await asyncio.sleep(0)
+                self.assertEqual(refcounts.get(key), 2)
+                self.assertIs(locks.get(key), retained_lock)
+
+                waiter.cancel()
+                with self.assertRaises(asyncio.CancelledError):
+                    await waiter
+                self.assertEqual(refcounts.get(key), 1)
+                self.assertIs(locks.get(key), retained_lock)
+                self.assertIs(owners.get(key), owner)
+
+                release.set()
+                await asyncio.wait_for(owner, timeout=1)
+                self.assertNotIn(key, locks)
+                self.assertNotIn(key, owners)
+                self.assertNotIn(key, refcounts)
+            finally:
+                release.set()
+                pending = [
+                    task
+                    for task in (owner, waiter)
+                    if task is not None and not task.done()
+                ]
+                for task in pending:
+                    task.cancel()
+                if pending:
+                    await asyncio.gather(*pending, return_exceptions=True)
+
+    async def test_cross_chat_keyed_locks_retire_after_waiter_cancellation(
+        self,
+    ) -> None:
+        registries = (
+            (
+                "lifecycle_registry_cleanup",
+                agent_server.cross_chat_lifecycle_lock,
+                agent_server.CROSS_CHAT_LIFECYCLE_LOCKS,
+                agent_server.CROSS_CHAT_LIFECYCLE_LOCK_REFCOUNTS,
+            ),
+            (
+                "exchange_registry_cleanup",
+                agent_server.cross_chat_exchange_lock,
+                agent_server.CROSS_CHAT_EXCHANGE_LOCKS,
+                agent_server.CROSS_CHAT_EXCHANGE_LOCK_REFCOUNTS,
+            ),
+            (
+                "live_lease_registry_cleanup",
+                agent_server.cross_chat_live_lease_lock,
+                agent_server.CROSS_CHAT_LIVE_LEASE_LOCKS,
+                agent_server.CROSS_CHAT_LIVE_LEASE_LOCK_REFCOUNTS,
+            ),
+        )
+        for key, keyed_lock, locks, refcounts in registries:
+            entered = asyncio.Event()
+            release = asyncio.Event()
+
+            async def hold_owner() -> None:
+                async with keyed_lock(key):
+                    entered.set()
+                    await release.wait()
+
+            async def wait_for_owner() -> None:
+                async with keyed_lock(key):
+                    self.fail("cancelled keyed-lock waiter acquired the fence")
+
+            owner = asyncio.create_task(hold_owner())
+            waiter: asyncio.Task | None = None
+            try:
+                await asyncio.wait_for(entered.wait(), timeout=1)
+                retained_lock = locks[key]
+                self.assertEqual(refcounts.get(key), 1)
+
+                waiter = asyncio.create_task(wait_for_owner())
+                await asyncio.sleep(0)
+                self.assertEqual(refcounts.get(key), 2)
+                self.assertIs(locks.get(key), retained_lock)
+
+                waiter.cancel()
+                with self.assertRaises(asyncio.CancelledError):
+                    await waiter
+                self.assertEqual(refcounts.get(key), 1)
+                self.assertIs(locks.get(key), retained_lock)
+
+                release.set()
+                await asyncio.wait_for(owner, timeout=1)
+                self.assertNotIn(key, locks)
+                self.assertNotIn(key, refcounts)
+            finally:
+                release.set()
+                pending = [
+                    task
+                    for task in (owner, waiter)
+                    if task is not None and not task.done()
+                ]
+                for task in pending:
+                    task.cancel()
+                if pending:
+                    await asyncio.gather(*pending, return_exceptions=True)
+
+    async def test_exchange_queue_promotion_cancellation_keeps_owner_until_requeue(
+        self,
+    ) -> None:
+        exchange, leg = await self.create_exchange(
+            "exchange_cancelled_queue_promotion"
+        )
+        leg = await agent_server.CROSS_CHAT.update_exchange_leg(
+            leg["id"],
+            expected={"registered"},
+            status="submitting",
+        )
+        self.assertIsNotNone(leg)
+        leg = await agent_server.CROSS_CHAT.update_exchange_leg(
+            leg["id"],
+            expected={"submitting"},
+            status="queued",
+            queued_id="queued_cancelled_promotion",
+            queue_position=1,
+        )
+        self.assertIsNotNone(leg)
+        agent_server.QUEUED_TURNS["target"] = deque([{
+            "queued_id": "queued_cancelled_promotion",
+            "prompt": "Preserve this cancelled promotion",
+            "file_ids": [],
+            "purpose": "cross_chat_handoff_delivery",
+            "source_session_id": "source",
+            "target_session_id": "target",
+            "cross_chat_exchange_id": exchange["id"],
+            "cross_chat_exchange_leg_id": leg["id"],
+            "client_capabilities": [],
+        }])
+        promotion_entered = asyncio.Event()
+        settlement_entered = asyncio.Event()
+        release_settlement = asyncio.Event()
+        original_requeue = agent_server.requeue_turn_front
+        promotion: asyncio.Task | None = None
+
+        async def cancelled_start(*_args, **_kwargs):
+            promotion_entered.set()
+            await asyncio.Future()
+
+        async def pause_requeue(session_id, item):
+            settlement_entered.set()
+            await release_settlement.wait()
+            return await original_requeue(session_id, item)
+
+        try:
+            with (
+                patch.object(
+                    agent_server,
+                    "reconcile_idle_queue_session",
+                    AsyncMock(),
+                ),
+                patch.object(
+                    agent_server,
+                    "_start_turn_locked",
+                    AsyncMock(side_effect=cancelled_start),
+                ),
+                patch.object(
+                    agent_server,
+                    "requeue_turn_front",
+                    AsyncMock(side_effect=pause_requeue),
+                ),
+            ):
+                promotion = asyncio.create_task(
+                    agent_server.start_next_queued_turn("target")
+                )
+                await asyncio.wait_for(promotion_entered.wait(), timeout=1)
+                promotion.cancel()
+                await asyncio.wait_for(settlement_entered.wait(), timeout=1)
+
+                self.assertFalse(promotion.done())
+                self.assertNotIn("target", agent_server.QUEUED_TURNS)
+                self.assertIs(
+                    agent_server.QUEUE_START_TASKS.get("target"),
+                    promotion,
+                )
+                recovered = await asyncio.wait_for(
+                    agent_server.reconcile_cross_chat_exchange_leg(leg),
+                    timeout=1,
+                )
+                durable = await agent_server.CROSS_CHAT.get_exchange_leg(
+                    leg["id"]
+                )
+                self.assertEqual(recovered, 1)
+                self.assertEqual(durable["status"], "queued")
+
+                release_settlement.set()
+                with self.assertRaises(asyncio.CancelledError):
+                    await promotion
+                await asyncio.sleep(0)
+
+            queued = list(agent_server.QUEUED_TURNS.get("target") or ())
+            self.assertEqual(
+                [item.get("queued_id") for item in queued],
+                ["queued_cancelled_promotion"],
+            )
+            durable = await agent_server.CROSS_CHAT.get_exchange_leg(leg["id"])
+            self.assertEqual(durable["status"], "queued")
+            self.assertIsNone(agent_server.QUEUE_START_TASKS.get("target"))
+        finally:
+            release_settlement.set()
+            if promotion is not None and not promotion.done():
+                promotion.cancel()
+                await asyncio.gather(promotion, return_exceptions=True)
+
+    async def test_exchange_queue_promotion_error_keeps_owner_until_requeue(
+        self,
+    ) -> None:
+        exchange, leg = await self.create_exchange(
+            "exchange_failed_queue_promotion"
+        )
+        leg = await agent_server.CROSS_CHAT.update_exchange_leg(
+            leg["id"],
+            expected={"registered"},
+            status="submitting",
+        )
+        self.assertIsNotNone(leg)
+        leg = await agent_server.CROSS_CHAT.update_exchange_leg(
+            leg["id"],
+            expected={"submitting"},
+            status="queued",
+            queued_id="queued_failed_promotion",
+            queue_position=1,
+        )
+        self.assertIsNotNone(leg)
+        agent_server.QUEUED_TURNS["target"] = deque([{
+            "queued_id": "queued_failed_promotion",
+            "prompt": "Preserve this failed promotion",
+            "file_ids": [],
+            "purpose": "cross_chat_handoff_delivery",
+            "source_session_id": "source",
+            "target_session_id": "target",
+            "cross_chat_exchange_id": exchange["id"],
+            "cross_chat_exchange_leg_id": leg["id"],
+            "client_capabilities": [],
+        }])
+        promotion_entered = asyncio.Event()
+        settlement_entered = asyncio.Event()
+        release_settlement = asyncio.Event()
+        original_requeue = agent_server.requeue_turn_front
+        promotion: asyncio.Task | None = None
+
+        async def failed_start(*_args, **_kwargs):
+            promotion_entered.set()
+            raise OSError("deterministic provider admission failure")
+
+        async def pause_requeue(session_id, item):
+            settlement_entered.set()
+            await release_settlement.wait()
+            return await original_requeue(session_id, item)
+
+        try:
+            with (
+                patch.object(
+                    agent_server,
+                    "reconcile_idle_queue_session",
+                    AsyncMock(),
+                ),
+                patch.object(
+                    agent_server,
+                    "_start_turn_locked",
+                    AsyncMock(side_effect=failed_start),
+                ) as start,
+                patch.object(
+                    agent_server,
+                    "requeue_turn_front",
+                    AsyncMock(side_effect=pause_requeue),
+                ),
+                patch.object(agent_server, "append_event", AsyncMock()),
+                patch.object(
+                    agent_server,
+                    "schedule_queued_turn_retry",
+                    return_value=True,
+                ),
+            ):
+                promotion = asyncio.create_task(
+                    agent_server.start_next_queued_turn("target")
+                )
+                await asyncio.wait_for(promotion_entered.wait(), timeout=1)
+                await asyncio.wait_for(settlement_entered.wait(), timeout=1)
+
+                self.assertFalse(promotion.done())
+                self.assertNotIn("target", agent_server.QUEUED_TURNS)
+                self.assertIs(
+                    agent_server.QUEUE_START_TASKS.get("target"),
+                    promotion,
+                )
+                recovered = await asyncio.wait_for(
+                    agent_server.reconcile_cross_chat_exchange_leg(leg),
+                    timeout=1,
+                )
+                durable = await agent_server.CROSS_CHAT.get_exchange_leg(
+                    leg["id"]
+                )
+                self.assertEqual(recovered, 1)
+                self.assertEqual(durable["status"], "queued")
+                start.assert_awaited_once()
+
+                release_settlement.set()
+                await asyncio.wait_for(promotion, timeout=1)
+                await asyncio.sleep(0)
+
+            queued = list(agent_server.QUEUED_TURNS.get("target") or ())
+            self.assertEqual(
+                [item.get("queued_id") for item in queued],
+                ["queued_failed_promotion"],
+            )
+            durable = await agent_server.CROSS_CHAT.get_exchange_leg(leg["id"])
+            self.assertEqual(durable["status"], "queued")
+            self.assertIsNone(agent_server.QUEUE_START_TASKS.get("target"))
+        finally:
+            release_settlement.set()
+            if promotion is not None and not promotion.done():
+                promotion.cancel()
+                await asyncio.gather(promotion, return_exceptions=True)
+
+    async def test_direct_envelope_queue_promotion_owner_fences_reconcile(
+        self,
+    ) -> None:
+        record, created = await agent_server.CROSS_CHAT.create_instruction(
+            envelope_id="direct_promotion_owner",
+            source_session_id="source",
+            source_run_id="run_source",
+            target_session_id="target",
+            body="Deliver the direct envelope once",
+            idempotency_key="promotion-owner-direct",
+        )
+        self.assertTrue(created)
+        record = await agent_server.CROSS_CHAT.update(
+            record["id"],
+            expected={"ready"},
+            status="submitting",
+        )
+        self.assertIsNotNone(record)
+        record = await agent_server.CROSS_CHAT.update(
+            record["id"],
+            expected={"submitting"},
+            status="queued",
+            queued_id="queued_direct_promotion",
+            queue_position=1,
+        )
+        self.assertIsNotNone(record)
+        agent_server.QUEUED_TURNS["target"] = deque([{
+            "queued_id": "queued_direct_promotion",
+            "prompt": "Deliver the direct envelope once",
+            "file_ids": [],
+            "purpose": "cross_chat_handoff_delivery",
+            "source_session_id": "source",
+            "target_session_id": "target",
+            "cross_chat_envelope_id": record["id"],
+            "client_capabilities": [],
+        }])
+        promotion_entered = asyncio.Event()
+        release_promotion = asyncio.Event()
+        promotion: asyncio.Task | None = None
+
+        async def pause_then_admit(session_id, request, **kwargs):
+            promotion_entered.set()
+            await release_promotion.wait()
+            run_id = "run_direct_promotion"
+            agent_server.CURRENT_TURNS[session_id] = {
+                "run_id": run_id,
+                "cross_chat_envelope_id": request.cross_chat_envelope_id,
+            }
+            admitted = await agent_server.admit_cross_chat_delivery_run(
+                request.cross_chat_envelope_id,
+                queued_id=str(kwargs.get("queued_id") or ""),
+                run_id=run_id,
+            )
+            self.assertIsNotNone(admitted)
+            return {"queued": False, "run_id": run_id}
+
+        try:
+            with (
+                patch.object(
+                    agent_server,
+                    "reconcile_idle_queue_session",
+                    AsyncMock(),
+                ),
+                patch.object(
+                    agent_server,
+                    "_start_turn_locked",
+                    AsyncMock(side_effect=pause_then_admit),
+                ) as start,
+                patch.object(
+                    agent_server,
+                    "append_cross_chat_lifecycle",
+                    AsyncMock(),
+                ),
+            ):
+                promotion = asyncio.create_task(
+                    agent_server.start_next_queued_turn("target")
+                )
+                await asyncio.wait_for(promotion_entered.wait(), timeout=1)
+                self.assertNotIn("target", agent_server.QUEUED_TURNS)
+
+                recovered = await asyncio.wait_for(
+                    agent_server.reconcile_cross_chat_handoffs(),
+                    timeout=1,
+                )
+                durable = await agent_server.CROSS_CHAT.get(record["id"])
+                self.assertEqual(recovered, 1)
+                self.assertEqual(durable["status"], "queued")
+                self.assertEqual(
+                    durable["queued_id"],
+                    "queued_direct_promotion",
+                )
+                self.assertFalse(promotion.done())
+
+                release_promotion.set()
+                await asyncio.wait_for(promotion, timeout=1)
+
+            start.assert_awaited_once()
+            durable = await agent_server.CROSS_CHAT.get(record["id"])
+            self.assertEqual(durable["status"], "running")
+            self.assertEqual(
+                durable["target_run_id"],
+                "run_direct_promotion",
+            )
+        finally:
+            release_promotion.set()
+            if promotion is not None and not promotion.done():
+                promotion.cancel()
+                await asyncio.gather(promotion, return_exceptions=True)
+
+    async def test_direct_live_projection_cannot_resurrect_terminal_envelope(
+        self,
+    ) -> None:
+        record, created = await agent_server.CROSS_CHAT.create_instruction(
+            envelope_id="direct_terminal_wins",
+            source_session_id="source",
+            source_run_id="run_source",
+            target_session_id="target",
+            body="Cancellation must win",
+            idempotency_key="terminal-wins-direct",
+        )
+        self.assertTrue(created)
+        record = await agent_server.CROSS_CHAT.update(
+            record["id"],
+            expected={"ready"},
+            status="submitting",
+        )
+        self.assertIsNotNone(record)
+
+        async def cancel_then_return_stale_live(*_args, **_kwargs):
+            cancelled = await agent_server.CROSS_CHAT.update(
+                record["id"],
+                expected={"submitting"},
+                status="cancelled",
+                error="cancelled concurrently",
+            )
+            self.assertIsNotNone(cancelled)
+            return {
+                "status": "queued",
+                "queued_id": "stale_queue_owner",
+            }
+
+        with (
+            patch.object(
+                agent_server,
+                "live_cross_chat_delivery_state",
+                AsyncMock(side_effect=cancel_then_return_stale_live),
+            ),
+            patch.object(
+                agent_server,
+                "append_cross_chat_terminal_lifecycle",
+                AsyncMock(),
+            ) as terminal_lifecycle,
+            patch.object(
+                agent_server,
+                "append_cross_chat_lifecycle",
+                AsyncMock(),
+            ) as nonterminal_lifecycle,
+            patch.object(
+                agent_server,
+                "submit_cross_chat_delivery",
+                AsyncMock(),
+            ) as submit,
+        ):
+            recovered = await agent_server.reconcile_cross_chat_handoffs()
+
+        durable = await agent_server.CROSS_CHAT.get(record["id"])
+        self.assertEqual(recovered, 1)
+        self.assertEqual(durable["status"], "cancelled")
+        self.assertIsNone(durable["queued_id"])
+        terminal_lifecycle.assert_awaited_once()
+        nonterminal_lifecycle.assert_not_awaited()
+        submit.assert_not_awaited()
+
+    async def test_direct_submission_fences_reconcile_before_current_reservation(
+        self,
+    ) -> None:
+        record, created = await agent_server.CROSS_CHAT.create_instruction(
+            envelope_id="direct_precurrent_admission",
+            source_session_id="source",
+            source_run_id="run_source",
+            target_session_id="target",
+            body="Fence the pre-CURRENT admission window",
+            idempotency_key="direct-precurrent-admission",
+        )
+        self.assertTrue(created)
+        received_entered = asyncio.Event()
+        release_received = asyncio.Event()
+        submission: asyncio.Task | None = None
+        reconciliation: asyncio.Task | None = None
+
+        async def pause_received(*_args, **_kwargs):
+            received_entered.set()
+            await release_received.wait()
+
+        async def start_delivery(_session_id, request):
+            run_id = "run_direct_precurrent"
+            agent_server.CURRENT_TURNS["target"] = {
+                "run_id": run_id,
+                "cross_chat_envelope_id": request.cross_chat_envelope_id,
+            }
+            admitted = await agent_server.admit_cross_chat_delivery_run(
+                request.cross_chat_envelope_id,
+                queued_id=None,
+                run_id=run_id,
+            )
+            self.assertIsNotNone(admitted)
+            return {"queued": False, "run_id": run_id}
+
+        try:
+            with (
+                patch.object(
+                    agent_server,
+                    "cross_chat_delivery_client_capabilities",
+                    return_value=[],
+                ),
+                patch.object(
+                    agent_server,
+                    "append_cross_chat_event_once",
+                    AsyncMock(side_effect=pause_received),
+                ),
+                patch.object(
+                    agent_server,
+                    "start_turn_durably",
+                    AsyncMock(side_effect=start_delivery),
+                ) as start,
+                patch.object(
+                    agent_server,
+                    "append_cross_chat_lifecycle",
+                    AsyncMock(),
+                ),
+            ):
+                submission = asyncio.create_task(
+                    agent_server.submit_cross_chat_delivery(record)
+                )
+                await asyncio.wait_for(received_entered.wait(), timeout=1)
+                durable = await agent_server.CROSS_CHAT.get(record["id"])
+                self.assertEqual(durable["status"], "submitting")
+                self.assertNotIn("target", agent_server.CURRENT_TURNS)
+                self.assertIs(
+                    agent_server.CROSS_CHAT_DELIVERY_ADMISSION_OWNERS.get(
+                        record["id"]
+                    ),
+                    submission,
+                )
+
+                reconciliation = asyncio.create_task(
+                    agent_server.reconcile_cross_chat_handoffs()
+                )
+                await asyncio.sleep(0)
+                await asyncio.sleep(0)
+                self.assertFalse(reconciliation.done())
+
+                release_received.set()
+                submitted = await asyncio.wait_for(submission, timeout=1)
+                recovered = await asyncio.wait_for(reconciliation, timeout=1)
+
+            self.assertEqual(start.await_count, 1)
+            self.assertEqual(submitted["status"], "running")
+            self.assertEqual(recovered, 1)
+            durable = await agent_server.CROSS_CHAT.get(record["id"])
+            self.assertEqual(durable["status"], "running")
+            self.assertEqual(
+                durable["target_run_id"],
+                "run_direct_precurrent",
+            )
+            self.assertNotIn(
+                record["id"],
+                agent_server.CROSS_CHAT_DELIVERY_ADMISSION_OWNERS,
+            )
+        finally:
+            release_received.set()
+            pending = [
+                task
+                for task in (submission, reconciliation)
+                if task is not None and not task.done()
+            ]
+            for task in pending:
+                task.cancel()
+            if pending:
+                await asyncio.gather(*pending, return_exceptions=True)
+
+    async def test_secure_peer_queue_promotion_owner_fences_reconcile(
+        self,
+    ) -> None:
+        envelope_id = "secure_peer_promotion_owner"
+        agent_server.QUEUED_TURNS["target"] = deque([{
+            "queued_id": "queued_secure_peer_promotion",
+            "prompt": "Encrypted delivery",
+            "file_ids": [],
+            "purpose": "secure_peer_handoff_delivery",
+            "source_session_id": "peer-server",
+            "target_session_id": "target",
+            "secure_peer_envelope_id": envelope_id,
+            "client_capabilities": [],
+        }])
+        promotion_entered = asyncio.Event()
+        release_promotion = asyncio.Event()
+        promotion: asyncio.Task | None = None
+        record = {
+            "envelope_id": envelope_id,
+            "target_chat_id": "target",
+            "state": "queued",
+            "queued_id": "queued_secure_peer_promotion",
+        }
+
+        async def pause_start(*_args, **_kwargs):
+            promotion_entered.set()
+            await release_promotion.wait()
+            return {"queued": False}
+
+        try:
+            with (
+                patch.object(
+                    agent_server,
+                    "reconcile_idle_queue_session",
+                    AsyncMock(),
+                ),
+                patch.object(
+                    agent_server,
+                    "_start_turn_locked",
+                    AsyncMock(side_effect=pause_start),
+                ),
+                patch.object(
+                    agent_server.SECURE_PEER_RUNTIME,
+                    "recover_prepared_deliveries",
+                    return_value=[],
+                ),
+                patch.object(
+                    agent_server.SECURE_PEER_RUNTIME,
+                    "recoverable_deliveries",
+                    return_value=[record],
+                ),
+                patch.object(
+                    agent_server.SECURE_PEER_RUNTIME,
+                    "finish_delivery",
+                ) as finish,
+            ):
+                promotion = asyncio.create_task(
+                    agent_server.start_next_queued_turn("target")
+                )
+                await asyncio.wait_for(promotion_entered.wait(), timeout=1)
+                self.assertNotIn("target", agent_server.QUEUED_TURNS)
+
+                recovered = await asyncio.wait_for(
+                    agent_server.reconcile_secure_peer_deliveries(),
+                    timeout=1,
+                )
+                self.assertEqual(recovered, 0)
+                terminal_recovered = await asyncio.wait_for(
+                    agent_server.reconcile_secure_peer_terminal_orphans(),
+                    timeout=1,
+                )
+                self.assertEqual(terminal_recovered, 0)
+                finish.assert_not_called()
+                self.assertFalse(promotion.done())
+
+                release_promotion.set()
+                await asyncio.wait_for(promotion, timeout=1)
+        finally:
+            release_promotion.set()
+            if promotion is not None and not promotion.done():
+                promotion.cancel()
+                await asyncio.gather(promotion, return_exceptions=True)
+
     async def test_exchange_recovery_preserves_explicit_child_after_parent_owner_loss(self) -> None:
         exchange, parent = await self.create_exchange("exchange_explicit_restart")
         parent = await agent_server.CROSS_CHAT.update_exchange_leg(
@@ -3157,6 +4628,62 @@ class CrossChatStoreTests(unittest.IsolatedAsyncioTestCase):
             (reverse_status["source_session_id"], reverse_status["target_session_id"]),
             ("source", "target"),
         )
+
+    async def test_exchange_failure_status_retries_transient_target_admission(self) -> None:
+        exchange, failed_leg = await self.create_exchange(
+            "exchange_status_transient_retry"
+        )
+        exchange, failed_leg = await agent_server.CROSS_CHAT.finish_exchange_leg(
+            failed_leg["id"],
+            status="failed",
+            error_code="target_failed",
+            error="target failed before answering",
+        )
+        attempts = 0
+
+        async def admit_on_second_attempt(_session_id, request):
+            nonlocal attempts
+            attempts += 1
+            if attempts == 1:
+                raise agent_server.TransientAdmissionWait(
+                    status_code=503,
+                    detail="agent launch deferred: capacity",
+                )
+            await agent_server.CROSS_CHAT.update_exchange_leg(
+                request.cross_chat_exchange_leg_id,
+                expected={"submitting"},
+                status="queued",
+                queued_id="queued_status_retry",
+                queue_position=1,
+            )
+            return {"queued": True, "position": 1}
+
+        with (
+            patch.object(agent_server, "start_turn_durably", side_effect=admit_on_second_attempt),
+            patch.object(agent_server, "append_cross_chat_exchange_leg_lifecycle", AsyncMock()),
+            patch.object(agent_server, "append_cross_chat_exchange_leg_terminal_lifecycle", AsyncMock()),
+        ):
+            await agent_server.maybe_deliver_cross_chat_exchange_failure_status(
+                exchange,
+                failed_session_id=failed_leg["target_session_id"],
+                failed_leg=failed_leg,
+            )
+            status_leg = next(
+                item
+                for item in await agent_server.CROSS_CHAT.exchange_legs(
+                    exchange["id"]
+                )
+                if item["kind"] == "status"
+            )
+            self.assertEqual(status_leg["status"], "registered")
+            await agent_server.reconcile_cross_chat_exchange_leg(status_leg)
+
+        status_leg = await agent_server.CROSS_CHAT.get_exchange_leg(
+            status_leg["id"]
+        )
+        self.assertEqual(attempts, 2)
+        self.assertEqual(status_leg["status"], "queued")
+        self.assertEqual(status_leg["queued_id"], "queued_status_retry")
 
     async def test_exchange_reconcile_creates_missing_failure_status_outbox(self) -> None:
         exchange, leg = await self.create_exchange("exchange_status_outbox")
@@ -3537,14 +5064,14 @@ class CrossChatStoreTests(unittest.IsolatedAsyncioTestCase):
             if lock.locked():
                 lock.release()
 
-    def test_exchange_capability_v9_default_deny_contract_is_exact(self) -> None:
+    def test_exchange_capability_v12_default_deny_contract_is_exact(self) -> None:
         with (
             patch.object(agent_server, "CODEX_TRANSPORT", agent_server.CODEX_TRANSPORT_APP_SERVER),
             patch.object(agent_server, "CLAUDE_TRANSPORT", agent_server.CLAUDE_TRANSPORT_AGENT_SDK),
         ):
             capability = agent_server.cross_chat_handoffs_capability()
         self.assertTrue(capability["available"])
-        self.assertEqual(capability["version"], 9)
+        self.assertEqual(capability["version"], 12)
         self.assertEqual(
             capability["actions"],
             [
@@ -3563,13 +5090,22 @@ class CrossChatStoreTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(capability["features"]["durable_route_grants"])
         self.assertTrue(capability["features"]["agent_cross_chat_routes"])
         self.assertTrue(
+            capability["features"]["configured_route_async_request_reply"]
+        )
+        self.assertTrue(
             capability["features"]["live_same_server_request_reply"]
+        )
+        self.assertTrue(
+            capability["features"]["live_wait_async_fallback"]
         )
         self.assertTrue(
             capability["features"]["exact_queued_delivery_skip"]
         )
-        self.assertTrue(
-            capability["features"]["secure_peer_fifo_barriers"]
+        self.assertFalse(capability["features"]["secure_peer_fifo_barriers"])
+        self.assertFalse(capability["features"]["secure_peer_agent_relay"])
+        self.assertEqual(
+            capability["features"]["cross_server_delivery"],
+            "team_network_inbox_only",
         )
         self.assertFalse(
             capability["features"]["agent_ambient_local_handoffs"]
@@ -3595,6 +5131,7 @@ class CrossChatStoreTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(capability["agent_routes"]["max_routes_per_chat"], 16)
         self.assertFalse(capability["agent_routes"]["transcript_access"])
         self.assertEqual(capability["agent_routes"]["policy"], "default_deny")
+        self.assertTrue(capability["agent_routes"]["same_server_only"])
         self.assertTrue(capability["agent_routes"]["durable"])
         self.assertTrue(capability["agent_routes"]["directional"])
         self.assertTrue(
@@ -3617,6 +5154,7 @@ class CrossChatStoreTests(unittest.IsolatedAsyncioTestCase):
                 "max_wait_seconds": (
                     agent_server.PROVIDER_CROSS_CHAT_LIVE_WAIT_MAX_SECONDS
                 ),
+                "wait_timeout_delivery": "asynchronous",
             },
         )
 
@@ -4301,6 +5839,14 @@ class CrossChatStoreTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(retry_receipt, terminal_receipt)
 
         self.assertEqual(submit.await_count, 1)
+        self.assertTrue(agent_server.CROSS_CHAT_LIVE_RESPONSE_WAITERS)
+        self.assertTrue(all(
+            waiter["future"].done()
+            for waiter in agent_server.CROSS_CHAT_LIVE_RESPONSE_WAITERS.values()
+        ))
+        for waiter in agent_server.CROSS_CHAT_LIVE_RESPONSE_WAITERS.values():
+            waiter["deadline"] = asyncio.get_running_loop().time() - 1
+        await agent_server.prune_expired_cross_chat_live_waiters()
         self.assertEqual(agent_server.CROSS_CHAT_LIVE_RESPONSE_WAITERS, {})
         durable = await agent_server.CROSS_CHAT.get_exchange(exchange_ids[0])
         self.assertEqual(durable["status"], "completed")
@@ -4364,11 +5910,752 @@ class CrossChatStoreTests(unittest.IsolatedAsyncioTestCase):
         result = await asyncio.wait_for(waiter["future"], timeout=1)
         self.assertEqual(result["body"], "Automatic live answer")
         self.assertFalse(result["request_response"])
+        with self.assertRaises(HTTPException) as wrong_lease:
+            await agent_server.authorized_cross_chat_live_waiter(
+                source_token,
+                exchange_id=exchange["id"],
+                inbound_leg_id=inbound["id"],
+                lease_id="lease_" + "0" * 32,
+            )
+        self.assertEqual(wrong_lease.exception.status_code, 403)
+        replay_exchange, replay_waiter = (
+            await agent_server.authorized_cross_chat_live_waiter(
+                source_token,
+                exchange_id=exchange["id"],
+                inbound_leg_id=inbound["id"],
+                lease_id=waiter["lease_id"],
+            )
+        )
+        fixed_retention_deadline = float(waiter["deadline"])
+        first_get = await agent_server.await_cross_chat_live_waiter(
+            replay_exchange,
+            replay_waiter,
+            timeout_seconds=1,
+        )
+        self.assertEqual(float(waiter["deadline"]), fixed_retention_deadline)
+        replay_exchange, replay_waiter = (
+            await agent_server.authorized_cross_chat_live_waiter(
+                source_token,
+                exchange_id=exchange["id"],
+                inbound_leg_id=inbound["id"],
+                lease_id=waiter["lease_id"],
+            )
+        )
+        second_get = await agent_server.await_cross_chat_live_waiter(
+            replay_exchange,
+            replay_waiter,
+            timeout_seconds=1,
+        )
+        self.assertEqual(second_get, first_get)
+        self.assertEqual(float(waiter["deadline"]), fixed_retention_deadline)
+        self.assertIs(
+            agent_server.CROSS_CHAT_LIVE_RESPONSE_WAITERS[
+                (exchange["id"], inbound["id"])
+            ],
+            waiter,
+        )
+        waiter["deadline"] = asyncio.get_running_loop().time() - 1
+        replay_exchange, replay_waiter = (
+            await agent_server.authorized_cross_chat_live_waiter(
+                source_token,
+                exchange_id=exchange["id"],
+                inbound_leg_id=inbound["id"],
+                lease_id=waiter["lease_id"],
+            )
+        )
+        with self.assertRaises(HTTPException) as expired_result:
+            await agent_server.await_cross_chat_live_waiter(
+                replay_exchange,
+                replay_waiter,
+                timeout_seconds=1,
+            )
+        self.assertEqual(expired_result.exception.status_code, 410)
+        self.assertNotIn(
+            (exchange["id"], inbound["id"]),
+            agent_server.CROSS_CHAT_LIVE_RESPONSE_WAITERS,
+        )
         submit.assert_not_awaited()
         durable = await agent_server.CROSS_CHAT.get_exchange(exchange["id"])
         self.assertEqual(durable["status"], "completed")
 
-    async def test_live_wait_timeout_releases_waiter_and_exchange(self) -> None:
+    async def test_disconnected_get_does_not_downgrade_attached_retry(self) -> None:
+        exchange, inbound, waiter = await self.create_live_waiter(
+            "exchange_live_get_retry",
+            "run_live_get_retry_source",
+        )
+        disconnect_seen = asyncio.Event()
+
+        class DisconnectedRequest:
+            async def is_disconnected(self) -> bool:
+                disconnect_seen.set()
+                return True
+
+        replay_observer = "observer_" + "2" * 32
+
+        async def wait_for_replay_observer() -> None:
+            for _attempt in range(1000):
+                observers = waiter.get("observers") or set()
+                if replay_observer in observers:
+                    return
+                await asyncio.sleep(0.001)
+            self.fail("the replayed GET did not attach its observer")
+
+        with patch.object(
+            agent_server,
+            "PROVIDER_CROSS_CHAT_LIVE_OBSERVER_RETRY_GRACE_SECONDS",
+            0.2,
+        ):
+            with patch.object(
+                agent_server.uuid,
+                "uuid4",
+                side_effect=(
+                    Mock(hex="1" * 32),
+                    Mock(hex="2" * 32),
+                ),
+            ):
+                disconnected_get = asyncio.create_task(
+                    agent_server.await_cross_chat_live_waiter(
+                        exchange,
+                        waiter,
+                        timeout_seconds=10,
+                        request=DisconnectedRequest(),
+                    )
+                )
+                await asyncio.wait_for(disconnect_seen.wait(), timeout=1)
+                replayed_get = asyncio.create_task(
+                    agent_server.await_cross_chat_live_waiter(
+                        exchange,
+                        waiter,
+                        timeout_seconds=10,
+                    )
+                )
+                await wait_for_replay_observer()
+            exchange, _outbound = await self.deliver_terminal_live_answer(
+                exchange,
+                inbound,
+                waiter,
+                body="Answer survived the GET retry",
+            )
+            replayed_result = await asyncio.wait_for(replayed_get, timeout=1)
+            disconnected_result = await asyncio.gather(
+                disconnected_get,
+                return_exceptions=True,
+            )
+
+        self.assertEqual(replayed_result["body"], "Answer survived the GET retry")
+        self.assertIsInstance(disconnected_result[0], HTTPException)
+        self.assertEqual(disconnected_result[0].status_code, 499)
+        durable = await agent_server.CROSS_CHAT.get_exchange(exchange["id"])
+        self.assertEqual(durable["status"], "completed")
+        self.assertTrue(bool(durable["live_response_lease"]))
+
+    async def test_one_observer_timeout_keeps_other_live_get_attached(self) -> None:
+        exchange, inbound, waiter = await self.create_live_waiter(
+            "exchange_live_two_observers",
+            "run_live_two_observers_source",
+        )
+
+        async def wait_for_observer_count(expected: int) -> None:
+            for _attempt in range(1000):
+                if len(waiter.get("observers") or set()) == expected:
+                    return
+                await asyncio.sleep(0.001)
+            self.fail(f"live waiter did not reach {expected} observers")
+
+        with patch.object(
+            agent_server,
+            "cross_chat_live_wait_seconds",
+            side_effect=lambda requested: 0.02 if requested == 1 else 10.0,
+        ):
+            long_get = asyncio.create_task(
+                agent_server.await_cross_chat_live_waiter(
+                    exchange,
+                    waiter,
+                    timeout_seconds=10,
+                )
+            )
+            await wait_for_observer_count(1)
+            short_get = asyncio.create_task(
+                agent_server.await_cross_chat_live_waiter(
+                    exchange,
+                    waiter,
+                    timeout_seconds=1,
+                )
+            )
+            await wait_for_observer_count(2)
+            short_result = await asyncio.gather(
+                short_get,
+                return_exceptions=True,
+            )
+            self.assertIsInstance(short_result[0], HTTPException)
+            self.assertEqual(short_result[0].status_code, 504)
+            durable = await agent_server.CROSS_CHAT.get_exchange(exchange["id"])
+            self.assertTrue(bool(durable["live_response_lease"]))
+            self.assertIs(
+                agent_server.CROSS_CHAT_LIVE_RESPONSE_WAITERS[
+                    (exchange["id"], inbound["id"])
+                ],
+                waiter,
+            )
+            exchange, _outbound = await self.deliver_terminal_live_answer(
+                exchange,
+                inbound,
+                waiter,
+                body="The remaining observer received this",
+            )
+            long_result = await asyncio.wait_for(long_get, timeout=1)
+
+        self.assertEqual(
+            long_result["body"],
+            "The remaining observer received this",
+        )
+        durable = await agent_server.CROSS_CHAT.get_exchange(exchange["id"])
+        self.assertEqual(durable["status"], "completed")
+
+    async def test_last_observer_timeout_downgrades_once_and_queues_late_answer(self) -> None:
+        exchange, inbound, waiter = await self.create_live_waiter(
+            "exchange_live_all_observers_gone",
+            "run_live_all_observers_gone_source",
+        )
+
+        async def wait_for_two_observers() -> None:
+            for _attempt in range(1000):
+                if len(waiter.get("observers") or set()) == 2:
+                    return
+                await asyncio.sleep(0.001)
+            self.fail("both live GET observers did not attach")
+
+        original_downgrade = agent_server.CROSS_CHAT.downgrade_live_exchange
+        downgrade = AsyncMock(wraps=original_downgrade)
+        with (
+            patch.object(
+                agent_server,
+                "cross_chat_live_wait_seconds",
+                return_value=0.2,
+            ),
+            patch.object(
+                agent_server.CROSS_CHAT,
+                "downgrade_live_exchange",
+                downgrade,
+            ),
+        ):
+            first_get = asyncio.create_task(
+                agent_server.await_cross_chat_live_waiter(
+                    exchange,
+                    waiter,
+                    timeout_seconds=1,
+                )
+            )
+            second_get = asyncio.create_task(
+                agent_server.await_cross_chat_live_waiter(
+                    exchange,
+                    waiter,
+                    timeout_seconds=1,
+                )
+            )
+            await wait_for_two_observers()
+            results = await asyncio.gather(
+                first_get,
+                second_get,
+                return_exceptions=True,
+            )
+
+        self.assertEqual(downgrade.await_count, 1)
+        self.assertEqual(
+            sum(
+                isinstance(result, dict) and bool(result.get("deferred"))
+                for result in results
+            ),
+            1,
+        )
+        timeout_results = [
+            result for result in results if isinstance(result, HTTPException)
+        ]
+        self.assertEqual(len(timeout_results), 1)
+        self.assertEqual(timeout_results[0].status_code, 504)
+        self.assertEqual(agent_server.CROSS_CHAT_LIVE_RESPONSE_WAITERS, {})
+        durable = await agent_server.CROSS_CHAT.get_exchange(exchange["id"])
+        self.assertFalse(bool(durable["live_response_lease"]))
+
+        await agent_server.CROSS_CHAT.update_exchange_leg(
+            inbound["id"],
+            expected={"registered"},
+            status="running",
+            target_run_id="run_live_all_observers_gone_target",
+        )
+        submit = AsyncMock()
+        with (
+            patch.object(
+                agent_server,
+                "append_cross_chat_exchange_leg_lifecycle",
+                AsyncMock(),
+            ),
+            patch.object(
+                agent_server,
+                "append_cross_chat_exchange_leg_terminal_lifecycle",
+                AsyncMock(),
+            ),
+            patch.object(
+                agent_server,
+                "append_cross_chat_exchange_terminal_lifecycle",
+                AsyncMock(),
+            ),
+            patch.object(agent_server, "submit_cross_chat_exchange_leg", submit),
+        ):
+            await agent_server.finalize_cross_chat_exchange_run({
+                "run_id": "run_live_all_observers_gone_target",
+                "exchange_id": exchange["id"],
+                "exchange_leg_id": inbound["id"],
+                "result_text": "Queue this answer after both GETs disappeared",
+                "exit_code": 0,
+                "stopped": False,
+            })
+        submit.assert_awaited_once()
+        outbound = submit.await_args.args[1]
+        self.assertEqual(
+            outbound["body"],
+            "Queue this answer after both GETs disappeared",
+        )
+        self.assertEqual(outbound["target_session_id"], "source")
+
+    async def test_route_live_request_replays_after_async_downgrade(self) -> None:
+        values = {
+            "exchange_id": "exchange_route_live_replay",
+            "leg_id": "leg_route_live_replay",
+            "requester_session_id": "source",
+            "authorization_source_run_id": "run_route_live_replay",
+            "responder_session_id": "target",
+            "body": "Route question",
+            "idempotency_key": "route-live-replay-key",
+            "max_legs": 6,
+            "expires_at": "2099-01-01T00:00:00Z",
+            "authorization_route_id": "route_" + "a" * 32,
+            "initial_action": "request_reply",
+            "source_user_instruction": "Ask Target",
+            "live_response_lease": True,
+        }
+        exchange, leg, created = (
+            await agent_server.CROSS_CHAT.create_route_exchange_request(**values)
+        )
+        self.assertTrue(created)
+        downgraded, changed = await agent_server.CROSS_CHAT.downgrade_live_exchange(
+            exchange["id"],
+            active_leg_id=leg["id"],
+            expected_instance_id=str(exchange["live_response_instance_id"]),
+        )
+        self.assertTrue(changed)
+        self.assertFalse(bool(downgraded["live_response_lease"]))
+        replay_exchange, replay_leg, replay_created = (
+            await agent_server.CROSS_CHAT.create_route_exchange_request(**values)
+        )
+        self.assertFalse(replay_created)
+        self.assertEqual(replay_leg["id"], leg["id"])
+        self.assertTrue(bool(replay_exchange["live_response_requested"]))
+        self.assertFalse(bool(replay_exchange["live_response_lease"]))
+        with self.assertRaises(HTTPException) as changed_payload:
+            await agent_server.CROSS_CHAT.create_route_exchange_request(
+                **{**values, "body": "Changed route question"}
+            )
+        self.assertEqual(changed_payload.exception.status_code, 409)
+
+    async def test_exact_live_handoff_post_replay_returns_deferred_receipt(self) -> None:
+        exchange = {
+            "id": "exchange_deferred_post_replay",
+            "status": "active",
+            "authorization_source_run_id": "run_deferred_post_replay",
+            "live_response_requested": 1,
+            "live_response_lease": 0,
+        }
+        leg = {
+            "id": "leg_deferred_post_replay",
+            "status": "running",
+            "source_session_id": "source",
+            "source_run_id": "run_deferred_post_replay",
+        }
+        request = Request({
+            "type": "http",
+            "headers": [(b"x-agentsdock-provider-capability", b"capability")],
+            "client": ("127.0.0.1", 1234),
+        })
+        with (
+            patch.object(
+                agent_server,
+                "create_authorized_cross_chat_instruction",
+                AsyncMock(return_value=({"exchange": exchange, "leg": leg}, False)),
+            ),
+            patch.object(agent_server, "append_cross_chat_exchange_registered", AsyncMock()),
+            patch.object(agent_server, "append_cross_chat_exchange_leg_lifecycle", AsyncMock()),
+            patch.object(agent_server, "submit_cross_chat_exchange_leg", AsyncMock()) as submit,
+        ):
+            receipt = await agent_server.submit_authorized_cross_chat_handoff(
+                agent_server.CrossChatHandoffRequest(
+                    target_session_id="grant_" + "a" * 64,
+                    action="request_reply",
+                    body="Replay the exact question",
+                    idempotency_key="deferred-post-replay-key",
+                    wait_for_response=True,
+                    response_timeout_seconds=75,
+                ),
+                request,
+            )
+        self.assertEqual(receipt["exchange_id"], exchange["id"])
+        self.assertEqual(receipt["inbound_leg_id"], leg["id"])
+        self.assertTrue(receipt["deferred"])
+        self.assertEqual(receipt["delivery"], "asynchronous")
+        submit.assert_not_awaited()
+
+    async def test_direct_live_503_downgrades_and_exact_replay_is_deferred(self) -> None:
+        token = await self.issue_live_waiter_owner(
+            "source",
+            "run_direct_live_503",
+        )
+        await agent_server.CROSS_CHAT.create_exchange_obligation(
+            exchange_id="exchange_direct_live_503",
+            requester_session_id="source",
+            authorization_source_run_id="run_direct_live_503",
+            responder_session_id="target",
+            max_legs=6,
+            expires_at="2099-01-01T00:00:00Z",
+        )
+        exchange, leg, _created = (
+            await agent_server.CROSS_CHAT.create_initial_exchange_leg(
+                exchange_id="exchange_direct_live_503",
+                source_session_id="source",
+                source_run_id="run_direct_live_503",
+                target_session_id="target",
+                body="Retry this direct live request",
+                idempotency_key="direct-live-503-key",
+                live_response_lease=True,
+            )
+        )
+        request = Request({
+            "type": "http",
+            "headers": [
+                (b"x-agentsdock-provider-capability", token.encode()),
+            ],
+            "client": ("127.0.0.1", 1234),
+        })
+        captured_waiters = []
+        original_register = (
+            agent_server.register_or_replay_cross_chat_live_waiter_locked
+        )
+
+        async def replay_create(*_args, **_kwargs):
+            return ({
+                "exchange": await agent_server.CROSS_CHAT.get_exchange(
+                    exchange["id"]
+                ),
+                "leg": await agent_server.CROSS_CHAT.get_exchange_leg(leg["id"]),
+            }, False)
+
+        async def capture_waiter(*args, **kwargs):
+            waiter = await original_register(*args, **kwargs)
+            captured_waiters.append(waiter)
+            return waiter
+
+        unavailable = HTTPException(
+            status_code=503,
+            detail="target admission is temporarily unavailable",
+        )
+        with (
+            patch.object(
+                agent_server,
+                "create_authorized_cross_chat_instruction",
+                side_effect=replay_create,
+            ),
+            patch.object(
+                agent_server,
+                "register_or_replay_cross_chat_live_waiter_locked",
+                side_effect=capture_waiter,
+            ),
+            patch.object(
+                agent_server,
+                "append_cross_chat_exchange_registered",
+                AsyncMock(),
+            ),
+            patch.object(
+                agent_server,
+                "append_cross_chat_exchange_leg_lifecycle",
+                AsyncMock(),
+            ),
+            patch.object(
+                agent_server,
+                "submit_cross_chat_exchange_leg",
+                AsyncMock(side_effect=unavailable),
+            ) as submit,
+            patch.object(
+                agent_server,
+                "schedule_cross_chat_exchange_leg_retry",
+                Mock(),
+            ) as schedule,
+        ):
+            req = agent_server.CrossChatHandoffRequest(
+                target_session_id="grant_" + "a" * 64,
+                action="request_reply",
+                body="Retry this direct live request",
+                idempotency_key="direct-live-503-key",
+                wait_for_response=True,
+                response_timeout_seconds=75,
+            )
+            first = await agent_server.submit_authorized_cross_chat_handoff(
+                req,
+                request,
+            )
+            replay = await agent_server.submit_authorized_cross_chat_handoff(
+                req,
+                request,
+            )
+
+        self.assertEqual(first, replay)
+        self.assertTrue(first["deferred"])
+        self.assertEqual(first["delivery"], "asynchronous")
+        self.assertEqual(first["exchange_id"], exchange["id"])
+        self.assertEqual(first["inbound_leg_id"], leg["id"])
+        self.assertEqual(submit.await_count, 2)
+        self.assertEqual(schedule.call_count, 2)
+        self.assertEqual(len(captured_waiters), 1)
+        self.assertTrue(captured_waiters[0]["future"].done())
+        self.assertTrue(captured_waiters[0]["future"].result()["deferred"])
+        self.assertEqual(agent_server.CROSS_CHAT_LIVE_RESPONSE_WAITERS, {})
+        durable = await agent_server.CROSS_CHAT.get_exchange(exchange["id"])
+        self.assertEqual(durable["status"], "active")
+        self.assertFalse(bool(durable["live_response_lease"]))
+        self.assertTrue(bool(durable["live_response_requested"]))
+        self.assertEqual(
+            len(await agent_server.CROSS_CHAT.exchange_legs(exchange["id"])),
+            1,
+        )
+
+    async def test_route_live_503_downgrades_and_exact_replay_is_deferred(self) -> None:
+        token = await self.issue_live_waiter_owner(
+            "source",
+            "run_route_live_503",
+        )
+        route_id = "route_" + "b" * 32
+        reservation = {
+            "exchange_id": "exchange_route_live_503",
+            "leg_id": "leg_route_live_503",
+            "source_session_id": "source",
+            "source_run_id": "run_route_live_503",
+            "target_session_id": "target",
+            "source_user_instruction": "Ask target and wait",
+            "expires_at": "2099-01-01T00:00:00Z",
+        }
+        request = Request({
+            "type": "http",
+            "headers": [
+                (b"x-agentsdock-provider-capability", token.encode()),
+            ],
+            "client": ("127.0.0.1", 1234),
+        })
+        captured_waiters = []
+        original_register = (
+            agent_server.register_or_replay_cross_chat_live_waiter_locked
+        )
+
+        async def capture_waiter(*args, **kwargs):
+            waiter = await original_register(*args, **kwargs)
+            captured_waiters.append(waiter)
+            return waiter
+
+        unavailable = HTTPException(
+            status_code=503,
+            detail="target admission is temporarily unavailable",
+        )
+        with (
+            patch.object(
+                agent_server,
+                "provider_route_capability_source",
+                AsyncMock(return_value="source"),
+            ),
+            patch.object(
+                agent_server,
+                "reserve_provider_route_handoff",
+                AsyncMock(return_value=(reservation, False)),
+            ),
+            patch.object(
+                agent_server,
+                "register_or_replay_cross_chat_live_waiter_locked",
+                side_effect=capture_waiter,
+            ),
+            patch.object(
+                agent_server,
+                "append_cross_chat_exchange_registered",
+                AsyncMock(),
+            ),
+            patch.object(
+                agent_server,
+                "append_cross_chat_exchange_leg_lifecycle",
+                AsyncMock(),
+            ),
+            patch.object(
+                agent_server,
+                "submit_cross_chat_exchange_leg",
+                AsyncMock(side_effect=unavailable),
+            ) as submit,
+            patch.object(
+                agent_server,
+                "schedule_cross_chat_exchange_leg_retry",
+                Mock(),
+            ) as schedule,
+        ):
+            req = agent_server.AgentRouteHandoffRequest(
+                action="request_reply",
+                body="Retry this route live request",
+                idempotency_key="route-live-503-key",
+                wait_for_response=True,
+                response_timeout_seconds=75,
+            )
+            first = await agent_server.submit_provider_route_handoff(
+                route_id,
+                req,
+                request,
+            )
+            replay = await agent_server.submit_provider_route_handoff(
+                route_id,
+                req,
+                request,
+            )
+
+        self.assertEqual(first, replay)
+        self.assertEqual(first["route_id"], route_id)
+        self.assertTrue(first["deferred"])
+        self.assertEqual(first["delivery"], "asynchronous")
+        self.assertEqual(submit.await_count, 2)
+        self.assertEqual(schedule.call_count, 2)
+        self.assertEqual(len(captured_waiters), 1)
+        self.assertTrue(captured_waiters[0]["future"].done())
+        self.assertTrue(captured_waiters[0]["future"].result()["deferred"])
+        self.assertEqual(agent_server.CROSS_CHAT_LIVE_RESPONSE_WAITERS, {})
+        durable = await agent_server.CROSS_CHAT.get_exchange(
+            reservation["exchange_id"]
+        )
+        self.assertEqual(durable["status"], "active")
+        self.assertFalse(bool(durable["live_response_lease"]))
+        self.assertEqual(
+            len(await agent_server.CROSS_CHAT.exchange_legs(durable["id"])),
+            1,
+        )
+
+    async def test_cancelled_direct_live_post_preserves_durable_async_leg(self) -> None:
+        token = await self.issue_live_waiter_owner(
+            "source",
+            "run_direct_live_cancel",
+        )
+        await agent_server.CROSS_CHAT.create_exchange_obligation(
+            exchange_id="exchange_direct_live_cancel",
+            requester_session_id="source",
+            authorization_source_run_id="run_direct_live_cancel",
+            responder_session_id="target",
+            max_legs=6,
+            expires_at="2099-01-01T00:00:00Z",
+        )
+        exchange, leg, _created = (
+            await agent_server.CROSS_CHAT.create_initial_exchange_leg(
+                exchange_id="exchange_direct_live_cancel",
+                source_session_id="source",
+                source_run_id="run_direct_live_cancel",
+                target_session_id="target",
+                body="Preserve this cancelled live POST",
+                idempotency_key="direct-live-cancel-key",
+                live_response_lease=True,
+            )
+        )
+        request = Request({
+            "type": "http",
+            "headers": [
+                (b"x-agentsdock-provider-capability", token.encode()),
+            ],
+            "client": ("127.0.0.1", 1234),
+        })
+        entered = asyncio.Event()
+        release = asyncio.Event()
+        captured_waiters = []
+        original_register = (
+            agent_server.register_or_replay_cross_chat_live_waiter_locked
+        )
+
+        async def replay_create(*_args, **_kwargs):
+            return ({
+                "exchange": await agent_server.CROSS_CHAT.get_exchange(
+                    exchange["id"]
+                ),
+                "leg": await agent_server.CROSS_CHAT.get_exchange_leg(leg["id"]),
+            }, False)
+
+        async def capture_waiter(*args, **kwargs):
+            waiter = await original_register(*args, **kwargs)
+            captured_waiters.append(waiter)
+            return waiter
+
+        async def delayed_submit(current_exchange, current_leg):
+            entered.set()
+            await release.wait()
+            return current_exchange, current_leg
+
+        with (
+            patch.object(
+                agent_server,
+                "create_authorized_cross_chat_instruction",
+                side_effect=replay_create,
+            ),
+            patch.object(
+                agent_server,
+                "register_or_replay_cross_chat_live_waiter_locked",
+                side_effect=capture_waiter,
+            ),
+            patch.object(
+                agent_server,
+                "append_cross_chat_exchange_registered",
+                AsyncMock(),
+            ),
+            patch.object(
+                agent_server,
+                "append_cross_chat_exchange_leg_lifecycle",
+                AsyncMock(),
+            ),
+            patch.object(
+                agent_server,
+                "submit_cross_chat_exchange_leg",
+                side_effect=delayed_submit,
+            ),
+            patch.object(
+                agent_server,
+                "schedule_cross_chat_exchange_leg_retry",
+                Mock(),
+            ) as schedule,
+        ):
+            task = asyncio.create_task(
+                agent_server.submit_authorized_cross_chat_handoff(
+                    agent_server.CrossChatHandoffRequest(
+                        target_session_id="grant_" + "c" * 64,
+                        action="request_reply",
+                        body="Preserve this cancelled live POST",
+                        idempotency_key="direct-live-cancel-key",
+                        wait_for_response=True,
+                        response_timeout_seconds=75,
+                    ),
+                    request,
+                )
+            )
+            await asyncio.wait_for(entered.wait(), timeout=1)
+            task.cancel()
+            release.set()
+            with self.assertRaises(asyncio.CancelledError):
+                await asyncio.wait_for(task, timeout=1)
+
+        self.assertEqual(len(captured_waiters), 1)
+        self.assertTrue(captured_waiters[0]["future"].done())
+        self.assertTrue(captured_waiters[0]["future"].result()["deferred"])
+        self.assertEqual(agent_server.CROSS_CHAT_LIVE_RESPONSE_WAITERS, {})
+        durable = await agent_server.CROSS_CHAT.get_exchange(exchange["id"])
+        self.assertEqual(durable["status"], "active")
+        self.assertFalse(bool(durable["live_response_lease"]))
+        durable_leg = await agent_server.CROSS_CHAT.get_exchange_leg(leg["id"])
+        self.assertEqual(durable_leg["status"], "registered")
+        schedule.assert_called_once_with(leg["id"])
+
+    async def test_live_wait_timeout_falls_back_to_async_answer_delivery(self) -> None:
         source_token = await self.issue_live_waiter_owner(
             "source",
             "run_live_timeout_source",
@@ -4402,22 +6689,66 @@ class CrossChatStoreTests(unittest.IsolatedAsyncioTestCase):
             )
         with (
             patch.object(agent_server, "cross_chat_live_wait_seconds", return_value=0.01),
+            patch.object(agent_server, "managed_server_update_blocks_work", return_value=True),
+            patch.object(agent_server, "managed_server_restart_blocks_work", return_value=True),
             patch.object(agent_server, "append_cross_chat_exchange_leg_terminal_lifecycle", AsyncMock()),
             patch.object(agent_server, "append_cross_chat_exchange_terminal_lifecycle", AsyncMock()),
             patch.object(agent_server, "maybe_deliver_cross_chat_exchange_failure_status", AsyncMock()),
         ):
-            with self.assertRaises(HTTPException) as raised:
-                await agent_server.await_cross_chat_live_waiter(
-                    exchange,
-                    waiter,
-                    timeout_seconds=1,
-                )
-        self.assertEqual(raised.exception.status_code, 504)
+            result = await agent_server.await_cross_chat_live_waiter(
+                exchange,
+                waiter,
+                timeout_seconds=1,
+            )
+        self.assertTrue(result["deferred"])
+        self.assertEqual(result["delivery"], "asynchronous")
         self.assertEqual(agent_server.CROSS_CHAT_LIVE_RESPONSE_WAITERS, {})
         durable = await agent_server.CROSS_CHAT.get_exchange(exchange["id"])
-        self.assertEqual(durable["status"], "cancelled")
+        self.assertEqual(durable["status"], "active")
+        self.assertFalse(bool(durable["live_response_lease"]))
+        self.assertTrue(bool(durable["live_response_requested"]))
+        replay_exchange, replay_leg, replay_created = (
+            await agent_server.CROSS_CHAT.create_initial_exchange_leg(
+                exchange_id=exchange["id"],
+                source_session_id="source",
+                source_run_id="run_live_timeout_source",
+                target_session_id="target",
+                body="Wait briefly",
+                idempotency_key="live-timeout-request",
+                live_response_lease=True,
+            )
+        )
+        self.assertFalse(replay_created)
+        self.assertEqual(replay_leg["id"], inbound["id"])
+        self.assertFalse(bool(replay_exchange["live_response_lease"]))
 
-    async def test_live_waiter_expires_without_get_and_reconciliation_closes_exchange(self) -> None:
+        await agent_server.CROSS_CHAT.update_exchange_leg(
+            inbound["id"],
+            expected={"registered"},
+            status="running",
+            target_run_id="run_live_timeout_target",
+        )
+        submit = AsyncMock()
+        with (
+            patch.object(agent_server, "append_cross_chat_exchange_leg_terminal_lifecycle", AsyncMock()),
+            patch.object(agent_server, "append_cross_chat_exchange_terminal_lifecycle", AsyncMock()),
+            patch.object(agent_server, "append_cross_chat_exchange_leg_lifecycle", AsyncMock()),
+            patch.object(agent_server, "submit_cross_chat_exchange_leg", submit),
+        ):
+            await agent_server.finalize_cross_chat_exchange_run({
+                "run_id": "run_live_timeout_target",
+                "exchange_id": exchange["id"],
+                "exchange_leg_id": inbound["id"],
+                "result_text": "Late but durable answer",
+                "exit_code": 0,
+                "stopped": False,
+            })
+        submit.assert_awaited_once()
+        outbound = submit.await_args.args[1]
+        self.assertEqual(outbound["body"], "Late but durable answer")
+        self.assertEqual(outbound["target_session_id"], "source")
+
+    async def test_live_waiter_expires_without_get_and_reconciliation_defers_exchange(self) -> None:
         source_token = await self.issue_live_waiter_owner(
             "source",
             "run_live_lost_receipt",
@@ -4455,11 +6786,13 @@ class CrossChatStoreTests(unittest.IsolatedAsyncioTestCase):
             patch.object(agent_server, "append_cross_chat_exchange_leg_terminal_lifecycle", AsyncMock()),
             patch.object(agent_server, "append_cross_chat_exchange_terminal_lifecycle", AsyncMock()),
             patch.object(agent_server, "maybe_deliver_cross_chat_exchange_failure_status", AsyncMock()),
+            patch.object(agent_server, "submit_cross_chat_exchange_leg", AsyncMock()) as submit,
         ):
             await agent_server.reconcile_cross_chat_exchanges()
         durable = await agent_server.CROSS_CHAT.get_exchange(exchange["id"])
-        self.assertEqual(durable["status"], "failed")
-        self.assertEqual(durable["error_code"], "live_lease_owner_lost")
+        self.assertEqual(durable["status"], "active")
+        self.assertFalse(bool(durable["live_response_lease"]))
+        submit.assert_awaited_once()
         self.assertEqual(agent_server.CROSS_CHAT_LIVE_RESPONSE_WAITERS, {})
 
     async def test_reconciliation_never_submits_live_initial_leg_before_waiter_registration(self) -> None:
@@ -4532,8 +6865,16 @@ class CrossChatStoreTests(unittest.IsolatedAsyncioTestCase):
                 )
             )
 
-        lock = agent_server.cross_chat_live_lease_lock(exchange["id"])
-        await lock.acquire()
+        lock_held = asyncio.Event()
+        release_lock = asyncio.Event()
+
+        async def hold_live_lease_lock() -> None:
+            async with agent_server.cross_chat_live_lease_lock(exchange["id"]):
+                lock_held.set()
+                await release_lock.wait()
+
+        lock_holder = asyncio.create_task(hold_live_lease_lock())
+        await asyncio.wait_for(lock_held.wait(), timeout=1)
 
         async def register_retry() -> dict:
             async with agent_server.cross_chat_live_lease_lock(exchange["id"]):
@@ -4552,7 +6893,8 @@ class CrossChatStoreTests(unittest.IsolatedAsyncioTestCase):
             agent_server.reconcile_cross_chat_exchanges()
         )
         await asyncio.sleep(0)
-        lock.release()
+        release_lock.set()
+        await asyncio.wait_for(lock_holder, timeout=1)
         waiter = await asyncio.wait_for(registration, timeout=1)
         recovered = await asyncio.wait_for(reconciliation, timeout=1)
 
@@ -4656,23 +6998,52 @@ class CrossChatStoreTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertFalse(fresh_waiter["future"].done())
 
-    async def test_live_lease_lock_identity_survives_waiter_handoff(self) -> None:
+    async def test_live_lease_lock_identity_survives_waiter_handoff_and_retires(
+        self,
+    ) -> None:
         exchange_id = "exchange_lock_handoff"
-        lock = agent_server.cross_chat_live_lease_lock(exchange_id)
-        await lock.acquire()
+        owner_entered = asyncio.Event()
+        release_owner = asyncio.Event()
         acquired = asyncio.Event()
+        release_queued = asyncio.Event()
+
+        async def initial_owner() -> None:
+            async with agent_server.cross_chat_live_lease_lock(exchange_id):
+                owner_entered.set()
+                await release_owner.wait()
 
         async def queued_owner() -> None:
-            async with lock:
+            async with agent_server.cross_chat_live_lease_lock(exchange_id):
                 acquired.set()
+                await release_queued.wait()
 
+        initial = asyncio.create_task(initial_owner())
+        await asyncio.wait_for(owner_entered.wait(), timeout=1)
+        retained_lock = agent_server.CROSS_CHAT_LIVE_LEASE_LOCKS[exchange_id]
         queued = asyncio.create_task(queued_owner())
         await asyncio.sleep(0)
-        lock.release()
-        third_party_lock = agent_server.cross_chat_live_lease_lock(exchange_id)
-        self.assertIs(third_party_lock, lock)
+        self.assertEqual(
+            agent_server.CROSS_CHAT_LIVE_LEASE_LOCK_REFCOUNTS[exchange_id],
+            2,
+        )
+        release_owner.set()
+        await asyncio.wait_for(initial, timeout=1)
         await asyncio.wait_for(acquired.wait(), timeout=1)
-        await queued
+        self.assertIs(
+            agent_server.CROSS_CHAT_LIVE_LEASE_LOCKS[exchange_id],
+            retained_lock,
+        )
+        self.assertEqual(
+            agent_server.CROSS_CHAT_LIVE_LEASE_LOCK_REFCOUNTS[exchange_id],
+            1,
+        )
+        release_queued.set()
+        await asyncio.wait_for(queued, timeout=1)
+        self.assertNotIn(exchange_id, agent_server.CROSS_CHAT_LIVE_LEASE_LOCKS)
+        self.assertNotIn(
+            exchange_id,
+            agent_server.CROSS_CHAT_LIVE_LEASE_LOCK_REFCOUNTS,
+        )
 
     async def test_shutdown_waiter_settlement_serializes_on_live_lease_lock(self) -> None:
         exchange_id = "exchange_shutdown_lock"
@@ -4683,8 +7054,16 @@ class CrossChatStoreTests(unittest.IsolatedAsyncioTestCase):
         agent_server.CROSS_CHAT_LIVE_RESPONSE_WAITERS[
             (exchange_id, inbound_leg_id)
         ] = waiter
-        lock = agent_server.cross_chat_live_lease_lock(exchange_id)
-        await lock.acquire()
+        lock_held = asyncio.Event()
+        release_lock = asyncio.Event()
+
+        async def hold_live_lease_lock() -> None:
+            async with agent_server.cross_chat_live_lease_lock(exchange_id):
+                lock_held.set()
+                await release_lock.wait()
+
+        lock_holder = asyncio.create_task(hold_live_lease_lock())
+        await asyncio.wait_for(lock_held.wait(), timeout=1)
         settlement = asyncio.create_task(
             agent_server.settle_cross_chat_live_waiters_for_shutdown()
         )
@@ -4692,16 +7071,17 @@ class CrossChatStoreTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(settlement.done())
         self.assertFalse(waiter["future"].done())
 
-        lock.release()
+        release_lock.set()
+        await asyncio.wait_for(lock_holder, timeout=1)
         await asyncio.wait_for(settlement, timeout=1)
         self.assertEqual(agent_server.CROSS_CHAT_LIVE_RESPONSE_WAITERS, {})
         self.assertEqual(
             waiter["future"].result()["error_code"],
             "server_shutdown",
         )
-        self.assertIs(
-            agent_server.cross_chat_live_lease_lock(exchange_id),
-            lock,
+        self.assertNotIn(
+            exchange_id,
+            agent_server.CROSS_CHAT_LIVE_LEASE_LOCKS,
         )
 
     async def test_invalid_live_wait_path_does_not_retain_keyed_lock(self) -> None:
@@ -4851,7 +7231,302 @@ class CrossChatStoreTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(legs), 1)
         self.assertEqual(legs[0]["response_state"], "open")
 
-    async def test_recovered_stale_live_lease_is_not_scheduled_before_reconcile(self) -> None:
+    async def test_downgraded_live_followup_commits_as_async_and_returns_deferred(self) -> None:
+        await agent_server.CROSS_CHAT.create_exchange_obligation(
+            exchange_id="exchange_downgraded_followup",
+            requester_session_id="source",
+            authorization_source_run_id="run_downgraded_source",
+            responder_session_id="target",
+            max_legs=6,
+            expires_at="2099-01-01T00:00:00Z",
+        )
+        exchange, inbound, _created = (
+            await agent_server.CROSS_CHAT.create_initial_exchange_leg(
+                exchange_id="exchange_downgraded_followup",
+                source_session_id="source",
+                source_run_id="run_downgraded_source",
+                target_session_id="target",
+                body="Initial live question",
+                idempotency_key="downgraded-initial",
+                live_response_lease=True,
+            )
+        )
+        inbound = await agent_server.CROSS_CHAT.update_exchange_leg(
+            inbound["id"],
+            expected={"registered"},
+            status="running",
+            target_run_id="run_downgraded_target",
+        )
+        authority = await agent_server.issue_cross_chat_capability(
+            "target",
+            "run_downgraded_target",
+            [],
+            actions={"cross_chat_response"},
+            exchange_response_grants={(exchange["id"], inbound["id"])},
+        )
+        token = json.loads(authority.read_text())["provider_capability"]
+        agent_server.CURRENT_TURNS["target"] = {
+            "run_id": "run_downgraded_target",
+        }
+        downgraded, changed = await agent_server.CROSS_CHAT.downgrade_live_exchange(
+            exchange["id"],
+            active_leg_id=inbound["id"],
+            expected_instance_id=str(exchange["live_response_instance_id"]),
+        )
+        self.assertTrue(changed)
+        self.assertFalse(bool(downgraded["live_response_lease"]))
+        request = Request({
+            "type": "http",
+            "headers": [
+                (b"x-agentsdock-provider-capability", token.encode()),
+            ],
+            "client": ("127.0.0.1", 1234),
+        })
+        submit = AsyncMock(side_effect=lambda current_exchange, current_leg: (
+            current_exchange,
+            current_leg,
+        ))
+        with (
+            patch.object(agent_server, "append_cross_chat_exchange_leg_lifecycle", AsyncMock()),
+            patch.object(agent_server, "submit_cross_chat_exchange_leg", submit),
+        ):
+            receipt = await agent_server.submit_authorized_cross_chat_exchange_response(
+                exchange["id"],
+                agent_server.CrossChatExchangeResponseRequest(
+                    inbound_leg_id=inbound["id"],
+                    body="Async follow-up after timeout",
+                    request_response=True,
+                    idempotency_key="downgraded-followup",
+                    wait_for_response=True,
+                    response_timeout_seconds=75,
+                ),
+                request,
+            )
+        self.assertTrue(receipt["deferred"])
+        self.assertEqual(receipt["delivery"], "asynchronous")
+        submit.assert_awaited_once()
+        legs = await agent_server.CROSS_CHAT.exchange_legs(exchange["id"])
+        self.assertEqual(len(legs), 2)
+        self.assertEqual(legs[1]["kind"], "request")
+        self.assertEqual(receipt["inbound_leg_id"], legs[1]["id"])
+
+    async def test_cancelled_live_followup_post_preserves_durable_next_leg(self) -> None:
+        exchange, inbound, _source_waiter = await self.create_live_waiter(
+            "exchange_live_followup_cancel",
+            "run_live_followup_cancel_source",
+        )
+        inbound = await agent_server.CROSS_CHAT.update_exchange_leg(
+            inbound["id"],
+            expected={"registered"},
+            status="running",
+            target_run_id="run_live_followup_cancel_target",
+        )
+        authority = await agent_server.issue_cross_chat_capability(
+            "target",
+            "run_live_followup_cancel_target",
+            [],
+            actions={"cross_chat_response"},
+            exchange_response_grants={(exchange["id"], inbound["id"])},
+        )
+        token = json.loads(authority.read_text())["provider_capability"]
+        agent_server.CURRENT_TURNS["target"] = {
+            "run_id": "run_live_followup_cancel_target",
+        }
+        request = Request({
+            "type": "http",
+            "headers": [
+                (b"x-agentsdock-provider-capability", token.encode()),
+            ],
+            "client": ("127.0.0.1", 1234),
+        })
+        delivered = asyncio.Event()
+        release = asyncio.Event()
+        next_waiters = []
+        original_register = agent_server.register_cross_chat_live_waiter_locked
+
+        async def capture_next_waiter(*args, **kwargs):
+            waiter = await original_register(*args, **kwargs)
+            next_waiters.append(waiter)
+            return waiter
+
+        async def pause_after_live_delivery(*_args, **_kwargs):
+            delivered.set()
+            await release.wait()
+
+        with (
+            patch.object(
+                agent_server,
+                "register_cross_chat_live_waiter_locked",
+                side_effect=capture_next_waiter,
+            ),
+            patch.object(
+                agent_server,
+                "append_cross_chat_exchange_leg_lifecycle",
+                AsyncMock(),
+            ),
+            patch.object(
+                agent_server,
+                "append_cross_chat_exchange_leg_terminal_lifecycle",
+                side_effect=pause_after_live_delivery,
+            ),
+        ):
+            task = asyncio.create_task(
+                agent_server.submit_authorized_cross_chat_exchange_response(
+                    exchange["id"],
+                    agent_server.CrossChatExchangeResponseRequest(
+                        inbound_leg_id=inbound["id"],
+                        body="Ask one more live question",
+                        request_response=True,
+                        idempotency_key="live-followup-cancel-key",
+                        wait_for_response=True,
+                        response_timeout_seconds=75,
+                    ),
+                    request,
+                )
+            )
+            await asyncio.wait_for(delivered.wait(), timeout=1)
+            task.cancel()
+            release.set()
+            with self.assertRaises(asyncio.CancelledError):
+                await asyncio.wait_for(task, timeout=1)
+
+        self.assertEqual(len(next_waiters), 1)
+        next_waiter = next_waiters[0]
+        self.assertTrue(next_waiter["future"].done())
+        self.assertTrue(next_waiter["future"].result()["deferred"])
+        next_leg_id = str(next_waiter["inbound_leg_id"])
+        self.assertNotIn(
+            (exchange["id"], next_leg_id),
+            agent_server.CROSS_CHAT_LIVE_RESPONSE_WAITERS,
+        )
+        durable = await agent_server.CROSS_CHAT.get_exchange(exchange["id"])
+        self.assertEqual(durable["status"], "active")
+        self.assertFalse(bool(durable["live_response_lease"]))
+        self.assertTrue(bool(durable["live_response_requested"]))
+        self.assertEqual(durable["active_leg_id"], next_leg_id)
+        next_leg = await agent_server.CROSS_CHAT.get_exchange_leg(next_leg_id)
+        self.assertEqual(next_leg["status"], "delivered")
+        self.assertEqual(next_leg["response_state"], "open")
+
+    async def test_live_followup_snapshot_race_joins_async_downgrade(self) -> None:
+        source_token = await self.issue_live_waiter_owner(
+            "source",
+            "run_snapshot_race_source",
+        )
+        await agent_server.CROSS_CHAT.create_exchange_obligation(
+            exchange_id="exchange_live_snapshot_race",
+            requester_session_id="source",
+            authorization_source_run_id="run_snapshot_race_source",
+            responder_session_id="target",
+            max_legs=6,
+            expires_at="2099-01-01T00:00:00Z",
+        )
+        exchange, inbound, _created = (
+            await agent_server.CROSS_CHAT.create_initial_exchange_leg(
+                exchange_id="exchange_live_snapshot_race",
+                source_session_id="source",
+                source_run_id="run_snapshot_race_source",
+                target_session_id="target",
+                body="Race a live response against timeout cleanup",
+                idempotency_key="snapshot-race-initial",
+                live_response_lease=True,
+            )
+        )
+        inbound = await agent_server.CROSS_CHAT.update_exchange_leg(
+            inbound["id"],
+            expected={"registered"},
+            status="running",
+            target_run_id="run_snapshot_race_target",
+        )
+        async with agent_server.cross_chat_live_lease_lock(exchange["id"]):
+            waiter = await agent_server.register_cross_chat_live_waiter_locked(
+                exchange,
+                inbound,
+                owner_session_id="source",
+                owner_run_id="run_snapshot_race_source",
+                capability_token=source_token,
+            )
+        authority = await agent_server.issue_cross_chat_capability(
+            "target",
+            "run_snapshot_race_target",
+            [],
+            actions={"cross_chat_response"},
+            exchange_response_grants={(exchange["id"], inbound["id"])},
+        )
+        target_token = json.loads(authority.read_text())["provider_capability"]
+        agent_server.CURRENT_TURNS["target"] = {
+            "run_id": "run_snapshot_race_target",
+        }
+        request = Request({
+            "type": "http",
+            "headers": [
+                (
+                    b"x-agentsdock-provider-capability",
+                    target_token.encode(),
+                ),
+            ],
+            "client": ("127.0.0.1", 1234),
+        })
+        preflight_started = asyncio.Event()
+        resume_preflight = asyncio.Event()
+
+        async def pause_after_live_snapshot(*_args, **_kwargs) -> None:
+            preflight_started.set()
+            await resume_preflight.wait()
+
+        submit = AsyncMock(side_effect=lambda current_exchange, current_leg: (
+            current_exchange,
+            current_leg,
+        ))
+        with (
+            patch.object(
+                agent_server,
+                "require_cross_chat_live_response_preflight",
+                side_effect=pause_after_live_snapshot,
+            ),
+            patch.object(
+                agent_server,
+                "append_cross_chat_exchange_leg_lifecycle",
+                AsyncMock(),
+            ),
+            patch.object(agent_server, "submit_cross_chat_exchange_leg", submit),
+        ):
+            response_task = asyncio.create_task(
+                agent_server.submit_authorized_cross_chat_exchange_response(
+                    exchange["id"],
+                    agent_server.CrossChatExchangeResponseRequest(
+                        inbound_leg_id=inbound["id"],
+                        body="Commit this exactly once through async delivery",
+                        request_response=True,
+                        idempotency_key="snapshot-race-followup",
+                        wait_for_response=True,
+                        response_timeout_seconds=75,
+                    ),
+                    request,
+                )
+            )
+            await asyncio.wait_for(preflight_started.wait(), timeout=1)
+            outcome = await agent_server.defer_cross_chat_live_wait_after_observation(
+                exchange["id"],
+                inbound["id"],
+                waiter,
+            )
+            self.assertEqual(outcome["state"], "deferred")
+            resume_preflight.set()
+            receipt = await asyncio.wait_for(response_task, timeout=1)
+
+        self.assertTrue(receipt["deferred"])
+        self.assertEqual(receipt["delivery"], "asynchronous")
+        submit.assert_awaited_once()
+        durable = await agent_server.CROSS_CHAT.get_exchange(exchange["id"])
+        self.assertEqual(durable["status"], "active")
+        self.assertFalse(bool(durable["live_response_lease"]))
+        legs = await agent_server.CROSS_CHAT.exchange_legs(exchange["id"])
+        self.assertEqual(len(legs), 2)
+        self.assertEqual(legs[1]["kind"], "request")
+        self.assertEqual(receipt["inbound_leg_id"], legs[1]["id"])
+
+    async def test_recovered_stale_live_lease_falls_back_to_async_queue(self) -> None:
         await agent_server.CROSS_CHAT.create_exchange_obligation(
             exchange_id="exchange_live_stale_queue",
             requester_session_id="source",
@@ -4866,7 +7541,7 @@ class CrossChatStoreTests(unittest.IsolatedAsyncioTestCase):
                 source_session_id="source",
                 source_run_id="run_live_stale_queue",
                 target_session_id="target",
-                body="Never launch after restart",
+                body="Deliver asynchronously after restart",
                 idempotency_key="live-stale-queue",
                 live_response_lease=True,
             )
@@ -4901,9 +7576,15 @@ class CrossChatStoreTests(unittest.IsolatedAsyncioTestCase):
             patch.object(agent_server, "schedule_next_queued_turn") as schedule,
         ):
             rebuilt, scheduled = await agent_server.recover_queued_turns_after_start()
-        self.assertEqual((rebuilt, scheduled), (0, 0))
-        schedule.assert_not_called()
-        self.assertNotIn("target", agent_server.QUEUED_TURNS)
+        self.assertEqual((rebuilt, scheduled), (1, 1))
+        schedule.assert_called_once_with("target")
+        self.assertEqual(
+            agent_server.QUEUED_TURNS["target"][0]["queued_id"],
+            "queued_live_stale",
+        )
+        durable = await agent_server.CROSS_CHAT.get_exchange(exchange["id"])
+        self.assertEqual(durable["status"], "active")
+        self.assertFalse(bool(durable["live_response_lease"]))
 
     async def test_live_delivery_wins_or_cancel_serializes_after_future_release(self) -> None:
         source_token = await self.issue_live_waiter_owner(
@@ -5001,7 +7682,7 @@ class CrossChatStoreTests(unittest.IsolatedAsyncioTestCase):
         legs = await agent_server.CROSS_CHAT.exchange_legs(exchange["id"])
         self.assertEqual([leg["kind"] for leg in legs], ["request", "reply"])
 
-    async def test_live_exchange_restart_fails_closed_without_queueing_return(self) -> None:
+    async def test_live_exchange_restart_falls_back_to_async_delivery(self) -> None:
         await agent_server.CROSS_CHAT.create_exchange_obligation(
             exchange_id="exchange_live_restart",
             requester_session_id="source",
@@ -5016,7 +7697,7 @@ class CrossChatStoreTests(unittest.IsolatedAsyncioTestCase):
                 source_session_id="source",
                 source_run_id="run_live_restart_source",
                 target_session_id="target",
-                body="Do not recover asynchronously",
+                body="Recover asynchronously",
                 idempotency_key="live-restart-request",
                 live_response_lease=True,
             )
@@ -5031,12 +7712,12 @@ class CrossChatStoreTests(unittest.IsolatedAsyncioTestCase):
         ):
             recovered = await agent_server.reconcile_cross_chat_exchanges()
         self.assertGreaterEqual(recovered, 1)
-        submit.assert_not_awaited()
+        submit.assert_awaited_once()
         durable = await agent_server.CROSS_CHAT.get_exchange(exchange["id"])
-        self.assertEqual(durable["status"], "failed")
-        self.assertEqual(durable["error_code"], "live_lease_owner_lost")
+        self.assertEqual(durable["status"], "active")
+        self.assertFalse(bool(durable["live_response_lease"]))
         durable_inbound = await agent_server.CROSS_CHAT.get_exchange_leg(inbound["id"])
-        self.assertEqual(durable_inbound["status"], "failed")
+        self.assertEqual(durable_inbound["status"], "registered")
 
 
 if __name__ == "__main__":

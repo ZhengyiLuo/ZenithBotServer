@@ -21,3 +21,4 @@ files/
 dist/
 build/
 .DS_Store
+.test-state*/

@@ -608,6 +608,78 @@ class RuntimeDiagnosticTests(unittest.TestCase):
 
         self.assertEqual(catalog["default_model"], agent_server.CODEX_DEFAULT_MODEL)
 
+    def test_codex_catalog_default_stays_truthful_when_runtime_fallback_is_not_discovered(self) -> None:
+        payload = {
+            "models": [
+                {
+                    "slug": "gpt-5.6-sol",
+                    "display_name": "GPT-5.6-Sol",
+                    "visibility": "list",
+                    "supported_in_api": True,
+                    "default_reasoning_level": "medium",
+                    "supported_reasoning_levels": [
+                        {"effort": "medium"},
+                        {"effort": "ultra"},
+                    ],
+                },
+            ]
+        }
+        session = {
+            "id": "chat",
+            "backend": agent_server.BACKEND_CODEX,
+            "model": None,
+            "effort": None,
+        }
+        with patch.object(
+            agent_server,
+            "run_catalog_command",
+            return_value=json.dumps(payload),
+        ), patch.object(
+            agent_server,
+            "codex_user_config_defaults",
+            return_value=("", "", ""),
+        ), patch.object(
+            agent_server,
+            "CODEX_DEFAULT_MODEL",
+            "gpt-5.5",
+        ), patch.object(
+            agent_server,
+            "CODEX_DEFAULT_EFFORT",
+            "xhigh",
+        ):
+            catalog = agent_server.discover_codex_catalog()
+            runtime_model, runtime_effort, runtime_service_tier = (
+                agent_server.codex_runtime_settings(session)
+            )
+            command = agent_server.build_codex_cmd(
+                "chat",
+                session,
+                "probe",
+                Path("/tmp/current.json"),
+            )
+
+        self.assertEqual(catalog["default_model"], runtime_model)
+        self.assertEqual(catalog["default_effort"], runtime_effort)
+        self.assertEqual(catalog["default_service_tier"] or "", runtime_service_tier)
+        self.assertEqual(
+            catalog["models"][0]["label"],
+            f"Server default ({agent_server.title_model_label(runtime_model)})",
+        )
+        self.assertEqual(catalog["models"][0]["value"], "")
+        self.assertIn(
+            "gpt-5.6-sol",
+            [option["value"] for option in catalog["models"]],
+        )
+        self.assertEqual(
+            [
+                option["value"]
+                for option in catalog["model_efforts"][runtime_model]
+            ],
+            ["low", "medium", "high", "xhigh"],
+        )
+        self.assertEqual(command[command.index("--model") + 1], runtime_model)
+        self.assertIn(f"model_reasoning_effort={runtime_effort}", command)
+
     def test_transient_provider_failure_keeps_cli_ready(self) -> None:
         agent_server.store_runtime_diagnostic(agent_server.runtime_diagnostic_payload(
             agent_server.BACKEND_CLAUDE,

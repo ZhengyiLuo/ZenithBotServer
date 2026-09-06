@@ -460,8 +460,13 @@ class EmergencyAlertServerTests(unittest.IsolatedAsyncioTestCase):
             "query_params": {},
         })()
         self.assertTrue(agent_server.websocket_authorized(socket))
+        self.assertEqual(
+            agent_server.websocket_token_subprotocol(socket),
+            f"agentsdock-token.{encoded}",
+        )
         socket.headers = {"sec-websocket-protocol": "agentsdock-token.invalid"}
         self.assertFalse(agent_server.websocket_authorized(socket))
+        self.assertIsNone(agent_server.websocket_token_subprotocol(socket))
 
     async def test_emergency_websocket_selects_fixed_protocol_and_binds_snapshot_identity(self) -> None:
         encoded = agent_server.base64.urlsafe_b64encode(

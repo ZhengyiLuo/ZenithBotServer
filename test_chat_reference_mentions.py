@@ -71,6 +71,136 @@ class ChatReferenceMentionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(legacy_route[0].action, "route")
         self.assertEqual(agent_server.chat_reference_marker(legacy_route[0]), "@Target")
 
+    def test_cross_server_agent_reference_is_rejected_before_runtime_lookup(
+        self,
+    ) -> None:
+        reference = agent_server.ChatReference(
+            session_id="22222222-2222-4222-8222-222222222222",
+            display_title_snapshot="Remote",
+            source_text_start=0,
+            source_text_end=7,
+            action="instruction",
+            target_kind="secure_peer",
+            target_server_identity="peer_" + "a" * 64,
+            target_connection_id="11111111-1111-4111-8111-111111111111",
+            target_route_id="22222222-2222-4222-8222-222222222222",
+            target_route_revision="rev_" + "d" * 32,
+        )
+        with (
+            patch.object(agent_server, "AGENT_TOKEN", "token"),
+            patch.object(agent_server, "SECURE_PEER_AGENT_RELAY_ENABLED", False),
+            patch.object(agent_server.STORE, "sessions", self.sessions),
+            patch.object(
+                agent_server.SECURE_PEER_RUNTIME,
+                "remote_route_delivery_available",
+                side_effect=AssertionError("remote relay must not be consulted"),
+            ) as runtime_lookup,
+            self.assertRaises(HTTPException) as raised,
+        ):
+            agent_server.validate_chat_references(
+                "source-private-id",
+                "@Remote",
+                [reference],
+            )
+        self.assertEqual(raised.exception.status_code, 400)
+        self.assertIn("Team Network Inbox", str(raised.exception.detail))
+        runtime_lookup.assert_not_called()
+
+    async def test_inbox_only_capability_strips_legacy_secure_relay_grants(
+        self,
+    ) -> None:
+        snapshot = {
+            "version": 1,
+            "role": "client",
+            "connection_id": "11111111-1111-4111-8111-111111111111",
+            "team_id": "team-current",
+            "hub_id": "hub-current",
+            "source_server_identity": "server-local",
+            "source_chat_id": "source-private-id",
+            "source_route_id": "33333333-3333-4333-8333-333333333333",
+            "source_route_revision": "rev_" + "c" * 32,
+            "target_server_identity": "server-remote",
+            "target_route_id": "22222222-2222-4222-8222-222222222222",
+            "target_route_revision": "rev_" + "d" * 32,
+            "action": "instruction",
+        }
+        with (
+            tempfile.TemporaryDirectory() as temporary,
+            patch.object(agent_server, "AGENT_TOKEN", "token"),
+            patch.object(agent_server, "SECURE_PEER_AGENT_RELAY_ENABLED", False),
+            patch.object(
+                agent_server,
+                "CROSS_CHAT_AUTHORITY_ROOT",
+                Path(temporary) / "authority",
+            ),
+            patch.object(agent_server.STORE, "sessions", self.sessions),
+        ):
+            authority = await agent_server.issue_cross_chat_capability(
+                "source-private-id",
+                "run_inbox_only",
+                [],
+                actions={"publish", "secure_peer_instruction"},
+                secure_peer_route_snapshots=[snapshot],
+            )
+            token = agent_server.json.loads(authority.read_text())[
+                "provider_capability"
+            ]
+            token_hash = agent_server.hashlib.sha256(token.encode()).hexdigest()
+            capability = agent_server.CROSS_CHAT_CAPABILITIES.pop(token_hash)
+        self.assertEqual(capability["secure_peer_grants"], {})
+        self.assertNotIn("secure_peer_instruction", capability["actions"])
+
+    async def test_forged_legacy_secure_capability_cannot_submit(self) -> None:
+        token = "legacy-secure-capability"
+        token_hash = agent_server.hashlib.sha256(token.encode()).hexdigest()
+        handle = "legacy-remote-route"
+        capability = {
+            "server_identity": agent_server.server_identity(),
+            "source_session_id": "source-private-id",
+            "source_run_id": "run-legacy-secure",
+            "source_user_instruction": "Contact the remote agent",
+            "native_transition_nonce": "",
+            "actions": {"secure_peer_instruction"},
+            "secure_peer_grants": {
+                (handle, "instruction"): {"opaque": "legacy-snapshot"},
+            },
+            "consumed": {},
+        }
+        submit = Mock()
+        with (
+            patch.object(agent_server, "AGENT_TOKEN", "token"),
+            patch.object(agent_server, "SECURE_PEER_AGENT_RELAY_ENABLED", False),
+            patch.object(
+                agent_server,
+                "CURRENT_TURNS",
+                {"source-private-id": {"run_id": "run-legacy-secure"}},
+            ),
+            patch.dict(
+                agent_server.CROSS_CHAT_CAPABILITIES,
+                {token_hash: capability},
+                clear=True,
+            ),
+            patch.object(
+                agent_server.SECURE_PEER_RUNTIME,
+                "submit_remote_handoff",
+                submit,
+            ),
+            self.assertRaises(HTTPException) as raised,
+        ):
+            await agent_server.create_authorized_cross_chat_instruction(
+                token,
+                agent_server.CrossChatHandoffRequest(
+                    target_session_id=handle,
+                    action="instruction",
+                    body="Do not send this",
+                    idempotency_key="legacy-secure-send",
+                ),
+            )
+        self.assertEqual(raised.exception.status_code, 409)
+        self.assertIn("Team Network Inbox", str(raised.exception.detail))
+        self.assertEqual(capability["consumed"], {})
+        submit.assert_not_called()
+
     async def test_v2_grant_intent_requires_exact_single_at_and_fences_v1(self) -> None:
         durable = self.reference("route", grant_intent=True)
         with (
@@ -828,7 +958,7 @@ class ChatReferenceMentionTests(unittest.IsolatedAsyncioTestCase):
             ),
         ):
             capability = agent_server.cross_chat_handoffs_capability()
-        self.assertEqual(capability["version"], 9)
+        self.assertEqual(capability["version"], 12)
         self.assertEqual(capability["default_action"], "route")
         self.assertNotIn("direct_message", capability["actions"])
         self.assertIn("route", capability["actions"])
@@ -837,12 +967,16 @@ class ChatReferenceMentionTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(capability["features"]["durable_route_grants"])
         self.assertTrue(capability["features"]["agent_cross_chat_routes"])
         self.assertTrue(
+            capability["features"]["configured_route_async_request_reply"]
+        )
+        self.assertTrue(
             capability["features"]["live_same_server_request_reply"]
         )
         self.assertFalse(
             capability["features"]["agent_ambient_local_handoffs"]
         )
         self.assertEqual(capability["agent_routes"]["policy"], "default_deny")
+        self.assertTrue(capability["agent_routes"]["same_server_only"])
         self.assertEqual(
             capability["agent_routes"]["client_capability"],
             "agent_cross_chat_routes_v2",

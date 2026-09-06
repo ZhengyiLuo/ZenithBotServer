@@ -277,6 +277,12 @@ class ProviderAuthorityLifecycleTests(unittest.IsolatedAsyncioTestCase):
             operation="write",
         )
         self.assertEqual(candidate["source_run_id"], "run_new")
+        team_read = await agent_server.authorize_provider_action(
+            self.provider_request(candidate_token),
+            action="team_read",
+            session_id="source",
+        )
+        self.assertEqual(team_read["source_run_id"], "run_new")
         # Publish must not borrow the predecessor's current-run attachment.
         await self.assert_denied(candidate_token, action="publish")
         await self.assert_denied(
@@ -286,6 +292,7 @@ class ProviderAuthorityLifecycleTests(unittest.IsolatedAsyncioTestCase):
         )
 
         candidate_record = self.record_for_token(candidate_token)
+        self.assertIn("team_read", candidate_record["actions"])
         self.assertFalse(
             agent_server.provider_capability_has_ambient_native_routes(
                 candidate_record
@@ -620,7 +627,12 @@ class ProviderAuthorityLifecycleTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("jobs", capability["actions"])
         self.assertNotIn("$AGENTSDOCK_JOBS_CLI", prompt)
         self.assertNotIn("Jobs (full access)", prompt)
-        self.assertIn("$AGENTSDOCK_PUBLISH_CLI", prompt)
+        # The source chat is a Codex chat, so the steer carries the compact
+        # block: grants are listed by name and the helper syntax lives in the
+        # thread instructions (context diet).
+        self.assertIn("actions=emergency,publish", prompt)
+        self.assertNotIn("jobs=", prompt)
+        self.assertIn(str(authority_path), prompt)
         self.assertNotIn(token, prompt)
 
     async def test_revoke_never_unlinks_an_unregistered_or_outside_path(self) -> None:

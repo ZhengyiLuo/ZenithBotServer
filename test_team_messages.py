@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import os
 from pathlib import Path
 import tempfile
@@ -215,6 +216,117 @@ class TeamMessagesServiceTests(unittest.TestCase):
         self.assertEqual(changed["error"]["code"], "idempotency_conflict")
         feed = self.get(self.owner, f"{self.base}/messages?box=feed")
         self.assertEqual(len(feed["messages"]), 1)
+
+    def test_plain_message_rejects_title_and_legacy_title_is_sanitized(self) -> None:
+        rejected = self.post(
+            self.owner,
+            f"{self.base}/messages",
+            {
+                "kind": "message",
+                "title": "Unexpected",
+                "body": "plain",
+                "recipients": [{"kind": "all"}],
+                "idempotency_key": _key(),
+            },
+            expected=422,
+        )
+        self.assertEqual(rejected["error"]["code"], "invalid_request")
+
+        sent = self.send(self.owner, [{"kind": "all"}], body="legacy")
+        store = self.app.state.store
+        connection = store.connect()
+        try:
+            # Simulate a row written before the immutable V2 trigger and
+            # strict kind/title contract were installed.
+            connection.execute("DROP TRIGGER team_messages_are_immutable")
+            connection.execute(
+                "UPDATE team_messages SET title=? WHERE id=?",
+                ("legacy title", sent["id"]),
+            )
+            connection.commit()
+        finally:
+            connection.close()
+
+        detail = self.get(
+            self.owner, f"{self.base}/messages/{sent['id']}"
+        )["message"]
+        self.assertIsNone(detail["title"])
+        feed = self.get(self.owner, f"{self.base}/messages?box=feed")
+        self.assertIsNone(feed["messages"][0]["title"])
+
+    def test_provenance_round_trips_and_rejects_unknown_or_invalid_fields(self) -> None:
+        provenance = {
+            "via": "agent",
+            "backend": None,
+            "chat_id": "chat-1",
+            "run_id": None,
+        }
+        sent = self.send(
+            self.owner,
+            [{"kind": "all"}],
+            body="provenance",
+            provenance=provenance,
+        )
+        self.assertEqual(sent["provenance"], provenance)
+        detail = self.get(
+            self.owner, f"{self.base}/messages/{sent['id']}"
+        )["message"]
+        self.assertEqual(detail["provenance"], provenance)
+
+        for rejected_provenance in (
+            {"source": "foreign"},
+            {"backend": 7},
+            {"backend": "codex\nspoofed"},
+            {"backend": " codex"},
+            {"via": "foreign"},
+        ):
+            rejected = self.post(
+                self.owner,
+                f"{self.base}/messages",
+                {
+                    "kind": "message",
+                    "body": "invalid provenance",
+                    "recipients": [{"kind": "all"}],
+                    "provenance": rejected_provenance,
+                    "idempotency_key": _key(),
+                },
+                expected=422,
+            )
+            self.assertEqual(rejected["error"]["code"], "invalid_request")
+
+    def test_legacy_provenance_is_sanitized_from_detail_and_feed(self) -> None:
+        sent = self.send(self.owner, [{"kind": "all"}], body="legacy provenance")
+        stored = {
+            "via": "desktop",
+            "backend": None,
+            "chat_id": "chat-legacy",
+            "run_id": None,
+            "foreign": "must not escape",
+        }
+        store = self.app.state.store
+        connection = store.connect()
+        try:
+            connection.execute("DROP TRIGGER team_messages_are_immutable")
+            connection.execute(
+                "UPDATE team_messages SET provenance_json=? WHERE id=?",
+                (json.dumps(stored), sent["id"]),
+            )
+            connection.commit()
+        finally:
+            connection.close()
+
+        expected = {
+            "via": "desktop",
+            "backend": None,
+            "chat_id": "chat-legacy",
+            "run_id": None,
+        }
+        detail = self.get(
+            self.owner, f"{self.base}/messages/{sent['id']}"
+        )["message"]
+        self.assertEqual(detail["provenance"], expected)
+        feed = self.get(self.owner, f"{self.base}/messages?box=feed")
+        self.assertEqual(feed["messages"][0]["provenance"], expected)
 
     # -- direct mail --------------------------------------------------------
 
@@ -950,6 +1062,289 @@ class TeamMessagesServiceTests(unittest.TestCase):
         )
         self.assertEqual(denied["error"]["code"], "attachment_unavailable")
 
+    def test_corrupt_digest_named_blob_is_not_deduplicated_and_is_repaired(self) -> None:
+        payload = b"verified staging must replace same-sized corrupt final bytes"
+        original = self.upload(self.owner, payload, name="original.bin")
+        blob = (
+            self.data_dir
+            / "attachments"
+            / original["sha256"][:2]
+            / original["sha256"]
+        )
+        corrupt = b"!" * len(payload)
+        self.assertNotEqual(hashlib.sha256(corrupt).hexdigest(), original["sha256"])
+        blob.write_bytes(corrupt)
+
+        unavailable = self.client.get(
+            f"{self.base}/attachments/{original['id']}/content",
+            headers=self.auth(self.owner),
+        )
+        self.assertEqual(unavailable.status_code, 404, unavailable.text)
+        self.assertEqual(
+            unavailable.json()["error"]["code"], "attachment_unavailable"
+        )
+
+        replacement = self.declare(
+            self.owner,
+            payload,
+            name="replacement.bin",
+        )["attachment"]
+        self.assertEqual(replacement["state"], "uploading")
+        completed = self.put_chunk(
+            self.owner,
+            replacement["id"],
+            payload,
+            0,
+            len(payload) - 1,
+        )
+        self.assertEqual(completed.status_code, 200, completed.text)
+        self.assertEqual(completed.json()["attachment"]["state"], "ready")
+        self.assertEqual(blob.read_bytes(), payload)
+        repaired = self.client.get(
+            f"{self.base}/attachments/{original['id']}/content",
+            headers=self.auth(self.owner),
+        )
+        self.assertEqual(repaired.status_code, 200, repaired.text)
+        self.assertEqual(repaired.content, payload)
+
+    def test_final_chunk_retry_reconciles_publish_before_sqlite_commit_crash(self) -> None:
+        payload = b"published final bytes survive a pre-commit process death"
+        declared = self.declare(
+            self.owner,
+            payload,
+            name="publish-crash.bin",
+        )["attachment"]
+        store = self.app.state.store
+        claims = store.verify_access(self.owner["access_token"])
+        original_outbox = store._outbox
+
+        def fail_ready_outbox(*args, **kwargs):
+            if len(args) >= 5 and args[4] == "team.attachment.ready":
+                raise RuntimeError("simulated death after durable blob publication")
+            return original_outbox(*args, **kwargs)
+
+        with mock.patch.object(store, "_outbox", side_effect=fail_ready_outbox):
+            with self.assertRaisesRegex(
+                RuntimeError, "simulated death after durable blob publication"
+            ):
+                store.write_team_attachment_chunk(
+                    claims,
+                    self.team_id,
+                    declared["id"],
+                    offset=0,
+                    total=len(payload),
+                    data=payload,
+                )
+
+        blob = (
+            self.data_dir
+            / "attachments"
+            / declared["sha256"][:2]
+            / declared["sha256"]
+        )
+        staging = store._team_attachment_staging_path(declared["id"])
+        self.assertEqual(blob.read_bytes(), payload)
+        self.assertFalse(staging.exists())
+        rolled_back = self.get(
+            self.owner, f"{self.base}/attachments/{declared['id']}"
+        )["attachment"]
+        self.assertEqual(rolled_back["state"], "uploading")
+        self.assertEqual(rolled_back["received_bytes"], 0)
+
+        reconciled = store.write_team_attachment_chunk(
+            claims,
+            self.team_id,
+            declared["id"],
+            offset=0,
+            total=len(payload),
+            data=payload,
+        )["attachment"]
+        self.assertEqual(reconciled["state"], "ready")
+        self.assertEqual(reconciled["received_bytes"], len(payload))
+        connection = store.connect()
+        try:
+            self.assertEqual(
+                connection.execute(
+                    """
+                    SELECT count(*) FROM outbox_events
+                    WHERE aggregate_type='team_attachment' AND aggregate_id=?
+                      AND event_type='team.attachment.ready'
+                    """,
+                    (declared["id"],),
+                ).fetchone()[0],
+                1,
+            )
+        finally:
+            connection.close()
+
+    def test_expiry_reclaims_blob_published_before_sqlite_commit_crash(self) -> None:
+        payload = b"expired crash-window upload must not strand final bytes"
+        declared = self.declare(
+            self.owner,
+            payload,
+            name="publish-crash-expiry.bin",
+        )["attachment"]
+        store = self.app.state.store
+        claims = store.verify_access(self.owner["access_token"])
+        original_outbox = store._outbox
+
+        def fail_ready_outbox(*args, **kwargs):
+            if len(args) >= 5 and args[4] == "team.attachment.ready":
+                raise RuntimeError("simulated pre-commit death before expiry")
+            return original_outbox(*args, **kwargs)
+
+        with mock.patch.object(store, "_outbox", side_effect=fail_ready_outbox):
+            with self.assertRaisesRegex(
+                RuntimeError, "simulated pre-commit death before expiry"
+            ):
+                store.write_team_attachment_chunk(
+                    claims,
+                    self.team_id,
+                    declared["id"],
+                    offset=0,
+                    total=len(payload),
+                    data=payload,
+                )
+
+        blob = (
+            self.data_dir
+            / "attachments"
+            / declared["sha256"][:2]
+            / declared["sha256"]
+        )
+        self.assertEqual(blob.read_bytes(), payload)
+        connection = store.connect()
+        try:
+            row = connection.execute(
+                "SELECT created_at,state FROM team_attachments WHERE id=?",
+                (declared["id"],),
+            ).fetchone()
+            assert row is not None
+            self.assertEqual(row["state"], "uploading")
+            expired_at = int(row["created_at"]) + 1
+            connection.execute(
+                "UPDATE team_attachments SET expires_at=? WHERE id=?",
+                (expired_at, declared["id"]),
+            )
+        finally:
+            connection.close()
+
+        self.assertEqual(store.purge_expired_team_attachments(expired_at + 1), 1)
+        self.get(
+            self.owner,
+            f"{self.base}/attachments/{declared['id']}",
+            expected=404,
+        )
+        self.assertFalse(blob.exists())
+        connection = store.connect()
+        try:
+            self.assertEqual(
+                connection.execute(
+                    """
+                    SELECT count(*) FROM team_attachment_cleanup_queue
+                    WHERE path_kind='content' AND path_key=?
+                    """,
+                    (declared["sha256"],),
+                ).fetchone()[0],
+                0,
+            )
+        finally:
+            connection.close()
+
+    def test_first_chunk_rejects_precreated_hardlink_and_fifo_without_touching_them(self) -> None:
+        payload = b"first chunk must create its staging inode exclusively"
+        store = self.app.state.store
+        for path_kind in ("hardlink", "fifo"):
+            with self.subTest(path_kind=path_kind):
+                declared = self.declare(
+                    self.owner,
+                    payload,
+                    name=f"first-{path_kind}.bin",
+                )["attachment"]
+                staging = store._team_attachment_staging_path(declared["id"])
+                victim: Path | None = None
+                if path_kind == "hardlink":
+                    victim = self.data_dir / f"first-{path_kind}-victim.bin"
+                    victim.write_bytes(b"victim bytes must never be truncated")
+                    os.chmod(victim, 0o600)
+                    os.link(victim, staging)
+                    before = victim.read_bytes()
+                else:
+                    os.mkfifo(staging, 0o600)
+
+                rejected = self.put_chunk(
+                    self.owner,
+                    declared["id"],
+                    payload,
+                    0,
+                    len(payload) - 1,
+                )
+                self.assertEqual(rejected.status_code, 409, rejected.text)
+                self.assertEqual(
+                    rejected.json()["error"]["code"], "attachment_unavailable"
+                )
+                metadata = self.get(
+                    self.owner, f"{self.base}/attachments/{declared['id']}"
+                )["attachment"]
+                self.assertEqual(metadata["state"], "failed")
+                if victim is not None:
+                    self.assertEqual(victim.read_bytes(), before)
+                    self.assertEqual(victim.stat().st_nlink, 2)
+                else:
+                    # Cleanup inspection is nonblocking too; the unsafe FIFO
+                    # remains for explicit operator repair rather than hanging
+                    # an opportunistic reclamation pass.
+                    with self.assertRaises(PermissionError):
+                        store._unlink_team_attachment_cleanup_path(
+                            "staging", declared["id"]
+                        )
+
+    def test_resume_rejects_replaced_staging_hardlink_and_fifo_without_mutation(self) -> None:
+        payload = b"resume must stay bound to one private regular staging inode"
+        first_end = 8
+        store = self.app.state.store
+        for path_kind in ("hardlink", "fifo"):
+            with self.subTest(path_kind=path_kind):
+                declared = self.declare(
+                    self.owner,
+                    payload,
+                    name=f"resume-{path_kind}.bin",
+                )["attachment"]
+                first = self.put_chunk(
+                    self.owner,
+                    declared["id"],
+                    payload,
+                    0,
+                    first_end,
+                )
+                self.assertEqual(first.status_code, 200, first.text)
+                staging = store._team_attachment_staging_path(declared["id"])
+                staging.unlink()
+                victim: Path | None = None
+                if path_kind == "hardlink":
+                    victim = self.data_dir / f"resume-{path_kind}-victim.bin"
+                    victim.write_bytes(b"long victim bytes must remain exactly intact")
+                    os.chmod(victim, 0o600)
+                    os.link(victim, staging)
+                    before = victim.read_bytes()
+                else:
+                    os.mkfifo(staging, 0o600)
+
+                rejected = self.put_chunk(
+                    self.owner,
+                    declared["id"],
+                    payload,
+                    first_end + 1,
+                    len(payload) - 1,
+                )
+                self.assertEqual(rejected.status_code, 409, rejected.text)
+                self.assertEqual(
+                    rejected.json()["error"]["code"], "attachment_unavailable"
+                )
+                if victim is not None:
+                    self.assertEqual(victim.read_bytes(), before)
+                    self.assertEqual(victim.stat().st_nlink, 2)
+
     def test_attachment_declaration_and_chunk_validation(self) -> None:
         payload = b"y" * 10
         digest = hashlib.sha256(payload).hexdigest()
@@ -1252,6 +1647,10 @@ class TeamMessagesServiceTests(unittest.TestCase):
             queued,
             {
                 ("content", ready["sha256"]),
+                # Uploading rows also queue their final digest name: normally
+                # it is absent, but a crash after publication and before the
+                # ready transaction may have left verified final bytes there.
+                ("content", partial["sha256"]),
                 ("staging", ready["id"]),
                 ("staging", partial["id"]),
             },

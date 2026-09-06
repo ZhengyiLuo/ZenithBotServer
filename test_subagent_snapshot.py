@@ -366,6 +366,32 @@ class ClaudeSubagentSnapshotTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(latest["subagent_log"]), agent_server.SUBAGENT_SNAPSHOT_LOG_LIMIT)
         self.assertEqual(latest["subagent_log"][-1]["text"], f"Step {agent_server.SUBAGENT_SNAPSHOT_LOG_LIMIT + 24}")
 
+    async def test_snapshot_omits_silently_learned_state_without_event_identity(self) -> None:
+        session_id = "codex-chat"
+        with patch.dict(agent_server.STORE.sessions, {
+            session_id: {"id": session_id, "backend": agent_server.BACKEND_CODEX},
+        }, clear=True), patch.dict(
+            agent_server.CODEX_SUBAGENT_STATE, {}, clear=True
+        ), patch.dict(
+            agent_server.CODEX_SUBAGENT_SESSION_INDEX, {}, clear=True
+        ):
+            learned = await agent_server.emit_codex_subagent_state(
+                session_id,
+                "terminal-child",
+                "completed",
+                activity="Subagent completed",
+                persist_event=False,
+            )
+
+            self.assertNotIn("seq", learned or {})
+            self.assertNotIn("id", learned or {})
+            snapshot = agent_server.build_subagent_snapshot(session_id)
+
+        self.assertEqual(snapshot["count"], 1)
+        self.assertEqual(snapshot["active_count"], 0)
+        self.assertEqual(snapshot["latest_seq"], 0)
+        self.assertEqual(snapshot["subagents"], [])
+
     def test_sanitized_sdk_lifecycle_completes_background_agent(self) -> None:
         self.write_events([
             self.event(1, "tool_started", tool={

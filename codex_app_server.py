@@ -59,15 +59,21 @@ class CodexAppServerDisconnected(CodexAppServerError):
 
 
 class CodexAppServerTimeout(CodexAppServerError):
-    """A request timed out after it may have reached app-server."""
+    """A request exceeded its deadline before or after transport delivery."""
 
-    def __init__(self, method: str, timeout: float) -> None:
+    def __init__(
+        self,
+        method: str,
+        timeout: float,
+        *,
+        request_sent: bool = True,
+    ) -> None:
         self.method = method
         self.timeout = timeout
         super().__init__(
             f"{method} timed out after {timeout:g}s",
-            request_sent=True,
-            safe_to_retry=False,
+            request_sent=request_sent,
+            safe_to_retry=not request_sent,
         )
 
 
@@ -104,6 +110,9 @@ ServerRequestHandler = Callable[
     [Any, str, dict[str, Any]],
     Awaitable[dict[str, Any]] | dict[str, Any],
 ]
+# ``(pid, process_group_id)``; the group id is None when it is not provably
+# owned by the client (injected factories, non-POSIX hosts).
+ProcessLifecycleHook = Callable[[int, int | None], None]
 
 _THREAD_GOAL_STATUSES = frozenset(
     {
@@ -334,6 +343,9 @@ class CodexAppServerTurn:
     thread_id: str
     turn_id: str
     _subscription: CodexAppServerSubscription
+    # Set at the exact stdin write boundary. A caller cancelled after delivery
+    # must retire this generation, not the one observed before lazy start/init.
+    transport_generation: int = 0
     _closed: bool = False
     _completed: bool = False
 
@@ -449,10 +461,17 @@ class CodexAppServerClient:
         process_factory: ProcessFactory | None = None,
         server_request_handler: ServerRequestHandler | None = None,
         initialize_params: dict[str, Any] | None = None,
+        on_process_started: ProcessLifecycleHook | None = None,
+        on_process_exited: ProcessLifecycleHook | None = None,
     ) -> None:
         self.codex_bin = codex_bin
         self.cwd = cwd
         self.env_factory = env_factory
+        # Lifecycle hooks receive ``(pid, process_group_id)``. The group id is
+        # None whenever start() could not prove it owns the child's session,
+        # so a hook must never derive a signal target from the pid alone.
+        self._on_process_started = on_process_started
+        self._on_process_exited = on_process_exited
         self.app_server_args = tuple(str(value) for value in app_server_args)
         self.request_timeout = request_timeout
         self.lifecycle_timeout = lifecycle_timeout
@@ -615,6 +634,16 @@ class CodexAppServerClient:
                 else None
             )
             self._proc = proc
+            if (
+                self._on_process_started is not None
+                and isinstance(raw_pid, int)
+                and not isinstance(raw_pid, bool)
+                and raw_pid > 0
+            ):
+                # Registry/bookkeeping hooks must never break a provider
+                # start; they exist so an orphaned child can be reaped later.
+                with suppress(Exception):
+                    self._on_process_started(raw_pid, self._process_group_id)
             self._reader_task = asyncio.create_task(
                 self._reader_loop(proc),
                 name="codex-app-server-reader",
@@ -624,9 +653,16 @@ class CodexAppServerClient:
                 name="codex-app-server-stderr",
             )
             try:
-                result = await self._request_connected("initialize", dict(self._initialize_params))
+                result = await self._request_connected(
+                    "initialize",
+                    dict(self._initialize_params),
+                    discard_on_send_timeout=False,
+                )
                 self._initialize_result = result if isinstance(result, dict) else {}
-                await self.notify("initialized")
+                await self._send(
+                    {"method": "initialized"},
+                    discard_on_send_timeout=False,
+                )
                 self._initialized = True
                 self._generation += 1
             except Exception:
@@ -636,6 +672,21 @@ class CodexAppServerClient:
     async def close(self) -> None:
         self._closing = True
         await self._discard_process()
+
+    async def retire_generation(self, expected_generation: int) -> bool:
+        """Stop only the transport generation that may own ambiguous work.
+
+        A cancelled request can have crossed the stdin write boundary before
+        its acknowledgement arrived.  Callers that cannot recover the native
+        turn id must be able to retire that exact process without racing a
+        replacement generation started by another task.
+        """
+
+        async with self._start_lock:
+            if self._generation != expected_generation:
+                return False
+            await self._discard_process()
+            return True
 
     async def __aenter__(self) -> "CodexAppServerClient":
         await self.start()
@@ -705,7 +756,11 @@ class CodexAppServerClient:
             # subscription consumers, matching normal callback dispatch.
             pass
 
-    async def _discard_process(self) -> None:
+    async def _discard_process(
+        self,
+        *,
+        preserve_task: asyncio.Task[Any] | None = None,
+    ) -> None:
         self._initialized = False
         self._initialize_result = None
         proc = self._proc
@@ -769,6 +824,15 @@ class CodexAppServerClient:
                         proc.kill()
                     with suppress(Exception):
                         await asyncio.wait_for(proc.wait(), timeout=1.0)
+            raw_pid = getattr(proc, "pid", None)
+            if (
+                self._on_process_exited is not None
+                and isinstance(raw_pid, int)
+                and not isinstance(raw_pid, bool)
+                and raw_pid > 0
+            ):
+                with suppress(Exception):
+                    self._on_process_exited(raw_pid, process_group_id)
 
         for task in (reader_task, stderr_task):
             if task and task is not current:
@@ -777,8 +841,12 @@ class CodexAppServerClient:
                     await task
 
         background_tasks = [
-            *self._server_request_tasks.values(),
-            *self._callback_tasks,
+            task
+            for task in (
+                *self._server_request_tasks.values(),
+                *self._callback_tasks,
+            )
+            if task is not current and task is not preserve_task
         ]
         for task in background_tasks:
             task.cancel()
@@ -833,6 +901,8 @@ class CodexAppServerClient:
         *,
         timeout: float | None = None,
         notification_boundary_subscription: CodexAppServerSubscription | None = None,
+        discard_on_send_timeout: bool = True,
+        transport_turn: CodexAppServerTurn | None = None,
     ) -> Any:
         proc = self._proc
         if not proc or proc.returncode is not None or not proc.stdin:
@@ -851,15 +921,21 @@ class CodexAppServerClient:
             future,
             notification_boundary_subscription,
         )
+        effective_timeout = self.request_timeout if timeout is None else timeout
+        deadline = loop.time() + max(0.0, float(effective_timeout))
         try:
-            await self._send({"id": request_id, "method": method, "params": params})
+            await self._send(
+                {"id": request_id, "method": method, "params": params},
+                deadline=deadline,
+                timeout=effective_timeout,
+                expected_process=proc,
+                discard_on_send_timeout=discard_on_send_timeout,
+                transport_turn=transport_turn,
+            )
             try:
-                effective_timeout = (
-                    self.request_timeout if timeout is None else timeout
-                )
                 return await asyncio.wait_for(
                     asyncio.shield(future),
-                    timeout=effective_timeout,
+                    timeout=max(0.0, deadline - loop.time()),
                 )
             except asyncio.TimeoutError as exc:
                 raise CodexAppServerTimeout(method, effective_timeout) from exc
@@ -867,6 +943,13 @@ class CodexAppServerClient:
             self._pending.pop(request_id, None)
             if not future.done():
                 future.cancel()
+            elif not future.cancelled():
+                # Transport retirement can fail every pending future while
+                # this request is unwinding from its write timeout. Consume
+                # that superseded exception so asyncio does not report it as
+                # an unretrieved future error.
+                with suppress(BaseException):
+                    future.exception()
 
     async def notify(self, method: str, params: dict[str, Any] | None = None) -> None:
         payload: dict[str, Any] = {"method": method}
@@ -874,8 +957,52 @@ class CodexAppServerClient:
             payload["params"] = params
         await self._send(payload)
 
-    async def _send(self, payload: dict[str, Any]) -> None:
-        proc = self._proc
+    async def _discard_process_after_write_timeout(
+        self,
+        proc: asyncio.subprocess.Process,
+    ) -> None:
+        """Retire exactly the process whose stdin missed its write deadline."""
+        async with self._start_lock:
+            if proc is not self._proc:
+                return
+            cleanup_task = asyncio.create_task(
+                self._discard_process(preserve_task=asyncio.current_task())
+            )
+            cancelled = False
+            while not cleanup_task.done():
+                try:
+                    await asyncio.shield(cleanup_task)
+                except asyncio.CancelledError:
+                    # _discard_process clears the owned process reference
+                    # before its first await. Every subsequent cancellation
+                    # must remain outside the cleanup task; a plain join here
+                    # lets a second cancel abandon the now-unreachable child.
+                    cancelled = True
+            # Propagate cleanup failure before restoring caller cancellation.
+            # result() also retrieves any exception when the task completed in
+            # the same loop turn as a repeated cancel.
+            cleanup_task.result()
+            if cancelled:
+                raise asyncio.CancelledError
+
+    async def _send(
+        self,
+        payload: dict[str, Any],
+        *,
+        timeout: float | None = None,
+        deadline: float | None = None,
+        expected_process: asyncio.subprocess.Process | None = None,
+        discard_on_send_timeout: bool = True,
+        transport_turn: CodexAppServerTurn | None = None,
+    ) -> None:
+        loop = asyncio.get_running_loop()
+        effective_timeout = self.request_timeout if timeout is None else timeout
+        timeout_seconds = max(0.0, float(effective_timeout))
+        if deadline is None:
+            deadline = loop.time() + timeout_seconds
+        method = str(payload.get("method") or "app-server write")
+        encoded = (json.dumps(payload, separators=(",", ":")) + "\n").encode()
+        proc = expected_process if expected_process is not None else self._proc
         if not proc or proc.returncode is not None or not proc.stdin:
             raise CodexAppServerDisconnected(
                 "codex app-server stdin is unavailable",
@@ -883,17 +1010,69 @@ class CodexAppServerClient:
                 safe_to_retry=True,
             )
 
-        encoded = (json.dumps(payload, separators=(",", ":")) + "\n").encode()
-        async with self._write_lock:
+        lock_acquired = False
+        request_sent = False
+        send_timeout: asyncio.TimeoutError | None = None
+        try:
             try:
-                proc.stdin.write(encoded)
-                await proc.stdin.drain()
-            except Exception as exc:
-                raise CodexAppServerDisconnected(
-                    f"codex app-server write failed: {exc}",
-                    request_sent=True,
-                    safe_to_retry=False,
-                ) from exc
+                await asyncio.wait_for(
+                    self._write_lock.acquire(),
+                    timeout=max(0.0, deadline - loop.time()),
+                )
+            except asyncio.TimeoutError as exc:
+                send_timeout = exc
+            else:
+                lock_acquired = True
+                # A process may be retired while this sender waits behind an
+                # older write. Never put a request on that stale pipe.
+                if (
+                    proc is not self._proc
+                    or proc.returncode is not None
+                    or not proc.stdin
+                ):
+                    raise CodexAppServerDisconnected(
+                        "codex app-server stdin is unavailable",
+                        request_sent=False,
+                        safe_to_retry=True,
+                    )
+                if loop.time() >= deadline:
+                    send_timeout = asyncio.TimeoutError()
+                else:
+                    try:
+                        if transport_turn is not None:
+                            transport_turn.transport_generation = self._generation
+                        proc.stdin.write(encoded)
+                        request_sent = True
+                        await asyncio.wait_for(
+                            proc.stdin.drain(),
+                            timeout=max(0.0, deadline - loop.time()),
+                        )
+                    except asyncio.TimeoutError as exc:
+                        send_timeout = exc
+                    except Exception as exc:
+                        raise CodexAppServerDisconnected(
+                            f"codex app-server write failed: {exc}",
+                            request_sent=True,
+                            safe_to_retry=False,
+                        ) from exc
+        except CodexAppServerError:
+            raise
+        finally:
+            if lock_acquired:
+                self._write_lock.release()
+
+        if send_timeout is None:
+            return
+        if request_sent and discard_on_send_timeout:
+            # Cleanup runs after releasing the shared writer lock. It is
+            # serialized with start() so a fresh process cannot be spawned and
+            # then accidentally cleared by retirement of the stale transport.
+            await self._discard_process_after_write_timeout(proc)
+        raise CodexAppServerTimeout(
+            method,
+            effective_timeout,
+            request_sent=request_sent,
+        ) from send_timeout
 
     async def _reader_loop(self, proc: asyncio.subprocess.Process) -> None:
         error: BaseException | None = None
@@ -999,6 +1178,18 @@ class CodexAppServerClient:
                     )
                     self._fail_all(error)
                     self._cancel_server_request_tasks()
+                    # An unplanned exit must release the child's registry entry
+                    # now; ``_discard_process`` only runs on the next start or
+                    # on close, and a stale {pid, pgid} could be reused.
+                    raw_pid = getattr(proc, "pid", None)
+                    if (
+                        self._on_process_exited is not None
+                        and isinstance(raw_pid, int)
+                        and not isinstance(raw_pid, bool)
+                        and raw_pid > 0
+                    ):
+                        with suppress(Exception):
+                            self._on_process_exited(raw_pid, self._process_group_id)
 
     async def _stderr_loop(self, proc: asyncio.subprocess.Process) -> None:
         if not proc.stderr:
@@ -2095,7 +2286,11 @@ class CodexAppServerClient:
         params["threadId"] = thread_id
         params["input"] = input_items
         try:
-            result = await self._request_connected("turn/start", params)
+            result = await self._request_connected(
+                "turn/start",
+                params,
+                transport_turn=provisional,
+            )
             turn = result.get("turn") if isinstance(result, dict) else None
             turn_id = str(turn.get("id") or "") if isinstance(turn, dict) else ""
             if not turn_id:
@@ -2113,6 +2308,16 @@ class CodexAppServerClient:
             provisional.turn_id = turn_id
             provisional._subscription.turn_id = turn_id
             return provisional
+        except asyncio.CancelledError as exc:
+            # turn/start may already have reached app-server. Transfer the
+            # provisional handle to the owning runner so its cancellation
+            # cleanup can interrupt/release it instead of leaving this thread
+            # permanently occupied in _turns_by_thread.
+            if self._turns_by_thread.get(thread_id) is provisional:
+                exc.pending_turn = provisional
+            else:
+                provisional._subscription._finish()
+            raise
         except CodexAppServerError as exc:
             if not exc.safe_to_retry:
                 exc.pending_turn = provisional
@@ -2158,6 +2363,8 @@ class CodexAppServerManager:
         process_factory: ProcessFactory | None = None,
         server_request_handler: ServerRequestHandler | None = None,
         initialize_params: dict[str, Any] | None = None,
+        on_process_started: ProcessLifecycleHook | None = None,
+        on_process_exited: ProcessLifecycleHook | None = None,
     ) -> None:
         self.client = CodexAppServerClient(
             codex_bin,
@@ -2172,6 +2379,8 @@ class CodexAppServerManager:
             process_factory=process_factory,
             server_request_handler=server_request_handler,
             initialize_params=initialize_params,
+            on_process_started=on_process_started,
+            on_process_exited=on_process_exited,
         )
 
     @property
@@ -2194,6 +2403,9 @@ class CodexAppServerManager:
 
     async def close(self) -> None:
         await self.client.close()
+
+    async def retire_generation(self, expected_generation: int) -> bool:
+        return await self.client.retire_generation(expected_generation)
 
     async def __aenter__(self) -> "CodexAppServerManager":
         await self.start()

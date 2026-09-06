@@ -6,6 +6,7 @@ from dataclasses import dataclass
 import base64
 import binascii
 from contextlib import contextmanager, suppress
+import errno
 import hashlib
 import hmac
 import json
@@ -28,12 +29,15 @@ try:
 except ImportError:  # pragma: no cover - Team Hub storage is Unix-only in V1.
     fcntl = None  # type: ignore[assignment]
 
+from cryptography.exceptions import InvalidTag
 from cryptography.hazmat.primitives import serialization
+from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
 
 from .auth import (
     AuthenticationError,
     AuthorizationError,
+    INVITATION_MAX_TTL_SECONDS,
     _bounded_text,
     _canonical_ed25519_public_key,
     _email,
@@ -75,6 +79,7 @@ MAX_BOOTSTRAP_DELEGATION_LEDGER_ROWS = 256
 MAX_NETWORK_AGENTS_PER_SERVER = 256
 MAX_NETWORK_BODY_BYTES = 8_192
 MAX_NETWORK_PAGE_ITEMS = 100
+MAX_HUMAN_ADMIN_PAGE_ITEMS = 100
 MAX_SECURE_PEER_BINDING_LOOKUP_IDS = 512
 SECURE_PEER_HEARTBEAT_WRITE_INTERVAL_SECONDS = 15
 # Secure-peer responses are hard-capped at 2 MiB. Keep paged network payloads
@@ -88,6 +93,7 @@ MAX_TEAM_MESSAGE_ATTACHMENTS = 16
 MAX_TEAM_MESSAGE_ATTACHMENT_BYTES = 2 * 1024 * 1024 * 1024
 MAX_TEAM_MESSAGE_TITLE_CHARS = 160
 MAX_TEAM_MESSAGE_PREVIEW_CHARS = 280
+TEAM_MESSAGE_PROVENANCE_KEYS = ("via", "backend", "chat_id", "run_id")
 DEFAULT_TEAM_ATTACHMENT_MAX_BYTES = 512 * 1024 * 1024
 DEFAULT_TEAM_ATTACHMENT_QUOTA_BYTES = 50 * 1024 * 1024 * 1024
 TEAM_ATTACHMENT_CHUNK_BYTES = 8 * 1024 * 1024
@@ -105,7 +111,21 @@ MAX_TEAM_SKILLS_PER_TEAM = 500
 MAX_TEAM_SKILL_VERSIONS = 200
 MAX_TEAM_SKILL_TAGS = 8
 RESTORE_TRANSACTION_JOURNAL_NAME = ".restore-transaction.json"
+RESTORE_COMPLETION_RECEIPT_NAME = ".restore-completion.json"
+SNAPSHOT_REBASE_JOURNAL_NAME = ".snapshot-rebase.json"
+HOST_REACTIVATION_HANDOFF_NAME = ".host-reactivation-handoff.json"
+MANAGED_STARTUP_GUARD_NAME = ".managed-startup-guard.json"
+MANAGED_STARTUP_AUTHORITY_NAME = ".managed-startup-authority.json"
+MAINTENANCE_FENCE_STAGING_RE = re.compile(
+    r"^\.maintenance-fence-host-reactivation-[0-9a-f]{24}\.pending$"
+)
+SNAPSHOT_REBASE_RETIRED_RE = re.compile(
+    r"^\.snapshot-rebase-[0-9a-f]{24}\.old$"
+)
 RESTORE_STAGING_NAME_RE = re.compile(r"^\.restore-[1-9][0-9]*-[0-9a-f]{16}$")
+SNAPSHOT_STAGING_NAME_RE = re.compile(
+    r"^\.snapshot_[0-9]{20}_[0-9a-f]{16}\.tmp$"
+)
 TEAM_SKILL_SLUG_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,63}$")
 TEAM_SKILL_TAG_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,31}$")
 TEAM_ATTACHMENT_FILE_NAME_RE = re.compile(r"^[^\x00-\x1f\x7f/\\]{1,255}$")
@@ -272,6 +292,18 @@ class HubStore:
                     if time.monotonic() >= deadline:
                         raise RuntimeError("Team Hub local control is busy")
                     time.sleep(0.025)
+            cls._cleanup_orphaned_maintenance_fence_staging_unlocked(root)
+            if cls._snapshot_rebase_pending(root):
+                attachment_lease = cls.acquire_attachment_control_lease(root)
+                try:
+                    cls._recover_snapshot_rebase_unlocked(root)
+                finally:
+                    cls.release_attachment_control_lease(attachment_lease)
+            attachment_lease = cls.acquire_attachment_control_lease(root)
+            try:
+                cls._cleanup_orphaned_snapshot_rebase_retired_unlocked(root)
+            finally:
+                cls.release_attachment_control_lease(attachment_lease)
             if cls._restore_recovery_pending(root):
                 attachment_lease = cls.acquire_attachment_control_lease(root)
                 try:
@@ -288,6 +320,9 @@ class HubStore:
                     if journal_pending:
                         cls._recover_interrupted_restore_unlocked(root)
                     cls._cleanup_abandoned_restore_staging_unlocked(root)
+                    cls._clear_orphaned_host_reactivation_restore_fence_unlocked(
+                        root
+                    )
                 finally:
                     cls.release_attachment_control_lease(attachment_lease)
             yield
@@ -342,25 +377,274 @@ class HubStore:
         now: int | None = None,
         managed_host_identity: str | None = None,
         managed_server_instance_id: str | None = None,
+        managed_host_display_name: str = "Team Hub host",
         allow_bound_control: bool = False,
+        maintenance_control_locked: bool = False,
+        managed_reactivation_hub_id: str | None = None,
+        managed_reactivation_operation_id: str | None = None,
+        managed_reactivation_snapshot: Path | None = None,
+        managed_update_hub_id: str | None = None,
+        managed_update_operation_id: str | None = None,
+        managed_update_snapshot: Path | None = None,
     ) -> None:
         self.data_dir = Path(os.path.abspath(os.path.expanduser(os.fspath(data_dir))))
         self.database_path = self.data_dir / "team-hub.sqlite3"
         self.signing_key_path = self.data_dir / "access-token-signing.key"
         self.bootstrap_proof_path = self.data_dir / "bootstrap-owner.proof"
         self.maintenance_fence_path = self.data_dir / "maintenance-fence.json"
+        if maintenance_control_locked and not allow_bound_control:
+            raise RuntimeError("Team Hub control-lock ownership is invalid")
+        try:
+            self._read_managed_startup_guard_unlocked(self.data_dir)
+        except FileNotFoundError:
+            pass
+        else:
+            raise RuntimeError("Team Hub cold handoff startup guard is active")
+        # A completed offline snapshot restore is not safe to expose until the
+        # outer release-activation ledger has durably restored the prior
+        # links/configuration.  Keep every ordinary constructor fail-closed in
+        # that crash window; only the exact offline confirm/acknowledge control
+        # path below may inspect and retire this receipt.
+        if (
+            self._read_restore_completion_receipt_unlocked(self.data_dir) is not None
+            and not self._restore_transaction_pending(self.data_dir)
+        ):
+            raise RuntimeError("Team Hub rollback settlement is pending")
         self.managed_host_identity: str | None = None
         self.managed_server_instance_id = (
             _identity(managed_server_instance_id)
             if managed_server_instance_id is not None
             else None
         )
+        self.managed_host_display_name = _bounded_text(
+            managed_host_display_name,
+            "managed_host_display_name",
+            1,
+            160,
+        )
         ensure_private_directory(self.data_dir)
+        self.reactivation_fenced_start = False
+        self.maintenance_fenced_start = False
+        self.maintenance_fence_reason: str | None = None
+        self.maintenance_operation_id: str | None = None
+        self.maintenance_fence_snapshot: Path | None = None
+        reactivation_values = (
+            managed_reactivation_hub_id,
+            managed_reactivation_operation_id,
+            managed_reactivation_snapshot,
+        )
+        update_values = (
+            managed_update_hub_id,
+            managed_update_operation_id,
+            managed_update_snapshot,
+        )
+        if any(value is not None for value in reactivation_values) and not all(
+            value is not None for value in reactivation_values
+        ):
+            raise RuntimeError(
+                "Team Hub reactivation startup authority is incomplete"
+            )
+        if any(value is not None for value in update_values) and not all(
+            value is not None for value in update_values
+        ):
+            raise RuntimeError("Team Hub update startup authority is incomplete")
+        if all(value is not None for value in reactivation_values) and all(
+            value is not None for value in update_values
+        ):
+            raise RuntimeError("Team Hub startup authority is ambiguous")
+        startup_authority: tuple[str, str, str, Path] | None = None
+        if all(value is not None for value in reactivation_values):
+            assert managed_reactivation_hub_id is not None
+            assert managed_reactivation_operation_id is not None
+            assert managed_reactivation_snapshot is not None
+            startup_authority = (
+                "host-reactivation",
+                managed_reactivation_hub_id,
+                managed_reactivation_operation_id,
+                Path(managed_reactivation_snapshot),
+            )
+        elif all(value is not None for value in update_values):
+            assert managed_update_hub_id is not None
+            assert managed_update_operation_id is not None
+            assert managed_update_snapshot is not None
+            startup_authority = (
+                "server-update",
+                managed_update_hub_id,
+                managed_update_operation_id,
+                Path(managed_update_snapshot),
+            )
+        persisted_authority: dict[str, str] | None = None
+        try:
+            fence_raw = self._read_private_regular_file(
+                self.maintenance_fence_path,
+                maximum_bytes=16 * 1024,
+            )
+        except FileNotFoundError:
+            if startup_authority is not None:
+                raise RuntimeError("Team Hub startup authority is stale")
+            # The fence is the only admission capability. A SIGKILL after
+            # committing its unlink may leave a complete, partial, or empty
+            # authority control file. Remove that powerless residue before
+            # ordinary startup, without trying to parse attacker-controlled
+            # or crash-truncated bytes. The control lock makes this atomic
+            # with every supported fence/authority publisher.
+            @contextmanager
+            def authority_cleanup_lock():
+                if maintenance_control_locked:
+                    yield
+                else:
+                    with self.maintenance_control_lock(self.data_dir):
+                        yield
+
+            with authority_cleanup_lock():
+                try:
+                    self.maintenance_fence_path.lstat()
+                except FileNotFoundError:
+                    authority_path = self.data_dir / MANAGED_STARTUP_AUTHORITY_NAME
+                    try:
+                        authority_info = authority_path.lstat()
+                    except FileNotFoundError:
+                        pass
+                    else:
+                        if (
+                            not stat.S_ISREG(authority_info.st_mode)
+                            or authority_info.st_uid != os.getuid()
+                            or authority_info.st_nlink != 1
+                            or stat.S_IMODE(authority_info.st_mode) != 0o600
+                        ):
+                            raise PermissionError(
+                                "Team Hub startup authority file is unsafe"
+                            )
+                        authority_path.unlink()
+                        self._fsync_directory(self.data_dir)
+                else:
+                    raise RuntimeError("Team Hub startup authority fence changed")
+        else:
+            try:
+                persisted_authority = self._read_managed_startup_authority_unlocked(
+                    self.data_dir
+                )
+            except FileNotFoundError:
+                persisted_authority = None
+            if persisted_authority is not None:
+                file_authority = (
+                    str(persisted_authority["reason"]),
+                    str(persisted_authority["hub_id"]),
+                    str(persisted_authority["operation_id"]),
+                    self.data_dir
+                    / "maintenance-backups"
+                    / str(persisted_authority["snapshot"]),
+                )
+                if (
+                    startup_authority is not None
+                    and startup_authority != file_authority
+                ):
+                    raise RuntimeError("Team Hub startup authority is ambiguous")
+                startup_authority = file_authority
+            try:
+                fence = json.loads(fence_raw)
+            except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+                raise RuntimeError("Team Hub maintenance fence is invalid") from exc
+            if not self._maintenance_fence_payload_valid(fence):
+                raise RuntimeError("Team Hub maintenance fence is invalid")
+            if fence.get("reason") in {"host-reactivation", "server-update"}:
+                if fence.get("format") != 1:
+                    raise RuntimeError(
+                        "Team Hub fenced restore requires offline recovery"
+                    )
+                expected_host = (
+                    _identity(managed_host_identity)
+                    if managed_host_identity is not None
+                    else None
+                )
+                authority_reason = (
+                    startup_authority[0]
+                    if startup_authority is not None
+                    else None
+                )
+                authority_hub_id = (
+                    startup_authority[1]
+                    if startup_authority is not None
+                    else None
+                )
+                authority_operation_id = (
+                    startup_authority[2]
+                    if startup_authority is not None
+                    else None
+                )
+                authority_snapshot = (
+                    startup_authority[3]
+                    if startup_authority is not None
+                    else None
+                )
+                snapshot = (
+                    Path(
+                        os.path.abspath(
+                            os.path.expanduser(
+                                os.fspath(authority_snapshot)
+                            )
+                        )
+                    )
+                    if authority_snapshot is not None
+                    else None
+                )
+                if (
+                    expected_host is None
+                    or authority_reason != fence.get("reason")
+                    or authority_hub_id is None
+                    or authority_operation_id is None
+                    or snapshot is None
+                    or snapshot.parent
+                    != self.data_dir / "maintenance-backups"
+                    or fence.get("host_server_identity") != expected_host
+                    or fence.get("hub_id") != authority_hub_id
+                    or fence.get("operation_id")
+                    != authority_operation_id
+                    or fence.get("snapshot") != snapshot.name
+                    or not isinstance(
+                        fence.get("snapshot_manifest_sha256"), str
+                    )
+                    or (
+                        persisted_authority is not None
+                        and (
+                            persisted_authority["host_server_identity"]
+                            != expected_host
+                            or persisted_authority[
+                                "snapshot_manifest_sha256"
+                            ]
+                            != fence.get("snapshot_manifest_sha256")
+                        )
+                    )
+                ):
+                    raise RuntimeError(
+                        "Team Hub startup authority does not match"
+                    )
+                self.verify_maintenance_snapshot(
+                    self.data_dir,
+                    snapshot,
+                    expected_host_identity=expected_host,
+                    expected_hub_id=authority_hub_id,
+                    expected_operation_id=authority_operation_id,
+                    expected_reason=authority_reason,
+                )
+                self.maintenance_fenced_start = True
+                self.maintenance_fence_reason = authority_reason
+                self.maintenance_operation_id = authority_operation_id
+                self.maintenance_fence_snapshot = snapshot
+                self.reactivation_fenced_start = (
+                    authority_reason == "host-reactivation"
+                )
+            elif startup_authority is not None:
+                raise RuntimeError("Team Hub startup authority does not match")
         # A restore swaps several independent filesystem objects. Complete or
-        # roll back any durable transaction before SQLite can observe them.
+        # roll back any durable transaction before SQLite can observe them,
+        # but never let an ordinary host startup mutate a protected update or
+        # reactivation generation before exact startup authority is checked.
         if self._restore_recovery_pending(self.data_dir):
             with self.maintenance_control_lock(self.data_dir):
                 pass
+        if self._read_restore_completion_receipt_unlocked(self.data_dir) is not None:
+            raise RuntimeError("Team Hub rollback settlement is pending")
         self.team_attachment_max_bytes = _positive_int_env(
             "AGENTSDOCK_TEAM_ATTACHMENT_MAX_BYTES",
             DEFAULT_TEAM_ATTACHMENT_MAX_BYTES,
@@ -390,7 +674,11 @@ class HubStore:
         # Host binding is checked or won transactionally before a missing key
         # is created. A foreign copied database therefore cannot mutate local
         # credential state merely by attempting activation.
-        self.signer = AccessTokenSigner(load_or_create_signing_key(self.signing_key_path))
+        signing_key = load_or_create_signing_key(self.signing_key_path)
+        self.signer = AccessTokenSigner(signing_key)
+        self._human_admin_cursor_key = hashlib.sha256(
+            b"agentsdock-team-hub-human-admin-cursor-v1\0" + signing_key
+        ).digest()
 
     def _preflight_managed_host_binding(
         self,
@@ -423,6 +711,21 @@ class HubStore:
     def _copy_private_regular_file(source: Path, destination: Path) -> tuple[int, ...]:
         """Copy one stable owner-only file without following source links."""
 
+        return HubStore._copy_private_regular_file_with_links(
+            source,
+            destination,
+            allow_source_hardlinks=False,
+        )
+
+    @staticmethod
+    def _copy_private_regular_file_with_links(
+        source: Path,
+        destination: Path,
+        *,
+        allow_source_hardlinks: bool,
+    ) -> tuple[int, ...]:
+        """Copy one stable private file, optionally accepting immutable links."""
+
         read_flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
         read_flags |= getattr(os, "O_NOFOLLOW", 0)
         source_descriptor = os.open(source, read_flags)
@@ -431,7 +734,8 @@ class HubStore:
             before = os.fstat(source_descriptor)
             if (
                 not stat.S_ISREG(before.st_mode)
-                or before.st_nlink != 1
+                or before.st_nlink < 1
+                or (not allow_source_hardlinks and before.st_nlink != 1)
                 or before.st_uid != os.getuid()
                 or stat.S_IMODE(before.st_mode) != 0o600
             ):
@@ -474,6 +778,104 @@ class HubStore:
             if destination_descriptor >= 0:
                 os.close(destination_descriptor)
             os.close(source_descriptor)
+
+    @classmethod
+    def _link_or_copy_immutable_private_file(
+        cls,
+        source: Path,
+        destination: Path,
+    ) -> bool:
+        """Hard-link one immutable blob when safe, otherwise copy it.
+
+        The attachment-control lease excludes all application writers. Keep an
+        open no-follow descriptor across link publication and compare both path
+        names back to that inode, closing the only pathname race left to a
+        same-user process. Unsupported/cross-device links fall back to a stable
+        byte copy; an observed identity race fails closed.
+        """
+
+        flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
+        flags |= getattr(os, "O_NOFOLLOW", 0)
+        descriptor = os.open(source, flags)
+        try:
+            opened = os.fstat(descriptor)
+            if (
+                not stat.S_ISREG(opened.st_mode)
+                or opened.st_nlink < 1
+                or opened.st_uid != os.getuid()
+                or stat.S_IMODE(opened.st_mode) != 0o600
+            ):
+                raise PermissionError(
+                    "Team Hub immutable attachment is not owner-only"
+                )
+            try:
+                os.link(source, destination, follow_symlinks=False)
+            except OSError as exc:
+                fallback_errors = {
+                    errno.EACCES,
+                    errno.EMLINK,
+                    errno.EPERM,
+                    errno.EXDEV,
+                }
+                for name in ("ENOTSUP", "EOPNOTSUPP"):
+                    value = getattr(errno, name, None)
+                    if isinstance(value, int):
+                        fallback_errors.add(value)
+                if exc.errno not in fallback_errors:
+                    raise
+                cls._copy_private_regular_file_with_links(
+                    source,
+                    destination,
+                    allow_source_hardlinks=True,
+                )
+                return False
+
+            try:
+                after = os.fstat(descriptor)
+                linked_source = os.stat(source, follow_symlinks=False)
+                linked_destination = os.stat(destination, follow_symlinks=False)
+                expected = (
+                    int(opened.st_dev),
+                    int(opened.st_ino),
+                    int(opened.st_size),
+                    int(opened.st_mtime_ns),
+                )
+                if (
+                    expected
+                    != (
+                        int(after.st_dev),
+                        int(after.st_ino),
+                        int(after.st_size),
+                        int(after.st_mtime_ns),
+                    )
+                    or expected
+                    != (
+                        int(linked_source.st_dev),
+                        int(linked_source.st_ino),
+                        int(linked_source.st_size),
+                        int(linked_source.st_mtime_ns),
+                    )
+                    or expected
+                    != (
+                        int(linked_destination.st_dev),
+                        int(linked_destination.st_ino),
+                        int(linked_destination.st_size),
+                        int(linked_destination.st_mtime_ns),
+                    )
+                    or linked_destination.st_nlink < 2
+                    or linked_destination.st_uid != os.getuid()
+                    or stat.S_IMODE(linked_destination.st_mode) != 0o600
+                ):
+                    raise RuntimeError(
+                        "Team Hub immutable attachment changed during snapshot"
+                    )
+            except BaseException:
+                with suppress(OSError):
+                    destination.unlink()
+                raise
+            return True
+        finally:
+            os.close(descriptor)
 
     def _read_managed_binding_without_source_mutation(self) -> str | None:
         """Read the main DB plus any live WAL through a private stable copy."""
@@ -536,8 +938,26 @@ class HubStore:
                     ) from exc
         raise RuntimeError("Team Hub host-binding preflight could not obtain a stable snapshot")
 
+    @classmethod
+    def managed_host_binding_without_source_mutation(
+        cls,
+        data_dir: Path,
+    ) -> str | None:
+        """Read a preserved Hub's host binding without opening/migrating it."""
+
+        root = Path(os.path.abspath(os.path.expanduser(os.fspath(data_dir))))
+        cls._validate_private_directory_without_mutation(root)
+        probe = object.__new__(cls)
+        probe.data_dir = root
+        probe.database_path = root / "team-hub.sqlite3"
+        return probe._read_managed_binding_without_source_mutation()
+
     @staticmethod
-    def _sha256_private_regular_file(path: Path) -> str:
+    def _sha256_private_regular_file(
+        path: Path,
+        *,
+        allow_hardlinks: bool = False,
+    ) -> str:
         flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
         flags |= getattr(os, "O_NOFOLLOW", 0)
         descriptor = os.open(path, flags)
@@ -545,7 +965,8 @@ class HubStore:
             info = os.fstat(descriptor)
             if (
                 not stat.S_ISREG(info.st_mode)
-                or info.st_nlink != 1
+                or info.st_nlink < 1
+                or (not allow_hardlinks and info.st_nlink != 1)
                 or info.st_uid != os.getuid()
                 or stat.S_IMODE(info.st_mode) != 0o600
             ):
@@ -632,6 +1053,83 @@ class HubStore:
         finally:
             os.close(descriptor)
 
+    @classmethod
+    def _create_owned_maintenance_fence(
+        cls,
+        path: Path,
+        value: bytes,
+    ) -> os.stat_result:
+        """Publish one fence while retaining exact creator-inode ownership.
+
+        Unlike the general secret-file helper, every failure after O_EXCL has
+        enough descriptor identity to remove only this invocation's inode.
+        A replaced path is never unlinked and therefore remains fail-closed.
+        """
+
+        ensure_private_directory(path.parent)
+        directory_flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
+        directory_flags |= getattr(os, "O_NOFOLLOW", 0) | getattr(
+            os, "O_DIRECTORY", 0
+        )
+        directory = os.open(path.parent, directory_flags)
+        descriptor: int | None = None
+        created: os.stat_result | None = None
+        try:
+            flags = os.O_RDWR | os.O_CREAT | os.O_EXCL
+            flags |= getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+            descriptor = os.open(path.name, flags, 0o600, dir_fd=directory)
+            created = os.fstat(descriptor)
+            os.fchmod(descriptor, 0o600)
+            written = 0
+            while written < len(value):
+                written += os.write(descriptor, value[written:])
+            os.fsync(descriptor)
+            created = os.fstat(descriptor)
+            if (
+                not stat.S_ISREG(created.st_mode)
+                or created.st_uid != os.getuid()
+                or created.st_nlink != 1
+                or stat.S_IMODE(created.st_mode) != 0o600
+            ):
+                raise PermissionError("Team Hub maintenance fence is unsafe")
+            cls._fsync_directory(path.parent)
+            linked = path.lstat()
+            if (
+                linked.st_dev != created.st_dev
+                or linked.st_ino != created.st_ino
+                or linked.st_uid != os.getuid()
+                or linked.st_nlink != 1
+                or not stat.S_ISREG(linked.st_mode)
+                or stat.S_IMODE(linked.st_mode) != 0o600
+            ):
+                raise RuntimeError("Team Hub maintenance fence changed")
+            os.lseek(descriptor, 0, os.SEEK_SET)
+            if not hmac.compare_digest(os.read(descriptor, len(value) + 1), value):
+                raise RuntimeError("Team Hub maintenance fence changed")
+            return created
+        except BaseException as publish_error:
+            if created is not None:
+                try:
+                    linked = path.lstat()
+                    if (
+                        linked.st_dev != created.st_dev
+                        or linked.st_ino != created.st_ino
+                    ):
+                        raise RuntimeError("Team Hub maintenance fence changed")
+                    path.unlink()
+                    cls._fsync_directory(path.parent)
+                except FileNotFoundError:
+                    pass
+                except BaseException as cleanup_error:
+                    raise RuntimeError(
+                        "Team Hub maintenance fence remains fail-closed"
+                    ) from cleanup_error
+            raise publish_error
+        finally:
+            if descriptor is not None:
+                os.close(descriptor)
+            os.close(directory)
+
     @staticmethod
     def _restore_transaction_pending(root: Path) -> bool:
         try:
@@ -640,18 +1138,824 @@ class HubStore:
             return False
         return True
 
+    @staticmethod
+    def _snapshot_rebase_pending(root: Path) -> bool:
+        try:
+            (root / SNAPSHOT_REBASE_JOURNAL_NAME).lstat()
+        except FileNotFoundError:
+            return False
+        return True
+
+    @classmethod
+    def _cleanup_orphaned_maintenance_fence_staging_unlocked(
+        cls,
+        root: Path,
+    ) -> None:
+        try:
+            (root / HOST_REACTIVATION_HANDOFF_NAME).lstat()
+        except FileNotFoundError:
+            pass
+        else:
+            return
+        try:
+            entries = list(os.scandir(root))
+        except FileNotFoundError:
+            return
+        candidates = [
+            root / entry.name
+            for entry in entries
+            if MAINTENANCE_FENCE_STAGING_RE.fullmatch(entry.name) is not None
+        ]
+        for path in candidates:
+            info = path.lstat()
+            if (
+                not stat.S_ISREG(info.st_mode)
+                or info.st_uid != os.getuid()
+                or stat.S_IMODE(info.st_mode) != 0o600
+            ):
+                raise PermissionError(
+                    "Team Hub maintenance fence staging file is unsafe"
+                )
+        for path in candidates:
+            path.unlink()
+        if candidates:
+            cls._fsync_directory(root)
+
+    @classmethod
+    def _read_host_reactivation_handoff_unlocked(
+        cls,
+        root: Path,
+    ) -> dict[str, Any] | None:
+        try:
+            raw = cls._read_private_regular_file(
+                root / HOST_REACTIVATION_HANDOFF_NAME,
+                maximum_bytes=16 * 1024,
+            )
+        except FileNotFoundError:
+            return None
+        try:
+            value = json.loads(raw)
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise RuntimeError(
+                "Team Hub reactivation handoff is invalid"
+            ) from exc
+        if (
+            not isinstance(value, dict)
+            or set(value)
+            != {
+                "format",
+                "state",
+                "hub_id",
+                "host_server_identity",
+                "operation_id",
+                "snapshot",
+                "fence_device",
+                "fence_inode",
+                "fence_staging",
+            }
+            or value.get("format") != 2
+            or value.get("state")
+            not in {"creating", "unclaimed", "adopted"}
+            or not isinstance(value.get("hub_id"), str)
+            or re.fullmatch(r"[A-Za-z0-9_.:-]{8,240}", value["hub_id"])
+            is None
+            or not isinstance(value.get("host_server_identity"), str)
+            or re.fullmatch(
+                r"[A-Za-z0-9][A-Za-z0-9._:@/-]{7,239}",
+                value["host_server_identity"],
+            )
+            is None
+            or not isinstance(value.get("operation_id"), str)
+            or re.fullmatch(
+                r"host-reactivation-[0-9a-f]{24}",
+                value["operation_id"],
+            )
+            is None
+            or not isinstance(value.get("snapshot"), str)
+            or re.fullmatch(r"snapshot_[A-Za-z0-9_]+", value["snapshot"])
+            is None
+            or isinstance(value.get("fence_device"), bool)
+            or not isinstance(value.get("fence_device"), int)
+            or value["fence_device"] < 0
+            or isinstance(value.get("fence_inode"), bool)
+            or not isinstance(value.get("fence_inode"), int)
+            or value["fence_inode"] <= 0
+            or not isinstance(value.get("fence_staging"), str)
+            or MAINTENANCE_FENCE_STAGING_RE.fullmatch(
+                value["fence_staging"]
+            )
+            is None
+        ):
+            raise RuntimeError("Team Hub reactivation handoff is invalid")
+        return value
+
+    @classmethod
+    def _read_managed_startup_guard_unlocked(
+        cls,
+        root: Path,
+    ) -> dict[str, str]:
+        raw = cls._read_private_regular_file(
+            root / MANAGED_STARTUP_GUARD_NAME,
+            maximum_bytes=4096,
+        )
+        try:
+            value = json.loads(raw)
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise RuntimeError("Team Hub startup guard is invalid") from exc
+        if (
+            not isinstance(value, dict)
+            or set(value) != {"format", "host_server_identity", "guard_id"}
+            or value.get("format") != 1
+            or not isinstance(value.get("host_server_identity"), str)
+            or re.fullmatch(
+                r"[A-Za-z0-9][A-Za-z0-9._:@/-]{7,239}",
+                value["host_server_identity"],
+            )
+            is None
+            or not isinstance(value.get("guard_id"), str)
+            or re.fullmatch(r"cold-handoff-[0-9a-f]{24}", value["guard_id"])
+            is None
+        ):
+            raise RuntimeError("Team Hub startup guard is invalid")
+        return value
+
+    @classmethod
+    def _read_managed_startup_authority_unlocked(
+        cls,
+        root: Path,
+    ) -> dict[str, str]:
+        raw = cls._read_private_regular_file(
+            root / MANAGED_STARTUP_AUTHORITY_NAME,
+            maximum_bytes=16 * 1024,
+        )
+        try:
+            value = json.loads(raw)
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise RuntimeError("Team Hub startup authority file is invalid") from exc
+        if (
+            not isinstance(value, dict)
+            or set(value)
+            != {
+                "format",
+                "reason",
+                "hub_id",
+                "host_server_identity",
+                "operation_id",
+                "snapshot",
+                "snapshot_manifest_sha256",
+            }
+            or value.get("format") != 1
+            or value.get("reason") not in {"server-update", "host-reactivation"}
+            or not isinstance(value.get("hub_id"), str)
+            or re.fullmatch(r"[A-Za-z0-9_.:-]{8,240}", value["hub_id"])
+            is None
+            or not isinstance(value.get("host_server_identity"), str)
+            or re.fullmatch(
+                r"[A-Za-z0-9][A-Za-z0-9._:@/-]{7,239}",
+                value["host_server_identity"],
+            )
+            is None
+            or not isinstance(value.get("operation_id"), str)
+            or re.fullmatch(
+                r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}",
+                value["operation_id"],
+            )
+            is None
+            or not isinstance(value.get("snapshot"), str)
+            or re.fullmatch(r"snapshot_[A-Za-z0-9_]+", value["snapshot"])
+            is None
+            or not isinstance(value.get("snapshot_manifest_sha256"), str)
+            or re.fullmatch(
+                r"[0-9a-f]{64}", value["snapshot_manifest_sha256"]
+            )
+            is None
+        ):
+            raise RuntimeError("Team Hub startup authority file is invalid")
+        return value
+
+    @classmethod
+    def _replace_private_control_file_unlocked(
+        cls,
+        path: Path,
+        payload: bytes,
+    ) -> None:
+        temporary = path.parent / f".{path.name}.{secrets.token_hex(12)}.tmp"
+        try:
+            create_secret_file(temporary, payload)
+            os.replace(temporary, path)
+            last_fsync_error: OSError | None = None
+            for _attempt in range(3):
+                try:
+                    cls._fsync_directory(path.parent)
+                except OSError as exc:
+                    last_fsync_error = exc
+                else:
+                    last_fsync_error = None
+                    break
+            if last_fsync_error is not None:
+                raise last_fsync_error
+        except BaseException as publish_error:
+            try:
+                temporary.unlink()
+            except FileNotFoundError:
+                pass
+            raise publish_error
+
+    @classmethod
+    def _recover_host_reactivation_handoff_unlocked(
+        cls,
+        root: Path,
+    ) -> dict[str, Any] | None:
+        handoff = cls._read_host_reactivation_handoff_unlocked(root)
+        if handoff is None:
+            return None
+        if handoff["state"] == "creating":
+            marker_path = root / "maintenance-fence.json"
+            staging_path = root / str(handoff["fence_staging"])
+            try:
+                marker_info = marker_path.lstat()
+            except FileNotFoundError:
+                marker_info = None
+            try:
+                staging_info = staging_path.lstat()
+            except FileNotFoundError:
+                staging_info = None
+            for info in (marker_info, staging_info):
+                if info is not None and (
+                    info.st_dev != handoff["fence_device"]
+                    or info.st_ino != handoff["fence_inode"]
+                ):
+                    raise RuntimeError(
+                        "Team Hub creating reactivation fence ownership changed"
+                    )
+            if marker_info is None and staging_info is None:
+                (root / HOST_REACTIVATION_HANDOFF_NAME).unlink()
+                cls._fsync_directory(root)
+                return None
+            if marker_info is None:
+                raw = cls._read_private_regular_file(
+                    staging_path,
+                    maximum_bytes=16 * 1024,
+                )
+                try:
+                    staged_marker = json.loads(raw)
+                except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+                    raise RuntimeError(
+                        "Team Hub creating reactivation fence is invalid"
+                    ) from exc
+                if (
+                    not cls._maintenance_fence_payload_valid(staged_marker)
+                    or staged_marker.get("hub_id") != handoff["hub_id"]
+                    or staged_marker.get("host_server_identity")
+                    != handoff["host_server_identity"]
+                    or staged_marker.get("reason") != "host-reactivation"
+                    or staged_marker.get("operation_id")
+                    != handoff["operation_id"]
+                    or staged_marker.get("snapshot") != handoff["snapshot"]
+                ):
+                    raise RuntimeError(
+                        "Team Hub creating reactivation fence does not match"
+                    )
+                staging_path.unlink()
+                (root / HOST_REACTIVATION_HANDOFF_NAME).unlink()
+                cls._fsync_directory(root)
+                return None
+            if staging_info is not None:
+                # A crash after link but before unlink leaves two names for
+                # the same inode. Retire only that exact staging name before
+                # normal private-file verification (which requires nlink=1).
+                staging_path.unlink()
+                cls._fsync_directory(root)
+        if handoff["state"] == "adopted":
+            marker = cls._maintenance_fence_control_unlocked(
+                root,
+                expected_hub_id=str(handoff["hub_id"]),
+                expected_host_identity=str(handoff["host_server_identity"]),
+                expected_reason="host-reactivation",
+                expected_operation_id=str(handoff["operation_id"]),
+                expected_snapshot=(
+                    root / "maintenance-backups" / str(handoff["snapshot"])
+                ),
+            )
+            if marker is None:
+                # Fence consumption is the irreversible commit point. A
+                # crash or directory-fsync error may leave only the advisory
+                # handoff; it no longer owns Hub admission.
+                (root / HOST_REACTIVATION_HANDOFF_NAME).unlink()
+                cls._fsync_directory(root)
+                return None
+            marker_info = (root / "maintenance-fence.json").lstat()
+            if (
+                marker is None
+                or marker_info.st_dev != handoff["fence_device"]
+                or marker_info.st_ino != handoff["fence_inode"]
+            ):
+                raise RuntimeError(
+                    "Team Hub adopted reactivation fence ownership changed"
+                )
+            return handoff
+        marker = cls._maintenance_fence_control_unlocked(
+            root,
+            expected_hub_id=str(handoff["hub_id"]),
+            expected_host_identity=str(handoff["host_server_identity"]),
+            expected_reason="host-reactivation",
+            expected_operation_id=str(handoff["operation_id"]),
+            expected_snapshot=(
+                root / "maintenance-backups" / str(handoff["snapshot"])
+            ),
+        )
+        if marker is not None:
+            marker_info = (root / "maintenance-fence.json").lstat()
+            if (
+                marker_info.st_dev != handoff["fence_device"]
+                or marker_info.st_ino != handoff["fence_inode"]
+            ):
+                raise RuntimeError(
+                    "Team Hub reactivation handoff fence ownership changed"
+                )
+            (root / "maintenance-fence.json").unlink()
+        (root / HOST_REACTIVATION_HANDOFF_NAME).unlink()
+        cls._fsync_directory(root)
+        return None
+
+    @classmethod
+    def _consume_host_reactivation_handoff_unlocked(
+        cls,
+        root: Path,
+        *,
+        expected_hub_id: str,
+        expected_host_identity: str,
+        expected_operation_id: str,
+        expected_snapshot: Path,
+        remove: bool = True,
+        expected_state: str = "adopted",
+    ) -> None:
+        handoff = cls._read_host_reactivation_handoff_unlocked(root)
+        if handoff is None:
+            return
+        if (
+            handoff.get("hub_id") != expected_hub_id
+            or handoff.get("host_server_identity") != expected_host_identity
+            or handoff.get("operation_id") != expected_operation_id
+            or handoff.get("snapshot") != Path(expected_snapshot).name
+            or handoff.get("state") != expected_state
+        ):
+            raise RuntimeError("Team Hub reactivation handoff does not match")
+        if not remove:
+            marker_info = (root / "maintenance-fence.json").lstat()
+            if (
+                marker_info.st_dev != handoff["fence_device"]
+                or marker_info.st_ino != handoff["fence_inode"]
+            ):
+                raise RuntimeError(
+                    "Team Hub reactivation fence ownership changed"
+                )
+        if remove:
+            (root / HOST_REACTIVATION_HANDOFF_NAME).unlink()
+
     @classmethod
     def _restore_recovery_pending(cls, root: Path) -> bool:
-        if cls._restore_transaction_pending(root):
+        if (
+            cls._restore_transaction_pending(root)
+            or cls._snapshot_rebase_pending(root)
+        ):
             return True
         try:
             with os.scandir(root) as entries:
                 return any(
-                    RESTORE_STAGING_NAME_RE.fullmatch(entry.name) is not None
+                    entry.name == "maintenance-fence.json"
+                    or SNAPSHOT_REBASE_RETIRED_RE.fullmatch(entry.name)
+                    is not None
+                    or RESTORE_STAGING_NAME_RE.fullmatch(entry.name) is not None
                     for entry in entries
                 )
         except FileNotFoundError:
             return False
+
+    @classmethod
+    def _remove_snapshot_generation_unlocked(cls, path: Path) -> None:
+        cls._validate_private_directory_without_mutation(path)
+        for directory, directory_names, file_names in os.walk(
+            path,
+            topdown=True,
+            followlinks=False,
+        ):
+            current = Path(directory)
+            cls._validate_private_directory_without_mutation(current)
+            for name in directory_names:
+                cls._validate_private_directory_without_mutation(current / name)
+            for name in file_names:
+                candidate = current / name
+                flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
+                flags |= getattr(os, "O_NOFOLLOW", 0)
+                descriptor = os.open(candidate, flags)
+                try:
+                    info = os.fstat(descriptor)
+                    if (
+                        not stat.S_ISREG(info.st_mode)
+                        or info.st_uid != os.getuid()
+                    ):
+                        raise PermissionError(
+                            "Team Hub snapshot generation contains an unsafe file"
+                        )
+                finally:
+                    os.close(descriptor)
+        shutil.rmtree(path)
+
+    @classmethod
+    def _verify_snapshot_rebase_generation_unlocked(
+        cls,
+        root: Path,
+        path: Path,
+        *,
+        journal: dict[str, Any],
+        manifest_digest_key: str,
+    ) -> tuple[int, int]:
+        before = path.lstat()
+        if not stat.S_ISDIR(before.st_mode) or before.st_uid != os.getuid():
+            raise PermissionError("Team Hub snapshot rebase generation is unsafe")
+        expected_digest = journal.get(manifest_digest_key)
+        if (
+            not isinstance(expected_digest, str)
+            or re.fullmatch(r"[0-9a-f]{64}", expected_digest) is None
+            or not hmac.compare_digest(
+                cls._sha256_private_regular_file(path / "manifest.json"),
+                expected_digest,
+            )
+        ):
+            raise RuntimeError("Team Hub snapshot rebase generation changed")
+        cls._restore_maintenance_snapshot_unlocked(
+            root,
+            path,
+            expected_host_identity=str(journal["host_server_identity"]),
+            expected_hub_id=str(journal["hub_id"]),
+            expected_operation_id=None,
+            expected_reason="server-update",
+            verify_only=True,
+            require_fence=False,
+            allow_rebase_snapshot=True,
+        )
+        after = path.lstat()
+        if (
+            after.st_dev != before.st_dev
+            or after.st_ino != before.st_ino
+            or not hmac.compare_digest(
+                cls._sha256_private_regular_file(path / "manifest.json"),
+                expected_digest,
+            )
+        ):
+            raise RuntimeError(
+                "Team Hub snapshot rebase generation changed during verification"
+            )
+        return before.st_dev, before.st_ino
+
+    @classmethod
+    def _recover_snapshot_rebase_unlocked(cls, root: Path) -> None:
+        journal_path = root / SNAPSHOT_REBASE_JOURNAL_NAME
+        try:
+            raw = cls._read_private_regular_file(
+                journal_path,
+                maximum_bytes=16 * 1024,
+            )
+        except FileNotFoundError:
+            return
+        try:
+            journal = json.loads(raw)
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise RuntimeError("Team Hub snapshot rebase journal is invalid") from exc
+        expected_keys = {
+            "format",
+            "hub_id",
+            "host_server_identity",
+            "operation_id",
+            "target",
+            "target_manifest_sha256",
+            "replacement",
+            "replacement_manifest_sha256",
+            "retired",
+        }
+        if (
+            not isinstance(journal, dict)
+            or set(journal) != expected_keys
+            or journal.get("format") != 1
+            or not isinstance(journal.get("target"), str)
+            or re.fullmatch(r"snapshot_[A-Za-z0-9_]+", journal["target"])
+            is None
+            or not isinstance(journal.get("replacement"), str)
+            or re.fullmatch(
+                r"snapshot_[A-Za-z0-9_]+", journal["replacement"]
+            )
+            is None
+            or journal["replacement"] == journal["target"]
+            or not isinstance(journal.get("target_manifest_sha256"), str)
+            or re.fullmatch(
+                r"[0-9a-f]{64}", journal["target_manifest_sha256"]
+            )
+            is None
+            or not isinstance(
+                journal.get("replacement_manifest_sha256"), str
+            )
+            or re.fullmatch(
+                r"[0-9a-f]{64}", journal["replacement_manifest_sha256"]
+            )
+            is None
+            or not isinstance(journal.get("retired"), str)
+            or SNAPSHOT_REBASE_RETIRED_RE.fullmatch(journal["retired"])
+            is None
+        ):
+            raise RuntimeError("Team Hub snapshot rebase journal is invalid")
+        backups = root / "maintenance-backups"
+        cls._validate_private_directory_without_mutation(backups)
+        target = backups / journal["target"]
+        replacement = backups / journal["replacement"]
+        retired = backups / journal["retired"]
+        marker = cls._maintenance_fence_control_unlocked(
+            root,
+            expected_hub_id=str(journal.get("hub_id") or ""),
+            expected_host_identity=str(journal.get("host_server_identity") or ""),
+            expected_reason="server-update",
+            expected_operation_id=str(journal.get("operation_id") or ""),
+            expected_snapshot=target,
+            verify_snapshot_digest=False,
+        )
+        if marker is None:
+            raise RuntimeError("Team Hub snapshot rebase fence is missing")
+
+        def bind_selected_generation(digest: str) -> None:
+            updated_marker = dict(marker)
+            updated_marker["snapshot_manifest_sha256"] = digest
+            cls._replace_private_control_file_unlocked(
+                root / "maintenance-fence.json",
+                canonical_json(updated_marker) + b"\n",
+            )
+
+        selected_digest: str | None = None
+        target_exists = target.exists() and not target.is_symlink()
+        replacement_exists = replacement.exists() and not replacement.is_symlink()
+        retired_exists = retired.exists() and not retired.is_symlink()
+        if target_exists and replacement_exists and not retired_exists:
+            # Journal committed before the first rename: the old target is
+            # still authoritative. Verify it before consuming the journal;
+            # the uncommitted replacement can then be discarded.
+            cls._verify_snapshot_rebase_generation_unlocked(
+                root,
+                target,
+                journal=journal,
+                manifest_digest_key="target_manifest_sha256",
+            )
+            cls._remove_snapshot_generation_unlocked(replacement)
+            selected_digest = str(journal["target_manifest_sha256"])
+        elif not target_exists and replacement_exists and retired_exists:
+            # The old target was retired. Both generations must still match
+            # the journal before a corrupt replacement can consume the only
+            # known-good rollback image.
+            cls._verify_snapshot_rebase_generation_unlocked(
+                root,
+                retired,
+                journal=journal,
+                manifest_digest_key="target_manifest_sha256",
+            )
+            try:
+                cls._verify_snapshot_rebase_generation_unlocked(
+                    root,
+                    replacement,
+                    journal=journal,
+                    manifest_digest_key="replacement_manifest_sha256",
+                )
+            except BaseException:
+                cls._remove_snapshot_generation_unlocked(replacement)
+                cls._fsync_directory(backups)
+                os.replace(retired, target)
+                cls._fsync_directory(backups)
+                bind_selected_generation(
+                    str(journal["target_manifest_sha256"])
+                )
+                journal_path.unlink()
+                cls._fsync_directory(root)
+                raise
+            else:
+                os.replace(replacement, target)
+                cls._fsync_directory(backups)
+                selected_digest = str(
+                    journal["replacement_manifest_sha256"]
+                )
+        elif target_exists and not replacement_exists and retired_exists:
+            # Replacement is already published under the stable name. Keep
+            # the retired generation until both sides have been verified.
+            cls._verify_snapshot_rebase_generation_unlocked(
+                root,
+                retired,
+                journal=journal,
+                manifest_digest_key="target_manifest_sha256",
+            )
+            try:
+                cls._verify_snapshot_rebase_generation_unlocked(
+                    root,
+                    target,
+                    journal=journal,
+                    manifest_digest_key="replacement_manifest_sha256",
+                )
+            except BaseException:
+                cls._remove_snapshot_generation_unlocked(target)
+                cls._fsync_directory(backups)
+                os.replace(retired, target)
+                cls._fsync_directory(backups)
+                bind_selected_generation(
+                    str(journal["target_manifest_sha256"])
+                )
+                journal_path.unlink()
+                cls._fsync_directory(root)
+                raise
+            else:
+                selected_digest = str(
+                    journal["replacement_manifest_sha256"]
+                )
+        elif not target_exists and not replacement_exists and retired_exists:
+            # No new generation survived, so put the verified old target back.
+            cls._verify_snapshot_rebase_generation_unlocked(
+                root,
+                retired,
+                journal=journal,
+                manifest_digest_key="target_manifest_sha256",
+            )
+            os.replace(retired, target)
+            cls._fsync_directory(backups)
+            retired_exists = False
+            selected_digest = str(journal["target_manifest_sha256"])
+        elif target_exists and not replacement_exists and not retired_exists:
+            # Recovery may itself have crashed after restoring the old target
+            # but before consuming the journal. Only the journal-bound old
+            # generation makes this state replayable.
+            cls._verify_snapshot_rebase_generation_unlocked(
+                root,
+                target,
+                journal=journal,
+                manifest_digest_key="target_manifest_sha256",
+            )
+            selected_digest = str(journal["target_manifest_sha256"])
+        else:
+            raise RuntimeError("Team Hub snapshot rebase state is invalid")
+        if selected_digest is None:
+            raise RuntimeError("Team Hub snapshot rebase selection is invalid")
+        bind_selected_generation(selected_digest)
+        cls._verify_snapshot_rebase_generation_unlocked(
+            root,
+            target,
+            journal=journal,
+            manifest_digest_key=(
+                "replacement_manifest_sha256"
+                if hmac.compare_digest(
+                    selected_digest,
+                    str(journal["replacement_manifest_sha256"]),
+                )
+                else "target_manifest_sha256"
+            ),
+        )
+        journal_path.unlink()
+        cls._fsync_directory(root)
+        if retired_exists and retired.exists() and not retired.is_symlink():
+            cls._remove_snapshot_generation_unlocked(retired)
+            cls._fsync_directory(backups)
+
+    @classmethod
+    def _cleanup_orphaned_snapshot_rebase_retired_unlocked(
+        cls,
+        root: Path,
+    ) -> None:
+        if cls._snapshot_rebase_pending(root):
+            return
+        backups = root / "maintenance-backups"
+        try:
+            entries = list(os.scandir(backups))
+        except FileNotFoundError:
+            return
+        retired = [
+            backups / entry.name
+            for entry in entries
+            if SNAPSHOT_REBASE_RETIRED_RE.fullmatch(entry.name) is not None
+        ]
+        for path in retired:
+            cls._validate_private_directory_without_mutation(path)
+        for path in retired:
+            cls._remove_snapshot_generation_unlocked(path)
+        if retired:
+            cls._fsync_directory(backups)
+
+    @staticmethod
+    def _maintenance_fence_payload_valid(value: Any) -> bool:
+        base_keys = {
+            "format",
+            "reason",
+            "operation_id",
+            "hub_id",
+            "host_server_identity",
+            "snapshot",
+            "created_at",
+        }
+        if not isinstance(value, dict):
+            return False
+        digest_keys = {"snapshot_manifest_sha256"}
+        if value.get("format") == 1:
+            expected_keys = (
+                base_keys | digest_keys
+                if "snapshot_manifest_sha256" in value
+                else base_keys
+            )
+        elif value.get("format") == 2:
+            expected_keys = base_keys | {"restore_transaction"}
+            if "snapshot_manifest_sha256" in value:
+                expected_keys |= digest_keys
+            if (
+                value.get("restore_transaction") != "host-reactivation"
+                or value.get("reason") != "host-reactivation"
+                or not isinstance(value.get("operation_id"), str)
+                or re.fullmatch(
+                    r"host-reactivation-[0-9a-f]{24}",
+                    value["operation_id"],
+                )
+                is None
+            ):
+                return False
+        else:
+            return False
+        return (
+            set(value) == expected_keys
+            and isinstance(value.get("hub_id"), str)
+            and re.fullmatch(r"[A-Za-z0-9_.:-]{8,240}", value["hub_id"])
+            is not None
+            and isinstance(value.get("host_server_identity"), str)
+            and re.fullmatch(
+                r"[A-Za-z0-9][A-Za-z0-9._:@/-]{7,239}",
+                value["host_server_identity"],
+            )
+            is not None
+            and isinstance(value.get("reason"), str)
+            and 1 <= len(value["reason"]) <= 80
+            and isinstance(value.get("operation_id"), str)
+            and re.fullmatch(
+                r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}",
+                value["operation_id"],
+            )
+            is not None
+            and isinstance(value.get("snapshot"), str)
+            and re.fullmatch(r"snapshot_[A-Za-z0-9_]+", value["snapshot"])
+            is not None
+            and isinstance(value.get("created_at"), str)
+            and (
+                "snapshot_manifest_sha256" not in value
+                or (
+                    isinstance(value["snapshot_manifest_sha256"], str)
+                    and re.fullmatch(
+                        r"[0-9a-f]{64}",
+                        value["snapshot_manifest_sha256"],
+                    )
+                    is not None
+                )
+            )
+        )
+
+    @classmethod
+    def _clear_orphaned_host_reactivation_restore_fence_unlocked(
+        cls,
+        root: Path,
+    ) -> None:
+        """Clear only the private restore fence whose owner no longer exists.
+
+        Format 2 is emitted solely by ``restore_host_reactivation_snapshot``.
+        Holding both control leases proves no live restore owns it, while an
+        absent journal/staging generation proves no multi-file transition has
+        begun. Ordinary update/shutdown fences remain untouched.
+        """
+
+        if cls._restore_transaction_pending(root):
+            return
+        try:
+            with os.scandir(root) as entries:
+                if any(
+                    RESTORE_STAGING_NAME_RE.fullmatch(entry.name) is not None
+                    for entry in entries
+                ):
+                    return
+        except FileNotFoundError:
+            return
+        marker_path = root / "maintenance-fence.json"
+        try:
+            raw = cls._read_private_regular_file(
+                marker_path,
+                maximum_bytes=16 * 1024,
+            )
+        except FileNotFoundError:
+            return
+        try:
+            marker = json.loads(raw)
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise RuntimeError("Team Hub maintenance fence is invalid") from exc
+        if not isinstance(marker, dict) or marker.get("format") != 2:
+            return
+        if not cls._maintenance_fence_payload_valid(marker):
+            raise RuntimeError("Team Hub maintenance fence is invalid")
+        marker_path.unlink()
+        cls._fsync_directory(root)
 
     @classmethod
     def _cleanup_abandoned_restore_staging_unlocked(
@@ -697,6 +2001,42 @@ class HubStore:
         for candidate in sorted(candidates, key=lambda path: path.name):
             shutil.rmtree(candidate)
             cls._fsync_directory(root)
+
+    @classmethod
+    def _cleanup_abandoned_snapshot_staging_unlocked(cls, backups: Path) -> None:
+        """Remove validated snapshot temporaries left by a killed process.
+
+        The caller owns both the maintenance-control and attachment leases, so
+        no matching temporary can still belong to a live snapshot writer.
+        Validate every candidate before deleting any to fail closed on unsafe
+        lookalikes.
+        """
+
+        candidates: list[Path] = []
+        with os.scandir(backups) as entries:
+            for entry in entries:
+                if SNAPSHOT_STAGING_NAME_RE.fullmatch(entry.name) is not None:
+                    candidates.append(backups / entry.name)
+
+        for candidate in candidates:
+            if not cls._restore_target_exists(candidate, "directory"):
+                continue  # pragma: no cover - scandir observed the entry.
+            for directory, directory_names, file_names in os.walk(
+                candidate,
+                topdown=True,
+                followlinks=False,
+            ):
+                current = Path(directory)
+                cls._restore_target_exists(current, "directory")
+                for name in directory_names:
+                    cls._restore_target_exists(current / name, "directory")
+                for name in file_names:
+                    cls._restore_target_exists(current / name, "file")
+
+        for candidate in sorted(candidates, key=lambda path: path.name):
+            shutil.rmtree(candidate)
+        if candidates:
+            cls._fsync_directory(backups)
 
     @staticmethod
     def _restore_target_kind(name: str) -> str:
@@ -823,6 +2163,118 @@ class HubStore:
         return raw
 
     @classmethod
+    def _restore_completion_receipt_value(
+        cls,
+        raw: Any,
+    ) -> dict[str, Any]:
+        if (
+            not isinstance(raw, dict)
+            or set(raw)
+            != {
+                "format",
+                "state",
+                "reason",
+                "hub_id",
+                "host_server_identity",
+                "operation_id",
+                "snapshot",
+                "snapshot_manifest_sha256",
+                "generation",
+            }
+            or raw.get("format") != 1
+            or raw.get("state") not in {"prepared", "committed"}
+            or raw.get("reason") not in {"server-update", "host-reactivation"}
+            or not isinstance(raw.get("hub_id"), str)
+            or re.fullmatch(r"[A-Za-z0-9_.:-]{8,240}", raw["hub_id"]) is None
+            or not isinstance(raw.get("host_server_identity"), str)
+            or re.fullmatch(
+                r"[A-Za-z0-9][A-Za-z0-9._:@/-]{7,239}",
+                raw["host_server_identity"],
+            )
+            is None
+            or not isinstance(raw.get("operation_id"), str)
+            or re.fullmatch(
+                r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}", raw["operation_id"]
+            )
+            is None
+            or not isinstance(raw.get("snapshot"), str)
+            or re.fullmatch(r"snapshot_[A-Za-z0-9_]+", raw["snapshot"]) is None
+            or not isinstance(raw.get("snapshot_manifest_sha256"), str)
+            or re.fullmatch(r"[0-9a-f]{64}", raw["snapshot_manifest_sha256"])
+            is None
+        ):
+            raise RuntimeError("Team Hub restore completion receipt is invalid")
+        generation = raw.get("generation")
+        proof_items = generation.get("proofs") if isinstance(generation, dict) else None
+        if not isinstance(proof_items, list) or any(
+            not isinstance(item, dict)
+            or not isinstance(item.get("name"), str)
+            or (
+                item["name"] != "bootstrap-owner.proof"
+                and re.fullmatch(r"[A-Za-z0-9_]{8,240}\.proof", item["name"])
+                is None
+            )
+            for item in proof_items
+        ):
+            raise RuntimeError("Team Hub restore completion receipt is invalid")
+        proof_names = {
+            str(item.get("name"))
+            for item in proof_items
+            if isinstance(item, dict) and isinstance(item.get("name"), str)
+        }
+        new_targets = {
+            "team-hub.sqlite3": "file",
+            "access-token-signing.key": "file",
+            "attachments": "directory",
+            **{name: "file" for name in proof_names},
+        }
+        try:
+            cls._restore_transaction_generation(generation, new_targets)
+        except RuntimeError as exc:
+            raise RuntimeError("Team Hub restore completion receipt is invalid") from exc
+        return raw
+
+    @classmethod
+    def _read_restore_completion_receipt_unlocked(
+        cls,
+        root: Path,
+    ) -> dict[str, Any] | None:
+        try:
+            raw = cls._read_private_regular_file(
+                root / RESTORE_COMPLETION_RECEIPT_NAME,
+                maximum_bytes=512 * 1024,
+            )
+        except FileNotFoundError:
+            return None
+        try:
+            value = json.loads(raw)
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise RuntimeError("Team Hub restore completion receipt is invalid") from exc
+        return cls._restore_completion_receipt_value(value)
+
+    @classmethod
+    def _write_restore_completion_receipt_unlocked(
+        cls,
+        root: Path,
+        receipt: dict[str, Any],
+    ) -> None:
+        validated = cls._restore_completion_receipt_value(receipt)
+        existing = cls._read_restore_completion_receipt_unlocked(root)
+        if existing is not None:
+            existing_identity = dict(existing)
+            new_identity = dict(validated)
+            existing_identity.pop("state", None)
+            new_identity.pop("state", None)
+            if existing_identity != new_identity:
+                raise RuntimeError("another Team Hub restore receipt is pending")
+            if existing["state"] == "committed" and validated["state"] == "prepared":
+                raise RuntimeError("the Team Hub restore is already committed")
+        cls._replace_private_control_file_unlocked(
+            root / RESTORE_COMPLETION_RECEIPT_NAME,
+            canonical_json(validated) + b"\n",
+        )
+
+    @classmethod
     def _read_restore_transaction_journal(
         cls,
         root: Path,
@@ -940,6 +2392,14 @@ class HubStore:
         journal, staging, old_targets, new_targets = (
             cls._read_restore_transaction_journal(root)
         )
+        receipt = cls._read_restore_completion_receipt_unlocked(root)
+        expected_generation = cls._restore_transaction_generation(
+            journal["new_generation"], new_targets
+        )
+        if receipt is None or receipt["generation"] != expected_generation:
+            raise RuntimeError("Team Hub restore completion receipt is missing")
+        if journal["state"] == "committed" and receipt["state"] != "committed":
+            raise RuntimeError("Team Hub committed restore receipt is incomplete")
         staging_exists = cls._restore_target_exists(staging, "directory")
         if journal["state"] == "prepared":
             previous = staging / "previous"
@@ -1053,6 +2513,231 @@ class HubStore:
         journal_path = root / RESTORE_TRANSACTION_JOURNAL_NAME
         journal_path.unlink()
         cls._fsync_directory(root)
+        if journal["state"] == "prepared":
+            # A prepared receipt is itself a fail-closed retry token. Retire
+            # the journal first: a crash can then leave that receipt for the
+            # next exact restore to adopt, whereas journal-without-receipt is
+            # not safely distinguishable from a corrupted transaction.
+            (root / RESTORE_COMPLETION_RECEIPT_NAME).unlink()
+            cls._fsync_directory(root)
+
+    @classmethod
+    def _verify_restore_receipt_generation_unlocked(
+        cls,
+        root: Path,
+        generation: dict[str, Any],
+    ) -> None:
+        for name in (
+            "maintenance-fence.json",
+            "team-hub.sqlite3-wal",
+            "team-hub.sqlite3-shm",
+        ):
+            try:
+                (root / name).lstat()
+            except FileNotFoundError:
+                continue
+            raise RuntimeError("Team Hub restored generation is not quiescent")
+        if not hmac.compare_digest(
+            cls._sha256_private_regular_file(root / "team-hub.sqlite3"),
+            generation["database_sha256"],
+        ) or not hmac.compare_digest(
+            cls._sha256_private_regular_file(root / "access-token-signing.key"),
+            generation["signing_key_sha256"],
+        ):
+            raise RuntimeError("Team Hub restored generation changed")
+        expected_proofs = {
+            str(entry["name"]): str(entry["sha256"])
+            for entry in generation["proofs"]
+        }
+        actual_proofs = {
+            entry.name
+            for entry in os.scandir(root)
+            if entry.name == "bootstrap-owner.proof"
+            or re.fullmatch(r"[A-Za-z0-9_]{8,240}\.proof", entry.name) is not None
+        }
+        if actual_proofs != expected_proofs.keys():
+            raise RuntimeError("Team Hub restored proof generation changed")
+        for name, digest in expected_proofs.items():
+            if not hmac.compare_digest(
+                cls._sha256_private_regular_file(root / name), digest
+            ):
+                raise RuntimeError("Team Hub restored proof generation changed")
+        connection = sqlite3.connect(
+            f"file:{root / 'team-hub.sqlite3'}?mode=ro&immutable=1",
+            uri=True,
+            isolation_level=None,
+        )
+        connection.row_factory = sqlite3.Row
+        try:
+            attachment_files = cls._team_attachment_snapshot_files(connection)
+        finally:
+            connection.close()
+        if cls._attachment_generation_summary(
+            root / "attachments",
+            attachment_files,
+            exact_tree=True,
+            require_root=True,
+        ) != generation["attachments"]:
+            raise RuntimeError("Team Hub restored attachment generation changed")
+
+    @classmethod
+    def _matching_restore_receipt_unlocked(
+        cls,
+        root: Path,
+        snapshot: Path,
+        *,
+        expected_host_identity: str,
+        expected_hub_id: str,
+        expected_operation_id: str,
+        expected_reason: str,
+    ) -> dict[str, Any]:
+        receipt = cls._read_restore_completion_receipt_unlocked(root)
+        if receipt is None or receipt["state"] != "committed":
+            raise RuntimeError("Team Hub restore completion receipt is missing")
+        manifest_digest = cls._sha256_private_regular_file(
+            snapshot / "manifest.json"
+        )
+        if (
+            receipt["reason"] != expected_reason
+            or receipt["hub_id"] != expected_hub_id
+            or receipt["host_server_identity"] != expected_host_identity
+            or receipt["operation_id"] != expected_operation_id
+            or receipt["snapshot"] != snapshot.name
+            or not hmac.compare_digest(
+                receipt["snapshot_manifest_sha256"], manifest_digest
+            )
+        ):
+            raise RuntimeError("Team Hub restore completion receipt does not match")
+        return receipt
+
+    @classmethod
+    def confirm_restored_maintenance_snapshot(
+        cls,
+        data_dir: Path,
+        snapshot_dir: Path,
+        *,
+        expected_host_identity: str,
+        expected_hub_id: str,
+        expected_operation_id: str,
+        expected_reason: str = "server-update",
+    ) -> None:
+        """Prove an exact prior restore whose fence was already consumed."""
+
+        root = Path(os.path.abspath(os.path.expanduser(os.fspath(data_dir))))
+        snapshot = Path(
+            os.path.abspath(os.path.expanduser(os.fspath(snapshot_dir)))
+        )
+        identity = _identity(expected_host_identity)
+        hub_id = _identity(expected_hub_id)
+        operation_id = _maintenance_operation_id(expected_operation_id)
+        lease = cls.acquire_managed_runtime_lease(root)
+        try:
+            with cls.maintenance_control_lock(root):
+                attachment_lease = cls.acquire_attachment_control_lease(root)
+                try:
+                    receipt = cls._matching_restore_receipt_unlocked(
+                        root,
+                        snapshot,
+                        expected_host_identity=identity,
+                        expected_hub_id=hub_id,
+                        expected_operation_id=operation_id,
+                        expected_reason=expected_reason,
+                    )
+                    cls._restore_maintenance_snapshot_unlocked(
+                        root,
+                        snapshot,
+                        expected_host_identity=identity,
+                        expected_hub_id=hub_id,
+                        expected_operation_id=None,
+                        expected_reason=expected_reason,
+                        verify_only=True,
+                        require_fence=False,
+                    )
+                    cls._verify_restore_receipt_generation_unlocked(
+                        root, receipt["generation"]
+                    )
+                    if expected_reason == "host-reactivation":
+                        handoff = cls._read_host_reactivation_handoff_unlocked(root)
+                        if handoff is not None:
+                            if (
+                                handoff.get("state") != "adopted"
+                                or handoff.get("hub_id") != hub_id
+                                or handoff.get("host_server_identity") != identity
+                                or handoff.get("operation_id") != operation_id
+                                or handoff.get("snapshot") != snapshot.name
+                            ):
+                                raise RuntimeError(
+                                    "Team Hub reactivation handoff does not match"
+                                )
+                            (root / HOST_REACTIVATION_HANDOFF_NAME).unlink()
+                            cls._fsync_directory(root)
+                finally:
+                    cls.release_attachment_control_lease(attachment_lease)
+        finally:
+            cls.release_managed_runtime_lease(lease)
+
+    @classmethod
+    def acknowledge_restored_maintenance_snapshot(
+        cls,
+        data_dir: Path,
+        snapshot_dir: Path,
+        *,
+        expected_host_identity: str,
+        expected_hub_id: str,
+        expected_operation_id: str,
+        expected_reason: str = "server-update",
+        allow_missing: bool = False,
+    ) -> None:
+        """Retire a receipt after the outer activation journal is rolled back."""
+
+        root = Path(os.path.abspath(os.path.expanduser(os.fspath(data_dir))))
+        snapshot = Path(
+            os.path.abspath(os.path.expanduser(os.fspath(snapshot_dir)))
+        )
+        identity = _identity(expected_host_identity)
+        hub_id = _identity(expected_hub_id)
+        operation_id = _maintenance_operation_id(expected_operation_id)
+        lease = cls.acquire_managed_runtime_lease(root)
+        try:
+            with cls.maintenance_control_lock(root):
+                attachment_lease = cls.acquire_attachment_control_lease(root)
+                try:
+                    try:
+                        receipt = cls._matching_restore_receipt_unlocked(
+                            root,
+                            snapshot,
+                            expected_host_identity=identity,
+                            expected_hub_id=hub_id,
+                            expected_operation_id=operation_id,
+                            expected_reason=expected_reason,
+                        )
+                    except RuntimeError:
+                        if (
+                            allow_missing
+                            and cls._read_restore_completion_receipt_unlocked(root)
+                            is None
+                        ):
+                            # Retry after an unlink whose caller did not
+                            # observe the final directory fsync.  Re-fsync the
+                            # namespace before acknowledging idempotent
+                            # completion.
+                            cls._fsync_directory(root)
+                            return
+                        raise
+                    # The installer records its exact link/config rollback
+                    # before acknowledgement and cannot start the old service
+                    # while this receipt exists.  Revalidate the complete
+                    # restored generation under both lifecycle leases before
+                    # consuming the last startup blocker.
+                    cls._verify_restore_receipt_generation_unlocked(
+                        root, receipt["generation"]
+                    )
+                    (root / RESTORE_COMPLETION_RECEIPT_NAME).unlink()
+                    cls._fsync_directory(root)
+                finally:
+                    cls.release_attachment_control_lease(attachment_lease)
+        finally:
+            cls.release_managed_runtime_lease(lease)
 
     @classmethod
     def _team_attachment_snapshot_files(
@@ -1185,7 +2870,10 @@ class HubStore:
                 info = path.lstat()
                 if not stat.S_ISREG(info.st_mode) or int(info.st_size) != item.byte_size:
                     raise RuntimeError("Team Hub snapshot attachment file size is invalid")
-                file_digest = cls._sha256_private_regular_file(path)
+                file_digest = cls._sha256_private_regular_file(
+                    path,
+                    allow_hardlinks=item.content_sha256 is not None,
+                )
                 if item.content_sha256 is not None and not hmac.compare_digest(
                     file_digest, item.content_sha256
                 ):
@@ -1228,7 +2916,12 @@ class HubStore:
                 source_parent = source_parent.parent
             destination = destination_root.joinpath(*item.relative_path.split("/"))
             ensure_private_directory(destination.parent)
-            cls._copy_private_regular_file(source, destination)
+            if item.content_sha256 is not None:
+                cls._link_or_copy_immutable_private_file(source, destination)
+            else:
+                # Resumable uploads are mutable and must remain an independent
+                # generation even when source and destination share a device.
+                cls._copy_private_regular_file(source, destination)
         summary = cls._attachment_generation_summary(
             destination_root,
             files,
@@ -1478,6 +3171,613 @@ class HubStore:
         with self.maintenance_control_lock(self.data_dir):
             return self._maintenance_snapshot_unlocked(reason, keep=keep)
 
+    @classmethod
+    def prepare_managed_host_reactivation(
+        cls,
+        data_dir: Path,
+        *,
+        expected_host_identity: str,
+    ) -> tuple[str, Path, str, int, int]:
+        """Verify and snapshot one exact preserved host before reactivation.
+
+        The candidate runtime may contain newer migrations than the disabled
+        host. Open the source read-only and use SQLite's online backup instead
+        of constructing HubStore normally, so the rollback generation always
+        captures the exact pre-reactivation schema.
+        """
+
+        root = Path(os.path.abspath(os.path.expanduser(os.fspath(data_dir))))
+        identity = _identity(expected_host_identity)
+        lease = cls.acquire_managed_runtime_lease(root)
+        try:
+            bound_identity = cls.managed_host_binding_without_source_mutation(root)
+            if bound_identity is None:
+                raise RuntimeError(
+                    "preserved Team Hub state has no managed host binding"
+                )
+            if not hmac.compare_digest(bound_identity, identity):
+                raise RuntimeError(
+                    "preserved Team Hub state is bound to a different AgentsServer host"
+                )
+            probe = object.__new__(cls)
+            probe.data_dir = root
+            probe.database_path = root / "team-hub.sqlite3"
+            probe.signing_key_path = root / "access-token-signing.key"
+            probe.bootstrap_proof_path = root / "bootstrap-owner.proof"
+            probe.maintenance_fence_path = root / "maintenance-fence.json"
+            probe.managed_host_identity = identity
+            probe.hub_id = ""
+            operation_id = f"host-reactivation-{secrets.token_hex(12)}"
+
+            def connect_read_only() -> sqlite3.Connection:
+                connection = sqlite3.connect(
+                    f"{probe.database_path.as_uri()}?mode=ro",
+                    uri=True,
+                    isolation_level=None,
+                )
+                connection.row_factory = sqlite3.Row
+                return connection
+
+            probe.connect = connect_read_only
+            with cls.maintenance_control_lock(root):
+                resumable = cls._recover_host_reactivation_handoff_unlocked(root)
+                if resumable is not None:
+                    snapshot = (
+                        root
+                        / "maintenance-backups"
+                        / str(resumable["snapshot"])
+                    )
+                    attachment_lease = cls.acquire_attachment_control_lease(root)
+                    try:
+                        cls._restore_maintenance_snapshot_unlocked(
+                            root,
+                            snapshot,
+                            expected_host_identity=identity,
+                            expected_hub_id=str(resumable["hub_id"]),
+                            expected_operation_id=str(resumable["operation_id"]),
+                            expected_reason="host-reactivation",
+                            verify_only=True,
+                        )
+                    finally:
+                        cls.release_attachment_control_lease(attachment_lease)
+                    return (
+                        str(resumable["hub_id"]),
+                        snapshot,
+                        str(resumable["operation_id"]),
+                        int(resumable["fence_device"]),
+                        int(resumable["fence_inode"]),
+                    )
+                if probe.maintenance_fence() is not None:
+                    raise RuntimeError(
+                        "preserved Team Hub state is already in managed maintenance"
+                    )
+                snapshot = probe._maintenance_snapshot_unlocked(
+                    "host-reactivation",
+                    source_read_only=True,
+                    allow_legacy_schema=True,
+                    derive_hub_id=True,
+                    verify_host_reactivation_before_publish=True,
+                )
+                # Commit a durable source-generation fence before releasing
+                # either the snapshot/control lock or the runtime lease. The
+                # installer carries this exact operation identity through
+                # candidate health or rollback, so no HTTP or supported local
+                # control mutation can become newer than the rollback image.
+                marker = {
+                    "format": 1,
+                    "reason": "host-reactivation",
+                    "operation_id": operation_id,
+                    "hub_id": probe.hub_id,
+                    "host_server_identity": identity,
+                    "snapshot": snapshot.name,
+                    "snapshot_manifest_sha256": cls._sha256_private_regular_file(
+                        snapshot / "manifest.json"
+                    ),
+                    "created_at": _iso8601(_now()),
+                }
+                marker_bytes = canonical_json(marker) + b"\n"
+                fence_staging = (
+                    root / f".maintenance-fence-{operation_id}.pending"
+                )
+                created_fence_info = cls._create_owned_maintenance_fence(
+                    fence_staging,
+                    marker_bytes,
+                )
+                handoff = {
+                    "format": 2,
+                    "state": "creating",
+                    "hub_id": probe.hub_id,
+                    "host_server_identity": identity,
+                    "operation_id": operation_id,
+                    "snapshot": snapshot.name,
+                    "fence_device": created_fence_info.st_dev,
+                    "fence_inode": created_fence_info.st_ino,
+                    "fence_staging": fence_staging.name,
+                }
+                handoff_path = root / HOST_REACTIVATION_HANDOFF_NAME
+                handoff_bytes = canonical_json(handoff) + b"\n"
+                try:
+                    cls._create_owned_maintenance_fence(
+                        handoff_path,
+                        handoff_bytes,
+                    )
+                    os.link(
+                        fence_staging,
+                        probe.maintenance_fence_path,
+                        follow_symlinks=False,
+                    )
+                    linked_info = probe.maintenance_fence_path.lstat()
+                    if (
+                        linked_info.st_dev != created_fence_info.st_dev
+                        or linked_info.st_ino != created_fence_info.st_ino
+                    ):
+                        raise RuntimeError(
+                            "Team Hub reactivation source fence changed"
+                        )
+                    fence_staging.unlink()
+                    cls._fsync_directory(root)
+                    if cls._maintenance_fence_control_unlocked(
+                        root,
+                        expected_hub_id=probe.hub_id,
+                        expected_host_identity=identity,
+                        expected_reason="host-reactivation",
+                        expected_operation_id=operation_id,
+                        expected_snapshot=snapshot,
+                    ) is None:
+                        raise RuntimeError(
+                            "Team Hub reactivation source fence could not be verified"
+                        )
+                    handoff.update(
+                        {
+                            "state": "unclaimed",
+                        }
+                    )
+                    cls._replace_private_control_file_unlocked(
+                        handoff_path,
+                        canonical_json(handoff) + b"\n",
+                    )
+                except BaseException as fence_error:
+                    # No caller has received the operation identity yet.
+                    # Remove only paths that still name the exact staged
+                    # fence inode; replacements remain fail-closed.
+                    for candidate in (
+                        probe.maintenance_fence_path,
+                        fence_staging,
+                    ):
+                        try:
+                            current_info = candidate.lstat()
+                        except FileNotFoundError:
+                            continue
+                        if (
+                            current_info.st_dev != created_fence_info.st_dev
+                            or current_info.st_ino != created_fence_info.st_ino
+                        ):
+                            raise RuntimeError(
+                                "Team Hub reactivation source fence remains fail-closed"
+                            ) from fence_error
+                        candidate.unlink()
+                    try:
+                        current_handoff = cls._read_host_reactivation_handoff_unlocked(
+                            root
+                        )
+                    except FileNotFoundError:
+                        current_handoff = None
+                    if current_handoff is not None:
+                        if (
+                            current_handoff.get("operation_id") != operation_id
+                            or current_handoff.get("state")
+                            not in {"creating", "unclaimed"}
+                            or current_handoff.get("fence_device")
+                            != created_fence_info.st_dev
+                            or current_handoff.get("fence_inode")
+                            != created_fence_info.st_ino
+                        ):
+                            raise RuntimeError(
+                                "Team Hub reactivation handoff remains fail-closed"
+                            ) from fence_error
+                        handoff_path.unlink()
+                    cls._fsync_directory(root)
+                    raise fence_error
+            return (
+                probe.hub_id,
+                snapshot,
+                operation_id,
+                created_fence_info.st_dev,
+                created_fence_info.st_ino,
+            )
+        finally:
+            cls.release_managed_runtime_lease(lease)
+
+    @classmethod
+    def begin_managed_startup_guard(
+        cls,
+        data_dir: Path,
+        *,
+        expected_host_identity: str,
+    ) -> tuple[str, int, int]:
+        """Publish or resume the exact guard used while old code is unlinked."""
+
+        root = Path(os.path.abspath(os.path.expanduser(os.fspath(data_dir))))
+        identity = _identity(expected_host_identity)
+        bound_identity = cls.managed_host_binding_without_source_mutation(root)
+        if bound_identity is None or not hmac.compare_digest(
+            bound_identity,
+            identity,
+        ):
+            raise RuntimeError("Team Hub startup guard binding does not match")
+        with cls.maintenance_control_lock(root):
+            try:
+                existing = cls._read_managed_startup_guard_unlocked(root)
+            except FileNotFoundError:
+                existing = None
+            path = root / MANAGED_STARTUP_GUARD_NAME
+            if existing is not None:
+                if existing["host_server_identity"] != identity:
+                    raise RuntimeError("Team Hub startup guard does not match")
+                info = path.lstat()
+                return existing["guard_id"], info.st_dev, info.st_ino
+            guard_id = f"cold-handoff-{secrets.token_hex(12)}"
+            payload = canonical_json(
+                {
+                    "format": 1,
+                    "host_server_identity": identity,
+                    "guard_id": guard_id,
+                }
+            ) + b"\n"
+            info = cls._create_owned_maintenance_fence(path, payload)
+            return guard_id, info.st_dev, info.st_ino
+
+    @classmethod
+    def clear_managed_startup_guard(
+        cls,
+        data_dir: Path,
+        *,
+        expected_host_identity: str,
+        expected_guard_id: str,
+        expected_device: int,
+        expected_inode: int,
+    ) -> bool:
+        root = Path(os.path.abspath(os.path.expanduser(os.fspath(data_dir))))
+        identity = _identity(expected_host_identity)
+        with cls.maintenance_control_lock(root):
+            try:
+                guard = cls._read_managed_startup_guard_unlocked(root)
+            except FileNotFoundError:
+                return False
+            path = root / MANAGED_STARTUP_GUARD_NAME
+            info = path.lstat()
+            if (
+                guard.get("host_server_identity") != identity
+                or guard.get("guard_id") != expected_guard_id
+                or info.st_dev != expected_device
+                or info.st_ino != expected_inode
+            ):
+                raise RuntimeError("Team Hub startup guard does not match")
+            path.unlink()
+            try:
+                cls._fsync_directory(root)
+            except BaseException:
+                try:
+                    path.lstat()
+                except FileNotFoundError:
+                    return True
+                raise
+            return True
+
+    @classmethod
+    def publish_managed_startup_authority(
+        cls,
+        data_dir: Path,
+        *,
+        expected_host_identity: str,
+        expected_hub_id: str,
+        expected_reason: str,
+        expected_operation_id: str,
+        expected_snapshot: Path,
+    ) -> None:
+        root = Path(os.path.abspath(os.path.expanduser(os.fspath(data_dir))))
+        snapshot = Path(
+            os.path.abspath(os.path.expanduser(os.fspath(expected_snapshot)))
+        )
+        identity = _identity(expected_host_identity)
+        with cls.maintenance_control_lock(root):
+            marker = cls._maintenance_fence_control_unlocked(
+                root,
+                expected_hub_id=expected_hub_id,
+                expected_host_identity=identity,
+                expected_reason=expected_reason,
+                expected_operation_id=expected_operation_id,
+                expected_snapshot=snapshot,
+            )
+            if marker is None or not isinstance(
+                marker.get("snapshot_manifest_sha256"), str
+            ):
+                raise RuntimeError("Team Hub startup authority fence is missing")
+            if expected_reason == "host-reactivation":
+                cls._consume_host_reactivation_handoff_unlocked(
+                    root,
+                    expected_hub_id=expected_hub_id,
+                    expected_host_identity=identity,
+                    expected_operation_id=expected_operation_id,
+                    expected_snapshot=snapshot,
+                    remove=False,
+                )
+            payload = canonical_json(
+                {
+                    "format": 1,
+                    "reason": expected_reason,
+                    "hub_id": expected_hub_id,
+                    "host_server_identity": identity,
+                    "operation_id": expected_operation_id,
+                    "snapshot": snapshot.name,
+                    "snapshot_manifest_sha256": marker[
+                        "snapshot_manifest_sha256"
+                    ],
+                }
+            ) + b"\n"
+            path = root / MANAGED_STARTUP_AUTHORITY_NAME
+            try:
+                current = cls._read_private_regular_file(
+                    path,
+                    maximum_bytes=16 * 1024,
+                )
+            except FileNotFoundError:
+                cls._create_owned_maintenance_fence(path, payload)
+            else:
+                if hmac.compare_digest(current, payload):
+                    cls._fsync_directory(root)
+                else:
+                    # A no-fence crash residue is powerless. Once this exact
+                    # new fence has been authenticated, replace it atomically
+                    # rather than permanently wedging the next update.
+                    cls._replace_private_control_file_unlocked(path, payload)
+
+    @classmethod
+    def clear_managed_startup_authority(
+        cls,
+        data_dir: Path,
+        *,
+        expected_host_identity: str,
+        expected_hub_id: str,
+        expected_reason: str,
+        expected_operation_id: str,
+        expected_snapshot: Path,
+    ) -> bool:
+        root = Path(os.path.abspath(os.path.expanduser(os.fspath(data_dir))))
+        with cls.maintenance_control_lock(root):
+            try:
+                authority = cls._read_managed_startup_authority_unlocked(root)
+            except FileNotFoundError:
+                return False
+            if (
+                authority["host_server_identity"] != expected_host_identity
+                or authority["hub_id"] != expected_hub_id
+                or authority["reason"] != expected_reason
+                or authority["operation_id"] != expected_operation_id
+                or authority["snapshot"] != Path(expected_snapshot).name
+            ):
+                raise RuntimeError("Team Hub startup authority does not match")
+            path = root / MANAGED_STARTUP_AUTHORITY_NAME
+            path.unlink()
+            try:
+                cls._fsync_directory(root)
+            except BaseException:
+                try:
+                    path.lstat()
+                except FileNotFoundError:
+                    return True
+                raise
+            return True
+
+    @classmethod
+    def adopt_prepared_host_reactivation(
+        cls,
+        data_dir: Path,
+        *,
+        expected_host_identity: str,
+        expected_hub_id: str,
+        expected_operation_id: str,
+        expected_snapshot: Path,
+        expected_device: int,
+        expected_inode: int,
+    ) -> None:
+        """Atomically transfer an unclaimed preflight to its installer."""
+
+        root = Path(os.path.abspath(os.path.expanduser(os.fspath(data_dir))))
+        identity = _identity(expected_host_identity)
+        snapshot = Path(
+            os.path.abspath(os.path.expanduser(os.fspath(expected_snapshot)))
+        )
+        lease = cls.acquire_managed_runtime_lease(root)
+        try:
+            with cls.maintenance_control_lock(root):
+                handoff = cls._read_host_reactivation_handoff_unlocked(root)
+                if handoff is None:
+                    raise RuntimeError("Team Hub reactivation handoff is missing")
+                expected_fields = (
+                    handoff.get("hub_id") == expected_hub_id
+                    and handoff.get("host_server_identity") == identity
+                    and handoff.get("operation_id") == expected_operation_id
+                    and handoff.get("snapshot") == snapshot.name
+                    and handoff.get("fence_device") == expected_device
+                    and handoff.get("fence_inode") == expected_inode
+                )
+                if not expected_fields or handoff.get("state") not in {
+                    "unclaimed",
+                    "adopted",
+                }:
+                    raise RuntimeError(
+                        "Team Hub reactivation handoff does not match"
+                    )
+                marker = cls._maintenance_fence_control_unlocked(
+                    root,
+                    expected_hub_id=expected_hub_id,
+                    expected_host_identity=identity,
+                    expected_reason="host-reactivation",
+                    expected_operation_id=expected_operation_id,
+                    expected_snapshot=snapshot,
+                )
+                marker_info = (root / "maintenance-fence.json").lstat()
+                if (
+                    marker is None
+                    or marker_info.st_dev != expected_device
+                    or marker_info.st_ino != expected_inode
+                ):
+                    raise RuntimeError(
+                        "Team Hub reactivation fence ownership changed"
+                    )
+                attachment_lease = cls.acquire_attachment_control_lease(root)
+                try:
+                    cls._restore_maintenance_snapshot_unlocked(
+                        root,
+                        snapshot,
+                        expected_host_identity=identity,
+                        expected_hub_id=expected_hub_id,
+                        expected_operation_id=expected_operation_id,
+                        expected_reason="host-reactivation",
+                        verify_only=True,
+                    )
+                finally:
+                    cls.release_attachment_control_lease(attachment_lease)
+                marker_after = (root / "maintenance-fence.json").lstat()
+                if (
+                    marker_after.st_dev != expected_device
+                    or marker_after.st_ino != expected_inode
+                ):
+                    raise RuntimeError(
+                        "Team Hub reactivation fence ownership changed"
+                    )
+                current_handoff = cls._read_host_reactivation_handoff_unlocked(
+                    root
+                )
+                if current_handoff != handoff:
+                    raise RuntimeError(
+                        "Team Hub reactivation handoff changed during adoption"
+                    )
+                if handoff["state"] == "unclaimed":
+                    handoff["state"] = "adopted"
+                    cls._replace_private_control_file_unlocked(
+                        root / HOST_REACTIVATION_HANDOFF_NAME,
+                        canonical_json(handoff) + b"\n",
+                    )
+                else:
+                    # An earlier adoption may have committed its rename but
+                    # reported a directory-fsync failure. The idempotent
+                    # retry cannot claim success until durability is proven.
+                    cls._fsync_directory(root)
+        finally:
+            cls.release_managed_runtime_lease(lease)
+
+    @classmethod
+    def abort_prepared_host_reactivation(
+        cls,
+        data_dir: Path,
+        *,
+        expected_host_identity: str,
+        expected_hub_id: str,
+        expected_operation_id: str,
+        expected_snapshot: Path,
+        expected_device: int,
+        expected_inode: int,
+    ) -> bool:
+        """Clear a fully verified pre-takeover reactivation fence.
+
+        This recovery path exists for a shell that died after the CLI
+        committed the fence but before it adopted the returned operation.
+        The managed runtime lease and exact inode/content recheck ensure no
+        active candidate or replaced marker is consumed.
+        """
+
+        root = Path(os.path.abspath(os.path.expanduser(os.fspath(data_dir))))
+        identity = _identity(expected_host_identity)
+        lease = cls.acquire_managed_runtime_lease(root)
+        try:
+            with cls.maintenance_control_lock(root):
+                marker_path = root / "maintenance-fence.json"
+                try:
+                    before = marker_path.lstat()
+                    raw = cls._read_private_regular_file(
+                        marker_path,
+                        maximum_bytes=16 * 1024,
+                    )
+                except FileNotFoundError:
+                    return False
+                try:
+                    marker = json.loads(raw)
+                except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+                    raise RuntimeError("Team Hub maintenance fence is invalid") from exc
+                snapshot = Path(
+                    os.path.abspath(
+                        os.path.expanduser(os.fspath(expected_snapshot))
+                    )
+                )
+                cls._maintenance_fence_control_unlocked(
+                    root,
+                    expected_hub_id=expected_hub_id,
+                    expected_host_identity=identity,
+                    expected_reason="host-reactivation",
+                    expected_operation_id=expected_operation_id,
+                    expected_snapshot=snapshot,
+                )
+                if (
+                    marker.get("format") != 1
+                    or before.st_dev != expected_device
+                    or before.st_ino != expected_inode
+                ):
+                    raise RuntimeError(
+                        "Team Hub reactivation preflight fence does not match"
+                    )
+                attachment_lease = cls.acquire_attachment_control_lease(root)
+                try:
+                    cls._restore_maintenance_snapshot_unlocked(
+                        root,
+                        snapshot,
+                        expected_host_identity=identity,
+                        expected_hub_id=expected_hub_id,
+                        expected_operation_id=expected_operation_id,
+                        expected_reason="host-reactivation",
+                        verify_only=True,
+                    )
+                finally:
+                    cls.release_attachment_control_lease(attachment_lease)
+                after = marker_path.lstat()
+                current = cls._read_private_regular_file(
+                    marker_path,
+                    maximum_bytes=16 * 1024,
+                )
+                if (
+                    before.st_dev != after.st_dev
+                    or before.st_ino != after.st_ino
+                    or after.st_dev != expected_device
+                    or after.st_ino != expected_inode
+                    or not hmac.compare_digest(raw, current)
+                ):
+                    raise RuntimeError(
+                        "Team Hub reactivation preflight fence changed"
+                    )
+                cls._consume_host_reactivation_handoff_unlocked(
+                    root,
+                    expected_hub_id=expected_hub_id,
+                    expected_host_identity=identity,
+                    expected_operation_id=expected_operation_id,
+                    expected_snapshot=snapshot,
+                    remove=False,
+                    expected_state="unclaimed",
+                )
+                marker_path.unlink()
+                cls._consume_host_reactivation_handoff_unlocked(
+                    root,
+                    expected_hub_id=expected_hub_id,
+                    expected_host_identity=identity,
+                    expected_operation_id=expected_operation_id,
+                    expected_snapshot=snapshot,
+                    expected_state="unclaimed",
+                )
+                cls._fsync_directory(root)
+                return True
+        finally:
+            cls.release_managed_runtime_lease(lease)
+
     def maintenance_snapshot_and_fence(
         self,
         reason: str,
@@ -1492,19 +3792,44 @@ class HubStore:
             if self.maintenance_fence_path.exists():
                 raise RuntimeError("Team Hub maintenance is already active")
             snapshot = self._maintenance_snapshot_unlocked(reason, keep=keep)
+            clean_reason = _bounded_text(reason, "reason", 1, 80)
             marker = {
                 "format": 1,
-                "reason": _bounded_text(reason, "reason", 1, 80),
+                "reason": clean_reason,
                 "operation_id": clean_operation_id,
                 "hub_id": self.hub_id,
                 "host_server_identity": self.managed_host_identity,
                 "snapshot": snapshot.name,
+                "snapshot_manifest_sha256": self._sha256_private_regular_file(
+                    snapshot / "manifest.json"
+                ),
                 "created_at": _iso8601(_now()),
             }
-            create_secret_file(
-                self.maintenance_fence_path,
-                canonical_json(marker) + b"\n",
-            )
+            try:
+                create_secret_file(
+                    self.maintenance_fence_path,
+                    canonical_json(marker) + b"\n",
+                )
+            except BaseException:
+                # A directory fsync or final validation can report failure
+                # after the no-replace fence creation already committed.  An
+                # exact, fully verified marker is therefore success; making
+                # the caller guess would strand the snapshot identity needed
+                # to clear it safely.
+                if self._maintenance_fence_control_unlocked(
+                    self.data_dir,
+                    expected_hub_id=self.hub_id,
+                    expected_host_identity=str(self.managed_host_identity),
+                    expected_reason=clean_reason,
+                    expected_operation_id=clean_operation_id,
+                    expected_snapshot=snapshot,
+                ) is not None:
+                    # The reported failure may have been the first directory
+                    # fsync itself. Retry it before treating the exact marker
+                    # as the durable admission boundary.
+                    self._fsync_directory(self.data_dir)
+                    return snapshot
+                raise
             return snapshot
 
     def maintenance_fence(self) -> dict[str, Any] | None:
@@ -1519,31 +3844,10 @@ class HubStore:
             value = json.loads(raw)
         except (UnicodeDecodeError, json.JSONDecodeError) as exc:
             raise RuntimeError("Team Hub maintenance fence is invalid") from exc
-        expected = {
-            "format",
-            "reason",
-            "operation_id",
-            "hub_id",
-            "host_server_identity",
-            "snapshot",
-            "created_at",
-        }
         if (
-            not isinstance(value, dict)
-            or set(value) != expected
-            or value.get("format") != 1
+            not self._maintenance_fence_payload_valid(value)
             or value.get("hub_id") != self.hub_id
             or value.get("host_server_identity") != self.managed_host_identity
-            or not isinstance(value.get("reason"), str)
-            or not isinstance(value.get("operation_id"), str)
-            or re.fullmatch(
-                r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}",
-                value["operation_id"],
-            )
-            is None
-            or not isinstance(value.get("snapshot"), str)
-            or re.fullmatch(r"snapshot_[A-Za-z0-9_]+", value["snapshot"]) is None
-            or not isinstance(value.get("created_at"), str)
         ):
             raise RuntimeError("Team Hub maintenance fence is invalid")
         return value
@@ -1560,17 +3864,45 @@ class HubStore:
         clean_reason = _bounded_text(expected_reason, "reason", 1, 80)
         clean_operation_id = _maintenance_operation_id(expected_operation_id)
         with self.maintenance_control_lock(self.data_dir):
-            marker = self.maintenance_fence()
+            marker = self._maintenance_fence_control_unlocked(
+                self.data_dir,
+                expected_hub_id=self.hub_id,
+                expected_host_identity=str(self.managed_host_identity),
+                expected_reason=clean_reason,
+                expected_operation_id=clean_operation_id,
+                expected_snapshot=expected_snapshot,
+            )
             if marker is None:
                 return False
-            if marker["reason"] != clean_reason:
-                raise RuntimeError("Team Hub maintenance reason does not match")
-            if marker["operation_id"] != clean_operation_id:
-                raise RuntimeError("Team Hub maintenance operation does not match")
-            if marker["snapshot"] != Path(expected_snapshot).name:
-                raise RuntimeError("Team Hub maintenance snapshot does not match")
+            if clean_reason == "host-reactivation":
+                self._consume_host_reactivation_handoff_unlocked(
+                    self.data_dir,
+                    expected_hub_id=self.hub_id,
+                    expected_host_identity=str(self.managed_host_identity),
+                    expected_operation_id=clean_operation_id,
+                    expected_snapshot=expected_snapshot,
+                    remove=False,
+                )
             self.maintenance_fence_path.unlink()
-            self._fsync_directory(self.data_dir)
+            try:
+                if clean_reason == "host-reactivation":
+                    self._consume_host_reactivation_handoff_unlocked(
+                        self.data_dir,
+                        expected_hub_id=self.hub_id,
+                        expected_host_identity=str(self.managed_host_identity),
+                        expected_operation_id=clean_operation_id,
+                        expected_snapshot=expected_snapshot,
+                    )
+                self._fsync_directory(self.data_dir)
+            except BaseException:
+                try:
+                    self.maintenance_fence_path.lstat()
+                except FileNotFoundError:
+                    # The unlink is the irreversible admission commit. A
+                    # directory-fsync error is reported by storage but must
+                    # never send the installer down the rollback path.
+                    return True
+                raise
             return True
 
     @classmethod
@@ -1583,6 +3915,7 @@ class HubStore:
         expected_reason: str,
         expected_operation_id: str,
         expected_snapshot: Path,
+        verify_snapshot_digest: bool = True,
     ) -> dict[str, Any] | None:
         marker_path = root / "maintenance-fence.json"
         try:
@@ -1595,28 +3928,33 @@ class HubStore:
             marker = json.loads(raw)
         except (UnicodeDecodeError, json.JSONDecodeError) as exc:
             raise RuntimeError("Team Hub maintenance fence is invalid") from exc
-        expected_keys = {
-            "format",
-            "reason",
-            "operation_id",
-            "hub_id",
-            "host_server_identity",
-            "snapshot",
-            "created_at",
-        }
         if (
-            not isinstance(marker, dict)
-            or set(marker) != expected_keys
-            or marker.get("format") != 1
+            not cls._maintenance_fence_payload_valid(marker)
             or marker.get("hub_id") != expected_hub_id
             or marker.get("host_server_identity") != expected_host_identity
             or marker.get("reason") != expected_reason
-            or marker.get("operation_id") != _maintenance_operation_id(
-                expected_operation_id
-            )
-            or marker.get("snapshot") != Path(expected_snapshot).name
         ):
             raise RuntimeError("Team Hub maintenance fence does not match")
+        if marker.get("operation_id") != _maintenance_operation_id(
+            expected_operation_id
+        ):
+            raise RuntimeError("Team Hub maintenance operation does not match")
+        if marker.get("snapshot") != Path(expected_snapshot).name:
+            raise RuntimeError("Team Hub maintenance snapshot does not match")
+        expected_digest = marker.get("snapshot_manifest_sha256")
+        if verify_snapshot_digest and expected_digest is not None:
+            try:
+                actual_digest = cls._sha256_private_regular_file(
+                    Path(expected_snapshot) / "manifest.json"
+                )
+            except FileNotFoundError as exc:
+                raise RuntimeError(
+                    "Team Hub maintenance snapshot generation is missing"
+                ) from exc
+            if not hmac.compare_digest(expected_digest, actual_digest):
+                raise RuntimeError(
+                    "Team Hub maintenance snapshot generation changed"
+                )
         return marker
 
     @classmethod
@@ -1653,6 +3991,8 @@ class HubStore:
         expected_reason: str,
         expected_operation_id: str,
         expected_snapshot: Path,
+        expected_device: int | None = None,
+        expected_inode: int | None = None,
     ) -> bool:
         """Clear an exact fence without opening or migrating its database.
 
@@ -1673,11 +4013,57 @@ class HubStore:
             )
             if marker is None:
                 return False
+            marker_info = marker_path.lstat()
+            if (
+                (expected_device is None) != (expected_inode is None)
+                or (
+                    expected_device is not None
+                    and (
+                        marker_info.st_dev != expected_device
+                        or marker_info.st_ino != expected_inode
+                    )
+                )
+            ):
+                raise RuntimeError("Team Hub maintenance fence ownership changed")
+            if expected_reason == "host-reactivation":
+                cls._consume_host_reactivation_handoff_unlocked(
+                    root,
+                    expected_hub_id=expected_hub_id,
+                    expected_host_identity=expected_host_identity,
+                    expected_operation_id=expected_operation_id,
+                    expected_snapshot=expected_snapshot,
+                    remove=False,
+                )
             marker_path.unlink()
-            cls._fsync_directory(root)
+            try:
+                if expected_reason == "host-reactivation":
+                    cls._consume_host_reactivation_handoff_unlocked(
+                        root,
+                        expected_hub_id=expected_hub_id,
+                        expected_host_identity=expected_host_identity,
+                        expected_operation_id=expected_operation_id,
+                        expected_snapshot=expected_snapshot,
+                    )
+                cls._fsync_directory(root)
+            except BaseException:
+                try:
+                    marker_path.lstat()
+                except FileNotFoundError:
+                    return True
+                raise
             return True
 
-    def _maintenance_snapshot_unlocked(self, reason: str, *, keep: int = 3) -> Path:
+    def _maintenance_snapshot_unlocked(
+        self,
+        reason: str,
+        *,
+        keep: int = 3,
+        source_read_only: bool = False,
+        allow_legacy_schema: bool = False,
+        derive_hub_id: bool = False,
+        verify_host_reactivation_before_publish: bool = False,
+        verify_before_publish: bool = False,
+    ) -> Path:
         """Checkpoint and durably snapshot the bound Hub before replacement.
 
         SQLite's online backup captures the complete logical database after a
@@ -1697,32 +4083,34 @@ class HubStore:
         generation = f"snapshot_{time.time_ns():020d}_{secrets.token_hex(8)}"
         temporary = backups / f".{generation}.tmp"
         final = backups / generation
-        ensure_private_directory(temporary)
         source: sqlite3.Connection | None = None
         destination: sqlite3.Connection | None = None
         attachment_lease = self.acquire_attachment_control_lease(self.data_dir)
         try:
+            self._cleanup_abandoned_snapshot_staging_unlocked(backups)
+            ensure_private_directory(temporary)
             source = self.connect()
             snapshot_time = _now()
             # A delegated bootstrap proof is scoped to the live AgentsServer
             # instance. Maintenance may replace that instance, so revoke the
             # remote authority before the durable snapshot is taken. The
             # immutable delegation row remains as audit/idempotency evidence.
-            with _write_transaction(source):
-                source.execute(
-                    """
-                    UPDATE bootstrap_claims SET revoked_at = ?
-                    WHERE consumed_at IS NULL AND revoked_at IS NULL
-                      AND EXISTS (
-                          SELECT 1 FROM bootstrap_delegations AS d
-                          WHERE d.bootstrap_claim_id = bootstrap_claims.id
-                      )
-                    """,
-                    (snapshot_time,),
-                )
-            checkpoint = source.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()
-            if checkpoint is None or int(checkpoint[0]) != 0:
-                raise RuntimeError("Team Hub WAL checkpoint could not drain")
+            if not source_read_only:
+                with _write_transaction(source):
+                    source.execute(
+                        """
+                        UPDATE bootstrap_claims SET revoked_at = ?
+                        WHERE consumed_at IS NULL AND revoked_at IS NULL
+                          AND EXISTS (
+                              SELECT 1 FROM bootstrap_delegations AS d
+                              WHERE d.bootstrap_claim_id = bootstrap_claims.id
+                          )
+                        """,
+                        (snapshot_time,),
+                    )
+                checkpoint = source.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()
+                if checkpoint is None or int(checkpoint[0]) != 0:
+                    raise RuntimeError("Team Hub WAL checkpoint could not drain")
 
             database_copy = temporary / "team-hub.sqlite3"
             flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
@@ -1746,27 +4134,47 @@ class HubStore:
                 """
             ).fetchone()
             if (
-                version != LATEST_SCHEMA_VERSION
+                (
+                    version != LATEST_SCHEMA_VERSION
+                    if not allow_legacy_schema
+                    else not 4 <= version <= LATEST_SCHEMA_VERSION
+                )
                 or metadata is None
-                or str(metadata[0]) != self.hub_id
                 or binding is None
-                or str(binding[0]) != self.hub_id
+                or str(binding[0]) != str(metadata[0])
                 or str(binding[1]) != self.managed_host_identity
             ):
                 raise RuntimeError("Team Hub maintenance backup identity verification failed")
+            if derive_hub_id:
+                self.hub_id = str(metadata[0])
+            elif str(metadata[0]) != self.hub_id:
+                raise RuntimeError("Team Hub maintenance backup identity verification failed")
             attachment_files = self._team_attachment_snapshot_files(destination)
             proof_rows: list[tuple[str, str, bytes]] = []
-            bootstrap_claims = destination.execute(
-                """
-                SELECT c.id, c.token_hash FROM bootstrap_claims AS c
-                LEFT JOIN bootstrap_delegations AS d
-                  ON d.bootstrap_claim_id = c.id
-                WHERE c.consumed_at IS NULL AND c.revoked_at IS NULL
-                  AND c.expires_at > ? AND d.bootstrap_claim_id IS NULL
-                ORDER BY c.created_at, c.id
-                """,
-                (snapshot_time,),
-            ).fetchall()
+            if version >= 5:
+                bootstrap_claims = destination.execute(
+                    """
+                    SELECT c.id, c.token_hash FROM bootstrap_claims AS c
+                    LEFT JOIN bootstrap_delegations AS d
+                      ON d.bootstrap_claim_id = c.id
+                    WHERE c.consumed_at IS NULL AND c.revoked_at IS NULL
+                      AND c.expires_at > ? AND d.bootstrap_claim_id IS NULL
+                    ORDER BY c.created_at, c.id
+                    """,
+                    (snapshot_time,),
+                ).fetchall()
+            else:
+                # Schema 4 predates delegated bootstrap authority, so every
+                # still-live claim is necessarily backed by the local proof.
+                bootstrap_claims = destination.execute(
+                    """
+                    SELECT id, token_hash FROM bootstrap_claims
+                    WHERE consumed_at IS NULL AND revoked_at IS NULL
+                      AND expires_at > ?
+                    ORDER BY created_at, id
+                    """,
+                    (snapshot_time,),
+                ).fetchall()
             if len(bootstrap_claims) > 1:
                 raise RuntimeError("Team Hub has multiple active bootstrap proofs")
             if bootstrap_claims:
@@ -1840,7 +4248,7 @@ class HubStore:
                 "reason": clean_reason,
                 "hub_id": self.hub_id,
                 "host_server_identity": self.managed_host_identity,
-                "schema_version": LATEST_SCHEMA_VERSION,
+                "schema_version": version,
                 "database_sha256": database_digest,
                 "signing_key_sha256": key_digest,
                 "proofs": proof_manifest,
@@ -1862,6 +4270,31 @@ class HubStore:
                 os.fsync(directory_descriptor)
             finally:
                 os.close(directory_descriptor)
+            if verify_host_reactivation_before_publish or verify_before_publish:
+                if (
+                    clean_reason
+                    not in (
+                        {"host-reactivation"}
+                        if verify_host_reactivation_before_publish
+                        else {"server-update", "host-reactivation"}
+                    )
+                    or not source_read_only
+                    or not allow_legacy_schema
+                ):
+                    raise RuntimeError(
+                        "pre-publication reactivation verification is invalid"
+                    )
+                self._restore_maintenance_snapshot_unlocked(
+                    self.data_dir,
+                    temporary,
+                    expected_host_identity=self.managed_host_identity,
+                    expected_hub_id=self.hub_id,
+                    expected_operation_id=None,
+                    expected_reason=clean_reason,
+                    verify_only=True,
+                    require_fence=False,
+                    allow_staging_snapshot=True,
+                )
             os.replace(temporary, final)
             backups_descriptor = os.open(
                 backups,
@@ -1886,7 +4319,41 @@ class HubStore:
                 key=lambda entry: entry.name,
                 reverse=True,
             )
+            fence = self.maintenance_fence()
+            protected_generation = (
+                str(fence["snapshot"])
+                if fence is not None
+                else None
+            )
+            protected_reactivation_generation: str | None = None
+            for generation_path in generations:
+                try:
+                    generation_manifest = json.loads(
+                        self._read_private_regular_file(
+                            generation_path / "manifest.json",
+                            maximum_bytes=1024 * 1024,
+                        )
+                    )
+                except (OSError, UnicodeError, json.JSONDecodeError, RuntimeError):
+                    continue
+                if (
+                    isinstance(generation_manifest, dict)
+                    and generation_manifest.get("reason") == "host-reactivation"
+                    and generation_manifest.get("hub_id") == self.hub_id
+                    and generation_manifest.get("host_server_identity")
+                    == self.managed_host_identity
+                ):
+                    # Keep the newest exact pre-reactivation generation even
+                    # after the candidate host emits enough restart/shutdown
+                    # snapshots to exceed the ordinary retention window.
+                    protected_reactivation_generation = generation_path.name
+                    break
             for expired in generations[retained:]:
+                if expired.name in {
+                    protected_generation,
+                    protected_reactivation_generation,
+                }:
+                    continue
                 shutil.rmtree(expired)
             return final
         except BaseException:
@@ -1927,6 +4394,169 @@ class HubStore:
                     expected_reason=expected_reason,
                     verify_only=True,
                 )
+                if expected_reason == "host-reactivation":
+                    cls._consume_host_reactivation_handoff_unlocked(
+                        root,
+                        expected_hub_id=expected_hub_id,
+                        expected_host_identity=expected_host_identity,
+                        expected_operation_id=expected_operation_id,
+                        expected_snapshot=snapshot_dir,
+                        remove=False,
+                    )
+            finally:
+                cls.release_attachment_control_lease(attachment_lease)
+
+    @classmethod
+    def rebase_maintenance_snapshot(
+        cls,
+        data_dir: Path,
+        snapshot_dir: Path,
+        *,
+        expected_host_identity: str,
+        expected_hub_id: str,
+        expected_operation_id: str,
+    ) -> Path:
+        """Refresh a stable update snapshot from a stopped legacy source.
+
+        The durable update row and fence keep their original snapshot path.
+        A small journal atomically swaps a fully verified cold generation
+        underneath that stable name, so crash recovery never needs a
+        cross-directory status/fence transaction.
+        """
+
+        root = Path(os.path.abspath(os.path.expanduser(os.fspath(data_dir))))
+        target = Path(
+            os.path.abspath(os.path.expanduser(os.fspath(snapshot_dir)))
+        )
+        identity = _identity(expected_host_identity)
+        hub_id = _identity(expected_hub_id)
+        operation_id = _maintenance_operation_id(expected_operation_id)
+        if target.parent != root / "maintenance-backups":
+            raise RuntimeError("Team Hub maintenance snapshot path is invalid")
+        lease = cls.acquire_managed_runtime_lease(root)
+        try:
+            with cls.maintenance_control_lock(root):
+                marker = cls._maintenance_fence_control_unlocked(
+                    root,
+                    expected_hub_id=hub_id,
+                    expected_host_identity=identity,
+                    expected_reason="server-update",
+                    expected_operation_id=operation_id,
+                    expected_snapshot=target,
+                )
+                if marker is None:
+                    raise RuntimeError("Team Hub maintenance fence is missing")
+                attachment_lease = cls.acquire_attachment_control_lease(root)
+                try:
+                    cls._restore_maintenance_snapshot_unlocked(
+                        root,
+                        target,
+                        expected_host_identity=identity,
+                        expected_hub_id=hub_id,
+                        expected_operation_id=operation_id,
+                        expected_reason="server-update",
+                        verify_only=True,
+                    )
+                finally:
+                    cls.release_attachment_control_lease(attachment_lease)
+                probe = object.__new__(cls)
+                probe.data_dir = root
+                probe.database_path = root / "team-hub.sqlite3"
+                probe.signing_key_path = root / "access-token-signing.key"
+                probe.bootstrap_proof_path = root / "bootstrap-owner.proof"
+                probe.maintenance_fence_path = root / "maintenance-fence.json"
+                probe.managed_host_identity = identity
+                probe.hub_id = hub_id
+
+                def connect_read_only() -> sqlite3.Connection:
+                    connection = sqlite3.connect(
+                        f"{probe.database_path.as_uri()}?mode=ro",
+                        uri=True,
+                        isolation_level=None,
+                    )
+                    connection.row_factory = sqlite3.Row
+                    return connection
+
+                probe.connect = connect_read_only
+                replacement = probe._maintenance_snapshot_unlocked(
+                    "server-update",
+                    source_read_only=True,
+                    allow_legacy_schema=True,
+                    derive_hub_id=True,
+                    verify_before_publish=True,
+                )
+                if probe.hub_id != hub_id:
+                    raise RuntimeError("Team Hub maintenance source identity changed")
+                backups = root / "maintenance-backups"
+                retired = backups / (
+                    f".snapshot-rebase-{secrets.token_hex(12)}.old"
+                )
+                journal = {
+                    "format": 1,
+                    "hub_id": hub_id,
+                    "host_server_identity": identity,
+                    "operation_id": operation_id,
+                    "target": target.name,
+                    "target_manifest_sha256": cls._sha256_private_regular_file(
+                        target / "manifest.json"
+                    ),
+                    "replacement": replacement.name,
+                    "replacement_manifest_sha256": cls._sha256_private_regular_file(
+                        replacement / "manifest.json"
+                    ),
+                    "retired": retired.name,
+                }
+                create_secret_file(
+                    root / SNAPSHOT_REBASE_JOURNAL_NAME,
+                    canonical_json(journal) + b"\n",
+                )
+                try:
+                    os.replace(target, retired)
+                    cls._fsync_directory(backups)
+                    os.replace(replacement, target)
+                    cls._fsync_directory(backups)
+                    cls._recover_snapshot_rebase_unlocked(root)
+                except BaseException:
+                    cls._recover_snapshot_rebase_unlocked(root)
+                    raise
+                return target
+        finally:
+            cls.release_managed_runtime_lease(lease)
+
+    @classmethod
+    def verify_host_reactivation_snapshot(
+        cls,
+        data_dir: Path,
+        snapshot_dir: Path,
+        *,
+        expected_host_identity: str,
+        expected_hub_id: str,
+        expected_operation_id: str,
+    ) -> None:
+        """Verify the exact snapshot and its durable source-generation fence."""
+
+        root = Path(os.path.abspath(os.path.expanduser(os.fspath(data_dir))))
+        cls._validate_private_directory_without_mutation(root)
+        with cls.maintenance_control_lock(root):
+            attachment_lease = cls.acquire_attachment_control_lease(root)
+            try:
+                cls._restore_maintenance_snapshot_unlocked(
+                    root,
+                    snapshot_dir,
+                    expected_host_identity=expected_host_identity,
+                    expected_hub_id=expected_hub_id,
+                    expected_operation_id=expected_operation_id,
+                    expected_reason="host-reactivation",
+                    verify_only=True,
+                )
+                cls._consume_host_reactivation_handoff_unlocked(
+                    root,
+                    expected_hub_id=expected_hub_id,
+                    expected_host_identity=expected_host_identity,
+                    expected_operation_id=expected_operation_id,
+                    expected_snapshot=snapshot_dir,
+                    remove=False,
+                )
             finally:
                 cls.release_attachment_control_lease(attachment_lease)
 
@@ -1961,7 +4591,7 @@ class HubStore:
             cls.release_managed_runtime_lease(lease)
 
     @classmethod
-    def _restore_maintenance_snapshot_unlocked(
+    def restore_host_reactivation_snapshot(
         cls,
         data_dir: Path,
         snapshot_dir: Path,
@@ -1969,8 +4599,80 @@ class HubStore:
         expected_host_identity: str,
         expected_hub_id: str,
         expected_operation_id: str,
+    ) -> None:
+        """Consume the fenced reactivation generation in an offline restore."""
+
+        root = Path(os.path.abspath(os.path.expanduser(os.fspath(data_dir))))
+        snapshot = Path(
+            os.path.abspath(os.path.expanduser(os.fspath(snapshot_dir)))
+        )
+        identity = _identity(expected_host_identity)
+        hub_id = str(expected_hub_id).strip()
+        operation_id = _maintenance_operation_id(expected_operation_id)
+        lease = cls.acquire_managed_runtime_lease(root)
+        try:
+            with cls.maintenance_control_lock(root):
+                cls._consume_host_reactivation_handoff_unlocked(
+                    root,
+                    expected_hub_id=hub_id,
+                    expected_host_identity=identity,
+                    expected_operation_id=operation_id,
+                    expected_snapshot=snapshot,
+                    remove=False,
+                )
+                attachment_lease = cls.acquire_attachment_control_lease(root)
+                try:
+                    # Revalidate the snapshot against the exact fence that has
+                    # excluded source mutations since its commit point.
+                    cls._restore_maintenance_snapshot_unlocked(
+                        root,
+                        snapshot,
+                        expected_host_identity=identity,
+                        expected_hub_id=hub_id,
+                        expected_operation_id=operation_id,
+                        expected_reason="host-reactivation",
+                        verify_only=True,
+                    )
+                    # The transactional replacement includes the fence among
+                    # its old targets. A committed restore therefore consumes
+                    # it atomically; any pre-commit failure leaves it fail-
+                    # closed for an exact retry.
+                    cls._restore_maintenance_snapshot_unlocked(
+                        root,
+                        snapshot,
+                        expected_host_identity=identity,
+                        expected_hub_id=hub_id,
+                        expected_operation_id=operation_id,
+                        expected_reason="host-reactivation",
+                        verify_only=False,
+                    )
+                    cls._consume_host_reactivation_handoff_unlocked(
+                        root,
+                        expected_hub_id=hub_id,
+                        expected_host_identity=identity,
+                        expected_operation_id=operation_id,
+                        expected_snapshot=snapshot,
+                    )
+                    cls._fsync_directory(root)
+                finally:
+                    cls.release_attachment_control_lease(attachment_lease)
+        finally:
+            cls.release_managed_runtime_lease(lease)
+
+    @classmethod
+    def _restore_maintenance_snapshot_unlocked(
+        cls,
+        data_dir: Path,
+        snapshot_dir: Path,
+        *,
+        expected_host_identity: str,
+        expected_hub_id: str,
+        expected_operation_id: str | None,
         expected_reason: str,
         verify_only: bool,
+        require_fence: bool = True,
+        allow_staging_snapshot: bool = False,
+        allow_rebase_snapshot: bool = False,
     ) -> None:
         """Verify and restore one maintenance generation while Hub is offline.
 
@@ -1997,17 +4699,70 @@ class HubStore:
         else:
             ensure_private_directory(root)
         backups = root / "maintenance-backups"
-        if snapshot.parent != backups or not snapshot.name.startswith("snapshot_"):
+        if allow_staging_snapshot:
+            valid_snapshot_name = (
+                SNAPSHOT_STAGING_NAME_RE.fullmatch(snapshot.name) is not None
+            )
+        elif allow_rebase_snapshot:
+            valid_snapshot_name = (
+                snapshot.name.startswith("snapshot_")
+                or SNAPSHOT_REBASE_RETIRED_RE.fullmatch(snapshot.name)
+                is not None
+            )
+        else:
+            valid_snapshot_name = snapshot.name.startswith("snapshot_")
+        if snapshot.parent != backups or not valid_snapshot_name:
             raise PermissionError("snapshot must be a Team Hub maintenance generation")
-        if cls._maintenance_fence_control_unlocked(
-            root,
-            expected_hub_id=hub_id,
-            expected_host_identity=host_identity,
-            expected_reason=expected_reason,
-            expected_operation_id=expected_operation_id,
-            expected_snapshot=snapshot,
-        ) is None:
-            raise RuntimeError("Team Hub maintenance fence is missing")
+        if allow_staging_snapshot and (
+            not verify_only
+            or require_fence
+            or expected_reason not in {"host-reactivation", "server-update"}
+            or expected_operation_id is not None
+        ):
+            raise RuntimeError("staged snapshot verification is not allowed")
+        if allow_rebase_snapshot and (
+            not verify_only
+            or require_fence
+            or allow_staging_snapshot
+            or expected_reason != "server-update"
+            or expected_operation_id is not None
+        ):
+            raise RuntimeError("rebase snapshot verification is not allowed")
+        if require_fence:
+            if expected_operation_id is None:
+                raise RuntimeError("Team Hub maintenance operation is missing")
+            if cls._maintenance_fence_control_unlocked(
+                root,
+                expected_hub_id=hub_id,
+                expected_host_identity=host_identity,
+                expected_reason=expected_reason,
+                expected_operation_id=expected_operation_id,
+                expected_snapshot=snapshot,
+            ) is None:
+                raise RuntimeError("Team Hub maintenance fence is missing")
+        else:
+            if (
+                expected_reason not in {"host-reactivation", "server-update"}
+                or expected_operation_id is not None
+            ):
+                raise RuntimeError("unfenced Team Hub snapshot verification is not allowed")
+            marker_path = root / "maintenance-fence.json"
+            try:
+                marker_path.lstat()
+            except FileNotFoundError:
+                pass
+            else:
+                if (
+                    (allow_staging_snapshot or allow_rebase_snapshot)
+                    and expected_reason == "server-update"
+                ):
+                    marker_path = None
+                else:
+                    raise RuntimeError("preserved Team Hub state is already in maintenance")
+            if marker_path is None:
+                pass
+            elif marker_path.exists():
+                raise RuntimeError("preserved Team Hub state is already in maintenance")
         cls._validate_private_directory_without_mutation(backups)
         cls._validate_private_directory_without_mutation(snapshot)
 
@@ -2349,6 +5104,32 @@ class HubStore:
                 cls._fsync_directory(staged_proofs)
             cls._fsync_directory(old_directory)
             cls._fsync_directory(staging)
+            restored_generation = {
+                "database_sha256": manifest["database_sha256"],
+                "signing_key_sha256": manifest["signing_key_sha256"],
+                "proofs": [
+                    {"name": filename, "sha256": proof_entries[filename][1]}
+                    for filename in sorted(proof_entries)
+                ],
+                "attachments": attachment_summary,
+            }
+            receipt = {
+                "format": 1,
+                "state": "prepared",
+                "reason": expected_reason,
+                "hub_id": hub_id,
+                "host_server_identity": host_identity,
+                "operation_id": expected_operation_id,
+                "snapshot": snapshot.name,
+                "snapshot_manifest_sha256": hashlib.sha256(
+                    manifest_bytes
+                ).hexdigest(),
+                "generation": restored_generation,
+            }
+            # This receipt is durable before the fence is moved away from the
+            # live root. A post-restore installer retry can therefore prove an
+            # exact committed generation instead of inferring from absence.
+            cls._write_restore_completion_receipt_unlocked(root, receipt)
             journal = {
                 "format": 1,
                 "state": "prepared",
@@ -2361,15 +5142,7 @@ class HubStore:
                     {"name": name, "kind": new_targets[name]}
                     for name in sorted(new_targets)
                 ],
-                "new_generation": {
-                    "database_sha256": manifest["database_sha256"],
-                    "signing_key_sha256": manifest["signing_key_sha256"],
-                    "proofs": [
-                        {"name": filename, "sha256": proof_entries[filename][1]}
-                        for filename in sorted(proof_entries)
-                    ],
-                    "attachments": attachment_summary,
-                },
+                "new_generation": restored_generation,
             }
             cls._write_restore_transaction_journal(root, journal)
 
@@ -2397,6 +5170,11 @@ class HubStore:
                 raise RuntimeError("Team Hub restored state verification failed")
             committed_journal = dict(journal)
             committed_journal["state"] = "committed"
+            committed_receipt = dict(receipt)
+            committed_receipt["state"] = "committed"
+            cls._write_restore_completion_receipt_unlocked(
+                root, committed_receipt
+            )
             cls._write_restore_transaction_journal(root, committed_journal)
             cls._recover_interrupted_restore_unlocked(root)
         except BaseException:
@@ -2595,7 +5373,10 @@ class HubStore:
                         )
                     competing = connection.execute(
                         """
-                        SELECT d.request_id
+                        SELECT c.id, d.request_id, d.server_identity,
+                               d.server_instance_id, d.hub_id, d.hub_url,
+                               d.tailnet_login_normalized,
+                               d.recipient_email_normalized
                         FROM bootstrap_delegations AS d
                         JOIN bootstrap_claims AS c
                           ON c.id = d.bootstrap_claim_id
@@ -2606,11 +5387,43 @@ class HubStore:
                         (timestamp,),
                     ).fetchone()
                     if competing is not None:
-                        raise HubError(
-                            "bootstrap_request_in_progress",
-                            "Another bootstrap confirmation is still active",
-                            409,
+                        same_authority = (
+                            str(competing["server_identity"])
+                            == clean_server_identity
+                            and str(competing["server_instance_id"])
+                            == clean_server_instance_id
+                            and str(competing["hub_id"]) == self.hub_id
+                            and str(competing["hub_url"]) == clean_hub_url
+                            and str(competing["tailnet_login_normalized"])
+                            == clean_login
+                            and str(competing["recipient_email_normalized"])
+                            == clean_recipient
                         )
+                        if not same_authority:
+                            raise HubError(
+                                "bootstrap_request_in_progress",
+                                "Another bootstrap confirmation is still active",
+                                409,
+                            )
+                        # A confirmation UI can be closed after proof issuance.
+                        # Let the same authenticated route/recipient atomically
+                        # replace that abandoned request, while the immutable
+                        # ledger keeps the old proof permanently revocable and
+                        # the hard row cap bounds repeated retries.
+                        changed = connection.execute(
+                            """
+                            UPDATE bootstrap_claims SET revoked_at = ?
+                            WHERE id = ? AND consumed_at IS NULL
+                              AND revoked_at IS NULL AND expires_at > ?
+                            """,
+                            (timestamp, str(competing["id"]), timestamp),
+                        ).rowcount
+                        if changed != 1:
+                            raise HubError(
+                                "bootstrap_unavailable",
+                                "Bootstrap is unavailable",
+                                409,
+                            )
                     connection.execute(
                         """
                         UPDATE bootstrap_claims SET revoked_at = ?
@@ -3176,8 +5989,10 @@ class HubStore:
             return None
         row = connection.execute(
             """
-            SELECT n.id,n.team_id,n.principal_id,n.status,
-                   p.kind AS principal_kind,p.scope_team_id,p.status AS principal_status
+            SELECT n.id,n.team_id,n.principal_id,n.display_name AS node_display_name,
+                   n.status,p.kind AS principal_kind,p.scope_team_id,
+                   p.display_name AS principal_display_name,
+                   p.status AS principal_status
             FROM nodes AS n JOIN principals AS p ON p.id=n.principal_id
             WHERE n.server_identity=?
             """,
@@ -3196,15 +6011,25 @@ class HubStore:
                     "Managed server identity conflicts with Team Hub state",
                     409,
                 )
-            if row["status"] != "active":
+            label = self.managed_host_display_name
+            if row["status"] != "active" or row["node_display_name"] != label:
                 connection.execute(
-                    "UPDATE nodes SET status='active',last_seen_at=? WHERE id=?",
-                    (timestamp, row["id"]),
+                    """
+                    UPDATE nodes
+                    SET display_name=?,status='active',last_seen_at=?
+                    WHERE id=?
+                    """,
+                    (label, timestamp, row["id"]),
+                )
+            if row["principal_display_name"] != label:
+                connection.execute(
+                    "UPDATE principals SET display_name=?,updated_at=? WHERE id=?",
+                    (label, timestamp, row["principal_id"]),
                 )
             return str(row["id"])
         principal_id = _id("node_principal")
         node_id = _id("node")
-        label = "Team Hub host"
+        label = self.managed_host_display_name
         connection.execute(
             """
             INSERT INTO principals(
@@ -4243,6 +7068,258 @@ class HubStore:
         finally:
             connection.close()
 
+    def list_device_sessions(self, claims: AccessClaims) -> dict[str, Any]:
+        """List only the authenticated human's own device-session ledger."""
+
+        return self.list_device_sessions_page(claims)
+
+    def _human_admin_page_cursor(
+        self,
+        value: str | None,
+        *,
+        resource_kind: str,
+        scope_id: str,
+        viewer_id: str,
+        visibility: str,
+    ) -> tuple[int, int, str] | None:
+        if value is None:
+            return None
+        raw = str(value)
+        associated_data = b"agentsdock-team-hub-human-admin-cursor-v1\0" + canonical_json(
+            {
+                "k": resource_kind,
+                "s": scope_id,
+                "u": viewer_id,
+                "f": visibility,
+            }
+        )
+        try:
+            if (
+                len(raw) > 512
+                or re.fullmatch(r"v1\.[A-Za-z0-9_-]{38,500}", raw) is None
+            ):
+                raise ValueError("cursor encoding is invalid")
+            encoded = raw[3:].encode("ascii")
+            ciphertext = base64.b64decode(
+                encoded + b"=" * (-len(encoded) % 4),
+                altchars=b"-_",
+                validate=True,
+            )
+            if len(ciphertext) < 12 + 16:
+                raise ValueError("cursor encoding is truncated")
+            plaintext = AESGCM(self._human_admin_cursor_key).decrypt(
+                ciphertext[:12],
+                ciphertext[12:],
+                associated_data,
+            )
+            payload = json.loads(plaintext)
+            if (
+                not isinstance(payload, dict)
+                or set(payload) != {"v", "h", "t", "i"}
+                or payload["v"] != 1
+                or type(payload["h"]) is not int
+                or type(payload["t"]) is not int
+                or not 0 <= payload["h"] <= MAX_SQLITE_SIGNED_INTEGER
+                or not 0 <= payload["t"] <= MAX_SQLITE_SIGNED_INTEGER
+            ):
+                raise ValueError("cursor payload is invalid")
+            clean_id = _identity(payload["i"])
+        except (
+            ValueError,
+            TypeError,
+            UnicodeError,
+            binascii.Error,
+            json.JSONDecodeError,
+            InvalidTag,
+        ) as exc:
+            raise HubError("invalid_cursor", "Page cursor is invalid", 422) from exc
+        return int(payload["h"]), int(payload["t"]), clean_id
+
+    def _encode_human_admin_page_cursor(
+        self,
+        *,
+        resource_kind: str,
+        scope_id: str,
+        viewer_id: str,
+        visibility: str,
+        highwater: int,
+        timestamp: int,
+        resource_id: str,
+    ) -> str:
+        payload = canonical_json(
+            {
+                "v": 1,
+                "h": int(highwater),
+                "t": int(timestamp),
+                "i": _identity(resource_id),
+            }
+        )
+        associated_data = b"agentsdock-team-hub-human-admin-cursor-v1\0" + canonical_json(
+            {
+                "k": resource_kind,
+                "s": scope_id,
+                "u": viewer_id,
+                "f": visibility,
+            }
+        )
+        nonce = secrets.token_bytes(12)
+        ciphertext = nonce + AESGCM(self._human_admin_cursor_key).encrypt(
+            nonce,
+            payload,
+            associated_data,
+        )
+        cursor = "v1." + base64.urlsafe_b64encode(ciphertext).rstrip(b"=").decode(
+            "ascii"
+        )
+        if len(cursor) > 512:
+            raise RuntimeError("human administration page cursor exceeds its wire bound")
+        return cursor
+
+    def list_device_sessions_page(
+        self,
+        claims: AccessClaims,
+        *,
+        limit: int = 50,
+        cursor: str | None = None,
+    ) -> dict[str, Any]:
+        page_limit = int(limit)
+        if not 1 <= page_limit <= MAX_HUMAN_ADMIN_PAGE_ITEMS:
+            raise HubError("invalid_request", "Page limit is invalid", 422)
+
+        timestamp = _now()
+        connection = self.connect()
+        try:
+            connection.execute("BEGIN")
+            session = self._require_session(connection, claims, timestamp)
+            if session["principal_kind"] != "human":
+                raise HubError("forbidden", "Operation is not permitted", 403)
+            boundary = self._human_admin_page_cursor(
+                cursor,
+                resource_kind="device_session",
+                scope_id=claims.principal_id,
+                viewer_id=claims.principal_id,
+                visibility="self",
+            )
+            highwater = (
+                boundary[0]
+                if boundary is not None
+                else int(
+                    connection.execute(
+                        "SELECT COALESCE(MAX(sequence),0) "
+                        "FROM human_admin_page_entries",
+                    ).fetchone()[0]
+                )
+            )
+            query = """
+                SELECT s.id,s.device_label,s.created_at,s.last_seen_at,
+                       s.expires_at,s.revoked_at
+                FROM device_sessions AS s
+                JOIN human_admin_page_entries AS page
+                  ON page.resource_kind='device_session' AND page.resource_id=s.id
+                WHERE s.human_principal_id=? AND page.sequence<=?
+            """
+            parameters: list[Any] = [claims.principal_id, highwater]
+            if boundary is not None:
+                query += " AND (s.created_at<? OR (s.created_at=? AND s.id<?))"
+                parameters.extend((boundary[1], boundary[1], boundary[2]))
+            query += " ORDER BY s.created_at DESC,s.id DESC LIMIT ?"
+            parameters.append(page_limit + 1)
+            rows = list(connection.execute(query, parameters))
+            visible = rows[:page_limit]
+            sessions = [
+                {
+                    "id": str(row["id"]),
+                    "device_label": str(row["device_label"]),
+                    "created_at": _iso8601(int(row["created_at"])),
+                    "last_seen_at": _iso8601(int(row["last_seen_at"])),
+                    "expires_at": _iso8601(int(row["expires_at"])),
+                    "revoked_at": _iso8601(row["revoked_at"]),
+                    "current": str(row["id"]) == claims.session_id,
+                }
+                for row in visible
+            ]
+            has_more = len(rows) > page_limit
+            next_cursor = (
+                self._encode_human_admin_page_cursor(
+                    resource_kind="device_session",
+                    scope_id=claims.principal_id,
+                    viewer_id=claims.principal_id,
+                    visibility="self",
+                    highwater=highwater,
+                    timestamp=int(visible[-1]["created_at"]),
+                    resource_id=str(visible[-1]["id"]),
+                )
+                if has_more and visible
+                else None
+            )
+            connection.execute("COMMIT")
+            return {
+                "sessions": sessions,
+                "has_more": has_more,
+                "next_cursor": next_cursor,
+            }
+        except BaseException:
+            if connection.in_transaction:
+                connection.execute("ROLLBACK")
+            raise
+        finally:
+            connection.close()
+
+    def revoke_device_session(
+        self,
+        claims: AccessClaims,
+        device_session_id: str,
+    ) -> dict[str, bool]:
+        """Revoke one device owned by the authenticated human principal."""
+
+        try:
+            device_session_id = _identity(device_session_id)
+        except ValueError as exc:
+            raise HubError("not_found", "Resource not found", 404) from exc
+        timestamp = _now()
+        connection = self.connect()
+        try:
+            with _write_transaction(connection):
+                session = self._require_session(connection, claims, timestamp)
+                if session["principal_kind"] != "human":
+                    raise HubError("forbidden", "Operation is not permitted", 403)
+                target = connection.execute(
+                    """
+                    SELECT id,revoked_at FROM device_sessions
+                    WHERE id=? AND human_principal_id=?
+                    """,
+                    (device_session_id, claims.principal_id),
+                ).fetchone()
+                if target is None:
+                    raise HubError("not_found", "Resource not found", 404)
+                connection.execute(
+                    """
+                    UPDATE device_sessions SET revoked_at=?
+                    WHERE id=? AND revoked_at IS NULL
+                    """,
+                    (timestamp, device_session_id),
+                )
+                connection.execute(
+                    """
+                    UPDATE refresh_tokens SET revoked_at=?
+                    WHERE device_session_id=?
+                      AND consumed_at IS NULL AND revoked_at IS NULL
+                    """,
+                    (timestamp, device_session_id),
+                )
+                self._audit_principal_teams(
+                    connection,
+                    claims.principal_id,
+                    "session.device_revoke",
+                    "device_session",
+                    device_session_id,
+                    "succeeded",
+                    timestamp,
+                )
+                return {"revoked": True}
+        finally:
+            connection.close()
+
     def list_teams(self, claims: AccessClaims) -> dict[str, Any]:
         connection = self.connect()
         try:
@@ -4290,7 +7367,17 @@ class HubStore:
         finally:
             connection.close()
 
-    def list_members(self, claims: AccessClaims, team_id: str) -> dict[str, Any]:
+    def list_members(
+        self,
+        claims: AccessClaims,
+        team_id: str,
+        *,
+        limit: int = 50,
+        cursor: str | None = None,
+    ) -> dict[str, Any]:
+        page_limit = int(limit)
+        if not 1 <= page_limit <= MAX_HUMAN_ADMIN_PAGE_ITEMS:
+            raise HubError("invalid_request", "Page limit is invalid", 422)
         connection = self.connect()
         try:
             connection.execute("BEGIN")
@@ -4302,27 +7389,86 @@ class HubStore:
                 ("owner", "admin", "member", "guest", "automation"),
             )
             email_projection = "h.email_normalized" if viewer["role"] in ("owner", "admin") else "NULL"
-            members = [
-                _row_dict(row)
-                for row in connection.execute(
-                    f"""
+            membership_projection = (
+                "m.status IN ('active','suspended')"
+                if viewer["role"] in ("owner", "admin")
+                else "m.status = 'active'"
+            )
+            membership_visibility = (
+                "manageable"
+                if viewer["role"] in ("owner", "admin")
+                else "active"
+            )
+            boundary = self._human_admin_page_cursor(
+                cursor,
+                resource_kind="membership",
+                scope_id=team_id,
+                viewer_id=claims.principal_id,
+                visibility=membership_visibility,
+            )
+            highwater = (
+                boundary[0]
+                if boundary is not None
+                else int(
+                    connection.execute(
+                        "SELECT COALESCE(MAX(sequence),0) "
+                        "FROM human_admin_page_entries",
+                    ).fetchone()[0]
+                )
+            )
+            query = f"""
                     SELECT m.principal_id, {email_projection} AS email,
-                           p.display_name, m.role, m.status
+                           p.display_name, m.role, m.status, m.created_at
                     FROM memberships AS m
+                    JOIN human_admin_page_entries AS page
+                      ON page.resource_kind='membership' AND page.resource_id=m.id
                     JOIN principals AS p ON p.id = m.principal_id
                     LEFT JOIN human_accounts AS h ON h.principal_id = m.principal_id
-                    WHERE m.team_id = ? AND m.status = 'active' AND p.status = 'active'
+                    WHERE m.team_id = ? AND page.sequence<=? AND {membership_projection}
+                      AND p.status = 'active'
                       AND (
                         p.kind = 'human'
                         OR (p.kind = 'service' AND p.id = ?)
                       )
-                    ORDER BY p.display_name COLLATE NOCASE, m.principal_id
-                    """,
-                    (team_id, claims.principal_id),
-                )
+            """
+            parameters: list[Any] = [team_id, highwater, claims.principal_id]
+            if boundary is not None:
+                query += " AND (m.created_at<? OR (m.created_at=? AND m.principal_id<?))"
+                parameters.extend((boundary[1], boundary[1], boundary[2]))
+            query += " ORDER BY m.created_at DESC,m.principal_id DESC LIMIT ?"
+            parameters.append(page_limit + 1)
+            rows = list(connection.execute(query, parameters))
+            visible = rows[:page_limit]
+            members = [
+                {
+                    "principal_id": str(row["principal_id"]),
+                    "email": row["email"],
+                    "display_name": str(row["display_name"]),
+                    "role": str(row["role"]),
+                    "status": str(row["status"]),
+                }
+                for row in visible
             ]
+            has_more = len(rows) > page_limit
+            next_cursor = (
+                self._encode_human_admin_page_cursor(
+                    resource_kind="membership",
+                    scope_id=team_id,
+                    viewer_id=claims.principal_id,
+                    visibility=membership_visibility,
+                    highwater=highwater,
+                    timestamp=int(visible[-1]["created_at"]),
+                    resource_id=str(visible[-1]["principal_id"]),
+                )
+                if has_more and visible
+                else None
+            )
             connection.execute("COMMIT")
-            return {"members": members}
+            return {
+                "members": members,
+                "has_more": has_more,
+                "next_cursor": next_cursor,
+            }
         except (AuthorizationError, AuthenticationError) as exc:
             if connection.in_transaction:
                 connection.execute("ROLLBACK")
@@ -4331,6 +7477,341 @@ class HubStore:
             if connection.in_transaction:
                 connection.execute("ROLLBACK")
             raise
+        finally:
+            connection.close()
+
+    @staticmethod
+    def _require_team_owner_for_human_administration(
+        connection: sqlite3.Connection,
+        claims: AccessClaims,
+        team_id: str,
+    ) -> str:
+        try:
+            team_id = _identity(team_id)
+        except ValueError as exc:
+            raise HubError("not_found", "Resource not found", 404) from exc
+        try:
+            viewer = _require_team_role(
+                connection,
+                team_id,
+                claims.principal_id,
+                ("owner", "admin", "member", "guest", "automation"),
+            )
+        except AuthorizationError as exc:
+            raise HubError("not_found", "Resource not found", 404) from exc
+        if viewer["role"] != "owner":
+            raise HubError("forbidden", "Operation is not permitted", 403)
+        return team_id
+
+    def list_pending_invitations(
+        self,
+        claims: AccessClaims,
+        team_id: str,
+        *,
+        limit: int = 50,
+        cursor: str | None = None,
+    ) -> dict[str, Any]:
+        page_limit = int(limit)
+        if not 1 <= page_limit <= MAX_HUMAN_ADMIN_PAGE_ITEMS:
+            raise HubError("invalid_request", "Page limit is invalid", 422)
+        timestamp = _now()
+        connection = self.connect()
+        try:
+            connection.execute("BEGIN")
+            self._require_session(connection, claims, timestamp)
+            team_id = self._require_team_owner_for_human_administration(
+                connection, claims, team_id
+            )
+            boundary = self._human_admin_page_cursor(
+                cursor,
+                resource_kind="invitation",
+                scope_id=team_id,
+                viewer_id=claims.principal_id,
+                visibility="pending",
+            )
+            highwater = (
+                boundary[0]
+                if boundary is not None
+                else int(
+                    connection.execute(
+                        "SELECT COALESCE(MAX(sequence),0) "
+                        "FROM human_admin_page_entries",
+                    ).fetchone()[0]
+                )
+            )
+            query = """
+                SELECT i.id,i.invitee_email_normalized,i.role,
+                       i.issued_by_principal_id,i.created_at,i.expires_at
+                FROM invitations AS i
+                JOIN human_admin_page_entries AS page
+                  ON page.resource_kind='invitation' AND page.resource_id=i.id
+                WHERE i.team_id=? AND i.redeemed_at IS NULL
+                  AND i.revoked_at IS NULL AND i.expires_at>?
+                  AND i.created_at>? AND page.sequence<=?
+            """
+            parameters: list[Any] = [
+                team_id,
+                timestamp,
+                max(0, timestamp - INVITATION_MAX_TTL_SECONDS),
+                highwater,
+            ]
+            if boundary is not None:
+                query += " AND (i.created_at<? OR (i.created_at=? AND i.id<?))"
+                parameters.extend((boundary[1], boundary[1], boundary[2]))
+            query += " ORDER BY i.created_at DESC,i.id DESC LIMIT ?"
+            parameters.append(page_limit + 1)
+            rows = list(connection.execute(query, parameters))
+            visible = rows[:page_limit]
+            invitations = [
+                {
+                    "id": str(row["id"]),
+                    "invitee_email": str(row["invitee_email_normalized"]),
+                    "role": str(row["role"]),
+                    "issued_by_principal_id": str(row["issued_by_principal_id"]),
+                    "created_at": _iso8601(int(row["created_at"])),
+                    "expires_at": _iso8601(int(row["expires_at"])),
+                }
+                for row in visible
+            ]
+            has_more = len(rows) > page_limit
+            next_cursor = (
+                self._encode_human_admin_page_cursor(
+                    resource_kind="invitation",
+                    scope_id=team_id,
+                    viewer_id=claims.principal_id,
+                    visibility="pending",
+                    highwater=highwater,
+                    timestamp=int(visible[-1]["created_at"]),
+                    resource_id=str(visible[-1]["id"]),
+                )
+                if has_more and visible
+                else None
+            )
+            connection.execute("COMMIT")
+            return {
+                "invitations": invitations,
+                "has_more": has_more,
+                "next_cursor": next_cursor,
+            }
+        except BaseException:
+            if connection.in_transaction:
+                connection.execute("ROLLBACK")
+            raise
+        finally:
+            connection.close()
+
+    def revoke_invitation(
+        self,
+        claims: AccessClaims,
+        team_id: str,
+        invitation_id: str,
+    ) -> dict[str, bool]:
+        try:
+            invitation_id = _identity(invitation_id)
+        except ValueError as exc:
+            raise HubError("not_found", "Resource not found", 404) from exc
+        timestamp = _now()
+        connection = self.connect()
+        try:
+            with _write_transaction(connection):
+                self._require_session(connection, claims, timestamp)
+                team_id = self._require_team_owner_for_human_administration(
+                    connection, claims, team_id
+                )
+                changed = connection.execute(
+                    """
+                    UPDATE invitations SET revoked_at=?
+                    WHERE id=? AND team_id=? AND redeemed_at IS NULL
+                      AND revoked_at IS NULL AND expires_at>?
+                    """,
+                    (timestamp, invitation_id, team_id, timestamp),
+                ).rowcount
+                if changed != 1:
+                    raise HubError("not_found", "Resource not found", 404)
+                self._audit(
+                    connection,
+                    team_id,
+                    claims.principal_id,
+                    "invitation.revoke",
+                    "invitation",
+                    invitation_id,
+                    "succeeded",
+                    {},
+                    timestamp,
+                )
+                return {"revoked": True}
+        finally:
+            connection.close()
+
+    def get_member(
+        self,
+        claims: AccessClaims,
+        team_id: str,
+        principal_id: str,
+    ) -> dict[str, Any]:
+        """Return one member under the caller's existing list visibility."""
+
+        try:
+            target_id = _identity(principal_id)
+        except ValueError as exc:
+            raise HubError("not_found", "Resource not found", 404) from exc
+        connection = self.connect()
+        try:
+            connection.execute("BEGIN")
+            self._require_session(connection, claims, _now())
+            viewer = _require_team_role(
+                connection,
+                team_id,
+                claims.principal_id,
+                ("owner", "admin", "member", "guest", "automation"),
+            )
+            manageable = viewer["role"] in ("owner", "admin")
+            row = connection.execute(
+                f"""
+                SELECT m.principal_id,
+                       {"h.email_normalized" if manageable else "NULL"} AS email,
+                       p.display_name,m.role,m.status,p.kind
+                FROM memberships AS m
+                JOIN principals AS p ON p.id=m.principal_id
+                LEFT JOIN human_accounts AS h ON h.principal_id=m.principal_id
+                WHERE m.team_id=? AND m.principal_id=?
+                  AND {"m.status IN ('active','suspended')" if manageable else "m.status='active'"}
+                  AND p.status='active'
+                  AND (p.kind='human' OR (p.kind='service' AND p.id=?))
+                """,
+                (team_id, target_id, claims.principal_id),
+            ).fetchone()
+            if row is None:
+                raise HubError("not_found", "Resource not found", 404)
+            connection.execute("COMMIT")
+            return {
+                "member": {
+                    "principal_id": str(row["principal_id"]),
+                    "email": row["email"],
+                    "display_name": str(row["display_name"]),
+                    "role": str(row["role"]),
+                    "status": str(row["status"]),
+                }
+            }
+        except (AuthorizationError, AuthenticationError) as exc:
+            if connection.in_transaction:
+                connection.execute("ROLLBACK")
+            raise HubError("not_found", "Resource not found", 404) from exc
+        except BaseException:
+            if connection.in_transaction:
+                connection.execute("ROLLBACK")
+            raise
+        finally:
+            connection.close()
+
+    def update_human_membership(
+        self,
+        claims: AccessClaims,
+        team_id: str,
+        principal_id: str,
+        *,
+        role: str | None = None,
+        status: str | None = None,
+    ) -> dict[str, Any]:
+        try:
+            principal_id = _identity(principal_id)
+        except ValueError as exc:
+            raise HubError("not_found", "Resource not found", 404) from exc
+        if (role is None) == (status is None):
+            raise HubError(
+                "invalid_request",
+                "Exactly one membership change is required",
+                422,
+            )
+        if role is not None and role not in {"admin", "member", "guest"}:
+            raise HubError("invalid_request", "Membership role is invalid", 422)
+        if status is not None and status not in {"active", "suspended", "revoked"}:
+            raise HubError("invalid_request", "Membership status is invalid", 422)
+
+        timestamp = _now()
+        connection = self.connect()
+        try:
+            with _write_transaction(connection):
+                self._require_session(connection, claims, timestamp)
+                team_id = self._require_team_owner_for_human_administration(
+                    connection, claims, team_id
+                )
+                target = connection.execute(
+                    """
+                    SELECT m.role,m.status,p.kind,p.display_name,h.email_normalized
+                    FROM memberships AS m
+                    JOIN principals AS p ON p.id=m.principal_id
+                    LEFT JOIN human_accounts AS h ON h.principal_id=p.id
+                    WHERE m.team_id=? AND m.principal_id=?
+                    """,
+                    (team_id, principal_id),
+                ).fetchone()
+                if (
+                    target is None
+                    or principal_id == claims.principal_id
+                    or target["kind"] != "human"
+                    or target["role"] in {"owner", "automation"}
+                ):
+                    raise HubError("not_found", "Resource not found", 404)
+                old_role = str(target["role"])
+                old_status = str(target["status"])
+                if old_status == "revoked":
+                    raise HubError(
+                        "membership_terminal",
+                        "Membership has been permanently revoked",
+                        409,
+                    )
+                if role is not None:
+                    if old_status != "active":
+                        raise HubError(
+                            "membership_not_active",
+                            "Membership must be active before changing role",
+                            409,
+                        )
+                    connection.execute(
+                        "UPDATE memberships SET role=?,updated_at=? "
+                        "WHERE team_id=? AND principal_id=?",
+                        (role, timestamp, team_id, principal_id),
+                    )
+                    action = "membership.role_change"
+                    metadata = {"old_role": old_role, "new_role": role}
+                    new_role = role
+                    new_status = old_status
+                else:
+                    assert status is not None
+                    if old_status == "active" and status not in {"active", "suspended", "revoked"}:
+                        raise HubError("invalid_membership_transition", "Membership transition is invalid", 409)
+                    if old_status == "suspended" and status not in {"active", "suspended", "revoked"}:
+                        raise HubError("invalid_membership_transition", "Membership transition is invalid", 409)
+                    connection.execute(
+                        "UPDATE memberships SET status=?,updated_at=? "
+                        "WHERE team_id=? AND principal_id=?",
+                        (status, timestamp, team_id, principal_id),
+                    )
+                    action = "membership.status_change"
+                    metadata = {"old_status": old_status, "new_status": status}
+                    new_role = old_role
+                    new_status = status
+                self._audit(
+                    connection,
+                    team_id,
+                    claims.principal_id,
+                    action,
+                    "membership",
+                    principal_id,
+                    "succeeded",
+                    metadata,
+                    timestamp,
+                )
+                return {
+                    "member": {
+                        "principal_id": principal_id,
+                        "email": target["email_normalized"],
+                        "display_name": str(target["display_name"]),
+                        "role": new_role,
+                        "status": new_status,
+                    }
+                }
         finally:
             connection.close()
 
@@ -4573,6 +8054,38 @@ class HubStore:
                 ).fetchall()
                 if len(memberships) != 1:
                     raise HubError("recovery_unavailable", "Device recovery is unavailable", 409)
+                principal_id = str(memberships[0]["principal_id"])
+                revoked_session_count = int(
+                    connection.execute(
+                        """
+                        SELECT count(*) FROM device_sessions
+                        WHERE human_principal_id = ? AND revoked_at IS NULL
+                        """,
+                        (principal_id,),
+                    ).fetchone()[0]
+                )
+                # Issuing recovery is the host operator's lost-device action.
+                # Revoke the old authority in this same transaction so the
+                # compromised device does not stay live while the replacement
+                # proof is transported (or if that proof is never redeemed).
+                connection.execute(
+                    """
+                    UPDATE device_sessions SET revoked_at = ?
+                    WHERE human_principal_id = ? AND revoked_at IS NULL
+                    """,
+                    (timestamp, principal_id),
+                )
+                connection.execute(
+                    """
+                    UPDATE refresh_tokens SET revoked_at = ?
+                    WHERE consumed_at IS NULL AND revoked_at IS NULL
+                      AND device_session_id IN (
+                        SELECT id FROM device_sessions
+                        WHERE human_principal_id = ?
+                      )
+                    """,
+                    (timestamp, principal_id),
+                )
                 superseded_ids = [
                     str(row["id"])
                     for row in connection.execute(
@@ -4581,7 +8094,7 @@ class HubStore:
                         WHERE owner_principal_id = ? AND consumed_at IS NULL
                           AND revoked_at IS NULL
                         """,
-                        (memberships[0]["principal_id"],),
+                        (principal_id,),
                     )
                 ]
                 connection.execute(
@@ -4590,7 +8103,7 @@ class HubStore:
                     WHERE owner_principal_id = ? AND consumed_at IS NULL
                       AND revoked_at IS NULL
                     """,
-                    (timestamp, memberships[0]["principal_id"]),
+                    (timestamp, principal_id),
                 )
                 proof, digest = opaque_secret("owner-recovery")
                 claim_id = _id("owner_recovery")
@@ -4606,7 +8119,7 @@ class HubStore:
                     (
                         claim_id,
                         memberships[0]["team_id"],
-                        memberships[0]["principal_id"],
+                        principal_id,
                         digest,
                         label,
                         timestamp,
@@ -4626,7 +8139,8 @@ class HubStore:
                     "accepted",
                     {
                         "authority": "local_host_recovery",
-                        "subject_principal_id": str(memberships[0]["principal_id"]),
+                        "subject_principal_id": principal_id,
+                        "revoked_session_count": revoked_session_count,
                     },
                     timestamp,
                 )
@@ -5739,6 +9253,100 @@ class HubStore:
         finally:
             connection.close()
 
+    def get_network_server(
+        self,
+        claims: AccessClaims,
+        team_id: str,
+        server_id: str,
+    ) -> dict[str, Any]:
+        """Return one visible logical server without enumerating its team."""
+
+        try:
+            clean_server_id = _identity(server_id)
+        except (AttributeError, TypeError, ValueError) as exc:
+            raise HubError("not_found", "Resource not found", 404) from exc
+        connection = self.connect()
+        try:
+            connection.execute("BEGIN")
+            membership = self._require_network_scope(
+                connection, claims, team_id, write=False
+            )
+            owned_node_id: str | None = None
+            if claims.auth_kind in NETWORK_AUTOMATION_AUTH_KINDS:
+                owned_node_id = str(
+                    self._caller_network_node(connection, claims, team_id)["node_id"]
+                )
+            elif membership["role"] in {"owner", "admin", "member"}:
+                try:
+                    owned_node_id = str(
+                        self._caller_network_node(connection, claims, team_id)[
+                            "node_id"
+                        ]
+                    )
+                except HubError as exc:
+                    if exc.code != "network_host_unavailable":
+                        raise
+            row = connection.execute(
+                """
+                SELECT n.id,n.server_identity,n.display_name,n.status
+                FROM nodes AS n
+                WHERE n.team_id=? AND n.id=? AND n.status<>'revoked'
+                  AND (
+                    n.server_identity=?
+                    OR NOT EXISTS (
+                        SELECT 1 FROM network_peer_bindings AS history
+                        WHERE history.team_id=n.team_id
+                          AND history.node_id=n.id
+                    )
+                    OR EXISTS (
+                        SELECT 1
+                        FROM network_peer_bindings AS live
+                        JOIN principals AS service_principal
+                          ON service_principal.id=live.service_principal_id
+                        JOIN service_accounts AS service_account
+                          ON service_account.principal_id=service_principal.id
+                        JOIN memberships AS service_membership
+                          ON service_membership.team_id=live.team_id
+                         AND service_membership.principal_id=service_principal.id
+                        WHERE live.team_id=n.team_id
+                          AND live.node_id=n.id
+                          AND live.peer_server_identity=n.server_identity
+                          AND live.status='active'
+                          AND service_principal.kind='service'
+                          AND service_principal.status='active'
+                          AND service_account.service_identifier=
+                              'agentsdock.secure-peer.' || live.peer_id
+                          AND service_membership.role='automation'
+                          AND service_membership.status='active'
+                    )
+                  )
+                """,
+                (team_id, clean_server_id, self.managed_host_identity),
+            ).fetchone()
+            if row is None:
+                raise HubError("not_found", "Resource not found", 404)
+            result = {
+                "server": {
+                    "id": str(row["id"]),
+                    "server_identity": str(row["server_identity"]),
+                    "display_name": str(row["display_name"]),
+                    "status": str(row["status"]),
+                    "is_host": bool(
+                        self.managed_host_identity is not None
+                        and row["server_identity"] == self.managed_host_identity
+                    ),
+                    "owned_by_caller": row["id"] == owned_node_id,
+                }
+            }
+            connection.execute("COMMIT")
+            return result
+        except BaseException:
+            if connection.in_transaction:
+                connection.execute("ROLLBACK")
+            raise
+        finally:
+            connection.close()
+
     def register_network_agent(
         self,
         claims: AccessClaims,
@@ -6449,6 +10057,28 @@ class HubStore:
         }
 
     @staticmethod
+    def _require_server_inbox_write(
+        request: dict[str, Any],
+        *,
+        destination_required: bool,
+    ) -> None:
+        """Keep agent records readable while retiring them as mail parties."""
+
+        destination = request.get("to")
+        if request.get("from_agent_id") is not None or (
+            destination_required
+            and (
+                not isinstance(destination, dict)
+                or destination.get("kind") != "server"
+            )
+        ):
+            raise HubError(
+                "invalid_request",
+                "Team Network mail accepts server inboxes only",
+                422,
+            )
+
+    @staticmethod
     def _network_recipient(
         connection: sqlite3.Connection,
         team_id: str,
@@ -6627,6 +10257,7 @@ class HubStore:
         team_id: str,
         request: dict[str, Any],
     ) -> dict[str, Any]:
+        self._require_server_inbox_write(request, destination_required=True)
         timestamp = _now()
         body, body_format, body_bytes = self._network_body(request)
         fingerprint = canonical_fingerprint(
@@ -7022,6 +10653,7 @@ class HubStore:
         team_id: str,
         request: dict[str, Any],
     ) -> dict[str, Any]:
+        self._require_server_inbox_write(request, destination_required=True)
         timestamp = _now()
         body, body_format, body_bytes = self._network_body(request)
         ttl = int(request.get("expires_in_seconds", 86_400))
@@ -7276,6 +10908,7 @@ class HubStore:
         request_id: str,
         request: dict[str, Any],
     ) -> dict[str, Any]:
+        self._require_server_inbox_write(request, destination_required=False)
         clean_id = _identity(request_id)
         timestamp = _now()
         body, body_format, body_bytes = self._network_body(request)
@@ -7303,6 +10936,17 @@ class HubStore:
                 ).fetchone()
                 if request_item is None:
                     raise HubError("not_found", "Resource not found", 404)
+                if (
+                    request_item["sender_kind"] == "agent"
+                    or request_item["recipient_kind"] == "agent"
+                ):
+                    # Retain legacy agent-addressed request history, but never
+                    # append a new cross-server agent-authored/directed reply.
+                    raise HubError(
+                        "invalid_request",
+                        "Agent-addressed Team Network requests are retired",
+                        422,
+                    )
                 cached = self._idempotency_lookup(
                     connection,
                     team_id,
@@ -7789,17 +11433,39 @@ class HubStore:
         return tags
 
     @staticmethod
-    def _team_provenance(value: Any) -> str:
+    def _team_provenance_field_valid(key: str, value: Any) -> bool:
+        if value is None:
+            return True
+        if not isinstance(value, str):
+            return False
+        try:
+            utf16_length = len(value.encode("utf-16-le")) // 2
+        except UnicodeEncodeError:
+            return False
+        if key == "via":
+            return value in {"agent", "desktop"}
+        if key == "backend":
+            return (
+                1 <= utf16_length <= 80
+                and value.strip() == value
+                and re.search(r"[\x00-\x1f\x7f]", value) is None
+            )
+        return (
+            1 <= utf16_length <= 240
+            and value.strip() == value
+            and re.search(r"[\x00-\x1f\x7f]", value) is None
+        )
+
+    @classmethod
+    def _team_provenance(cls, value: Any) -> str:
         if value is None:
             return "{}"
         if (
             not isinstance(value, dict)
-            or len(value) > 8
+            or any(key not in TEAM_MESSAGE_PROVENANCE_KEYS for key in value)
             or any(
                 not isinstance(key, str)
-                or not isinstance(item, str)
-                or not 1 <= len(key) <= 40
-                or len(item) > 200
+                or not cls._team_provenance_field_valid(key, item)
                 for key, item in value.items()
             )
         ):
@@ -7808,6 +11474,20 @@ class HubStore:
         if len(encoded) > 2_048:
             raise HubError("invalid_request", "Provenance is invalid", 422)
         return encoded.decode("utf-8")
+
+    @classmethod
+    def _team_provenance_public(cls, value: Any) -> dict[str, str | None]:
+        try:
+            decoded = json.loads(str(value or "{}"))
+        except (TypeError, ValueError):
+            return {}
+        if not isinstance(decoded, dict):
+            return {}
+        return {
+            key: decoded[key]
+            for key in TEAM_MESSAGE_PROVENANCE_KEYS
+            if key in decoded and cls._team_provenance_field_valid(key, decoded[key])
+        }
 
     @staticmethod
     def _team_idempotency_key(request: dict[str, Any]) -> str:
@@ -8008,7 +11688,10 @@ class HubStore:
             "id": message_id,
             "sequence": int(row["queue_ordinal"]),
             "kind": row["kind"],
-            "title": row["title"],
+            # Old pre-V2 writers could persist a title on an ordinary message.
+            # Keep the wire contract strict so one legacy row cannot poison a
+            # client's entire inbox/feed response.
+            "title": row["title"] if row["kind"] == "skill" else None,
             "body_format": row["body_format"],
             "body_bytes": int(row["body_bytes"]),
             "body_sha256": bytes(row["body_sha256"]).hex(),
@@ -8025,7 +11708,7 @@ class HubStore:
                 if row["skill_id"] is not None
                 else None
             ),
-            "provenance": json.loads(str(row["provenance_json"] or "{}")),
+            "provenance": self._team_provenance_public(row["provenance_json"]),
             "created_at": _iso8601(row["created_at"]),
         }
         if include_body:
@@ -8098,6 +11781,8 @@ class HubStore:
         title = self._team_text(
             request.get("title"), "title", 1, MAX_TEAM_MESSAGE_TITLE_CHARS, allow_none=True
         )
+        if kind == "message" and title is not None:
+            raise HubError("invalid_request", "Only skill posts carry a title", 422)
         body, body_format, body_digest, body_bytes = self._team_body(request)
         provenance_json = self._team_provenance(request.get("provenance"))
         idempotency_key = self._team_idempotency_key(request)
@@ -8774,6 +12459,260 @@ class HubStore:
         return uploads / f"{attachment_id}.part"
 
     @staticmethod
+    def _team_attachment_file_signature(info: os.stat_result) -> tuple[int, ...]:
+        """Return the identity and mutation fields anchored by attachment I/O."""
+
+        return (
+            int(info.st_dev),
+            int(info.st_ino),
+            int(info.st_mode),
+            int(info.st_nlink),
+            int(info.st_uid),
+            int(info.st_size),
+            int(info.st_mtime_ns),
+            int(info.st_ctime_ns),
+        )
+
+    @classmethod
+    def _verify_team_attachment_descriptor(
+        cls,
+        descriptor: int,
+        *,
+        expected_size: int,
+        require_single_link: bool,
+        linked_stat: Callable[[], os.stat_result],
+    ) -> str:
+        """Hash one exact, stable private inode and verify its live pathname."""
+
+        before = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(before.st_mode)
+            or before.st_nlink < 1
+            or (require_single_link and before.st_nlink != 1)
+            or before.st_uid != os.getuid()
+            or stat.S_IMODE(before.st_mode) != 0o600
+            or before.st_size != expected_size
+        ):
+            raise PermissionError("Team attachment file is unsafe")
+        digest = hashlib.sha256()
+        offset = 0
+        while offset < expected_size:
+            block = os.pread(descriptor, min(1024 * 1024, expected_size - offset), offset)
+            if not block:
+                raise RuntimeError("Team attachment file changed while hashing")
+            digest.update(block)
+            offset += len(block)
+        after = os.fstat(descriptor)
+        linked = linked_stat()
+        signature = cls._team_attachment_file_signature(before)
+        if (
+            signature != cls._team_attachment_file_signature(after)
+            or signature != cls._team_attachment_file_signature(linked)
+        ):
+            raise RuntimeError("Team attachment file changed while hashing")
+        return digest.hexdigest()
+
+    def _open_verified_team_attachment_blob(
+        self,
+        storage_key: str,
+        byte_size: int,
+    ) -> int:
+        """Open and authenticate one immutable content-addressed attachment."""
+
+        path = self._team_attachment_storage_path(storage_key)
+        directory_flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
+        directory_flags |= getattr(os, "O_NOFOLLOW", 0) | getattr(
+            os, "O_DIRECTORY", 0
+        )
+        directory = os.open(path.parent, directory_flags)
+        descriptor = -1
+        try:
+            directory_info = os.fstat(directory)
+            if (
+                not stat.S_ISDIR(directory_info.st_mode)
+                or directory_info.st_uid != os.getuid()
+                or stat.S_IMODE(directory_info.st_mode) != 0o700
+            ):
+                raise PermissionError("Team attachment content directory is unsafe")
+            flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
+            flags |= getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
+            descriptor = os.open(path.name, flags, dir_fd=directory)
+            digest = self._verify_team_attachment_descriptor(
+                descriptor,
+                expected_size=byte_size,
+                # Snapshot generations may hold safe immutable hard links to
+                # a live blob while the attachment-control lease is held.
+                require_single_link=False,
+                linked_stat=lambda: os.stat(
+                    path.name,
+                    dir_fd=directory,
+                    follow_symlinks=False,
+                ),
+            )
+            if not hmac.compare_digest(digest, storage_key):
+                raise PermissionError("Team attachment digest is invalid")
+            return descriptor
+        except BaseException:
+            if descriptor >= 0:
+                os.close(descriptor)
+            raise
+        finally:
+            os.close(directory)
+
+    def _open_team_attachment_staging(
+        self,
+        attachment_id: str,
+        received: int,
+    ) -> tuple[int, int, str]:
+        """Create first-chunk staging exclusively or pin a safe resumed inode."""
+
+        staging = self._team_attachment_staging_path(attachment_id)
+        directory_flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
+        directory_flags |= getattr(os, "O_NOFOLLOW", 0) | getattr(
+            os, "O_DIRECTORY", 0
+        )
+        directory = os.open(staging.parent, directory_flags)
+        descriptor = -1
+        try:
+            directory_info = os.fstat(directory)
+            if (
+                not stat.S_ISDIR(directory_info.st_mode)
+                or directory_info.st_uid != os.getuid()
+                or stat.S_IMODE(directory_info.st_mode) != 0o700
+            ):
+                raise PermissionError("Team attachment staging directory is unsafe")
+            flags = os.O_RDWR | getattr(os, "O_CLOEXEC", 0)
+            flags |= getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
+            if received == 0:
+                # Never open/truncate an attacker-precreated hard link, FIFO,
+                # device, or stale pathname on the first chunk.
+                flags |= os.O_CREAT | os.O_EXCL
+            descriptor = os.open(staging.name, flags, 0o600, dir_fd=directory)
+            if received == 0:
+                os.fchmod(descriptor, 0o600)
+            opened = os.fstat(descriptor)
+            linked = os.stat(staging.name, dir_fd=directory, follow_symlinks=False)
+            if (
+                not stat.S_ISREG(opened.st_mode)
+                or opened.st_nlink != 1
+                or opened.st_uid != os.getuid()
+                or stat.S_IMODE(opened.st_mode) != 0o600
+                or self._team_attachment_file_signature(opened)
+                != self._team_attachment_file_signature(linked)
+            ):
+                raise PermissionError("Team attachment staging file is unsafe")
+            if opened.st_size > received:
+                # A crash after file fsync but before SQLite commit is safely
+                # resumable from the last durable database offset.
+                os.ftruncate(descriptor, received)
+            elif opened.st_size < received:
+                raise RuntimeError("Team attachment upload state was lost")
+            current = os.fstat(descriptor)
+            linked = os.stat(staging.name, dir_fd=directory, follow_symlinks=False)
+            if (
+                current.st_size != received
+                or self._team_attachment_file_signature(current)
+                != self._team_attachment_file_signature(linked)
+            ):
+                raise RuntimeError("Team attachment staging file changed")
+            return descriptor, directory, staging.name
+        except BaseException:
+            if descriptor >= 0:
+                os.close(descriptor)
+            os.close(directory)
+            raise
+
+    def _team_attachment_staging_absent(self, attachment_id: str) -> bool:
+        """Observe exact staging-name absence through its private directory."""
+
+        staging = self._team_attachment_staging_path(attachment_id)
+        directory_flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
+        directory_flags |= getattr(os, "O_NOFOLLOW", 0) | getattr(
+            os, "O_DIRECTORY", 0
+        )
+        directory = os.open(staging.parent, directory_flags)
+        try:
+            directory_info = os.fstat(directory)
+            if (
+                not stat.S_ISDIR(directory_info.st_mode)
+                or directory_info.st_uid != os.getuid()
+                or stat.S_IMODE(directory_info.st_mode) != 0o700
+            ):
+                raise PermissionError("Team attachment staging directory is unsafe")
+            try:
+                os.stat(staging.name, dir_fd=directory, follow_symlinks=False)
+            except FileNotFoundError:
+                return True
+            return False
+        finally:
+            os.close(directory)
+
+    @classmethod
+    def _unlink_open_team_attachment_staging(
+        cls,
+        descriptor: int,
+        directory: int,
+        filename: str,
+    ) -> None:
+        """Unlink only when the staging name still denotes the pinned inode."""
+
+        opened = os.fstat(descriptor)
+        linked = os.stat(filename, dir_fd=directory, follow_symlinks=False)
+        if (
+            opened.st_nlink != 1
+            or cls._team_attachment_file_signature(opened)
+            != cls._team_attachment_file_signature(linked)
+        ):
+            raise RuntimeError("Team attachment staging file changed")
+        os.unlink(filename, dir_fd=directory)
+        os.fsync(directory)
+
+    def _mark_team_attachment_ready_locked(
+        self,
+        connection: sqlite3.Connection,
+        row: sqlite3.Row,
+        claims: AccessClaims,
+        team_id: str,
+        timestamp: int,
+    ) -> None:
+        """Publish ready metadata, audit, and outbox in the caller's transaction."""
+
+        attachment_id = str(row["id"])
+        byte_size = int(row["byte_size"])
+        connection.execute(
+            """
+            UPDATE team_attachments
+            SET received_bytes=?,state='ready',ready_at=?,expires_at=?
+            WHERE id=? AND state='uploading'
+            """,
+            (
+                byte_size,
+                timestamp,
+                timestamp + TEAM_ATTACHMENT_UPLOAD_TTL_SECONDS,
+                attachment_id,
+            ),
+        )
+        self._audit(
+            connection,
+            team_id,
+            claims.principal_id,
+            "team.attachment.ready",
+            "team_attachment",
+            attachment_id,
+            "succeeded",
+            {"byte_size": byte_size},
+            timestamp,
+        )
+        self._outbox(
+            connection,
+            team_id,
+            "team_attachment",
+            attachment_id,
+            "team.attachment.ready",
+            timestamp,
+        )
+
+    @staticmethod
     def _validate_team_attachment_cleanup_key(path_kind: str, path_key: str) -> None:
         if path_kind == "staging" and TEAM_ATTACHMENT_ID_RE.fullmatch(path_key):
             return
@@ -8814,7 +12753,9 @@ class HubStore:
             ):
                 raise PermissionError("Team attachment cleanup directory is unsafe")
             file_flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
-            file_flags |= getattr(os, "O_NOFOLLOW", 0)
+            file_flags |= getattr(os, "O_NOFOLLOW", 0) | getattr(
+                os, "O_NONBLOCK", 0
+            )
             try:
                 descriptor = os.open(filename, file_flags, dir_fd=directory)
             except FileNotFoundError:
@@ -8827,7 +12768,8 @@ class HubStore:
             linked = os.stat(filename, dir_fd=directory, follow_symlinks=False)
             if (
                 not stat.S_ISREG(opened.st_mode)
-                or opened.st_nlink != 1
+                or opened.st_nlink < 1
+                or (path_kind == "staging" and opened.st_nlink != 1)
                 or opened.st_uid != os.getuid()
                 or stat.S_IMODE(opened.st_mode) != 0o600
                 or (opened.st_dev, opened.st_ino) != (linked.st_dev, linked.st_ino)
@@ -9021,7 +12963,6 @@ class HubStore:
                     )
                 _sender_kind, uploader_node_id = self._team_sender(connection, claims, team_id)
                 attachment_id = _id("tatt")
-                storage_path = self._team_attachment_storage_path(storage_key)
                 duplicate_ready = connection.execute(
                     """
                     SELECT 1 FROM team_attachments
@@ -9031,11 +12972,24 @@ class HubStore:
                     """,
                     (team_id, storage_key, byte_size, timestamp),
                 ).fetchone()
-                already_stored = (
-                    duplicate_ready is not None
-                    and storage_path.is_file()
-                    and storage_path.stat().st_size == byte_size
-                )
+                already_stored = False
+                if duplicate_ready is not None:
+                    verified_descriptor = -1
+                    try:
+                        verified_descriptor = self._open_verified_team_attachment_blob(
+                            storage_key,
+                            byte_size,
+                        )
+                    except (OSError, RuntimeError):
+                        # Corrupt or unsafe bytes are never promoted by
+                        # metadata-only deduplication. A fresh upload can
+                        # repair the content-addressed name atomically.
+                        pass
+                    else:
+                        already_stored = True
+                    finally:
+                        if verified_descriptor >= 0:
+                            os.close(verified_descriptor)
                 connection.execute(
                     """
                     INSERT INTO team_attachments(
@@ -9203,6 +13157,46 @@ class HubStore:
                     raise HubError(
                         "attachment_unavailable", "Attachment upload failed; declare it again", 409
                     )
+                if offset == received and received + len(data) == byte_size:
+                    # os.replace()+directory fsync can survive a process death
+                    # before the surrounding SQLite transaction commits ready
+                    # metadata. Reconcile only an exact final-chunk replay: the
+                    # staging name must be absent, the content-addressed final
+                    # inode must fully authenticate, and its replayed suffix
+                    # must equal this request.
+                    final_descriptor = -1
+                    if self._team_attachment_staging_absent(attachment_id):
+                        try:
+                            final_descriptor = self._open_verified_team_attachment_blob(
+                                str(row["storage_key"]),
+                                byte_size,
+                            )
+                        except (OSError, RuntimeError):
+                            pass
+                        else:
+                            replayed = os.pread(final_descriptor, len(data), offset)
+                            if (
+                                hmac.compare_digest(replayed, data)
+                                and self._team_attachment_staging_absent(attachment_id)
+                            ):
+                                self._mark_team_attachment_ready_locked(
+                                    connection,
+                                    row,
+                                    claims,
+                                    team_id,
+                                    timestamp,
+                                )
+                                updated = connection.execute(
+                                    "SELECT * FROM team_attachments WHERE team_id=? AND id=?",
+                                    (team_id, attachment_id),
+                                ).fetchone()
+                                assert updated is not None
+                                return {
+                                    "attachment": self._team_attachment_public(updated)
+                                }
+                        finally:
+                            if final_descriptor >= 0:
+                                os.close(final_descriptor)
                 if offset + len(data) <= received:
                     return {"attachment": self._team_attachment_public(row)}
                 if offset != received:
@@ -9211,98 +13205,146 @@ class HubStore:
                     raise HubError(
                         "invalid_request", "Attachment chunk exceeds the declared size", 422
                     )
-                staging = self._team_attachment_staging_path(attachment_id)
-                flags = os.O_WRONLY | os.O_CREAT | getattr(os, "O_CLOEXEC", 0)
-                flags |= getattr(os, "O_NOFOLLOW", 0)
-                descriptor = os.open(staging, flags, 0o600)
+                descriptor = -1
+                staging_directory = -1
                 try:
-                    current_size = os.fstat(descriptor).st_size
-                    if current_size > received:
-                        os.ftruncate(descriptor, received)
-                    elif current_size < received:
+                    try:
+                        (
+                            descriptor,
+                            staging_directory,
+                            staging_filename,
+                        ) = self._open_team_attachment_staging(
+                            attachment_id,
+                            received,
+                        )
+                    except (OSError, RuntimeError) as exc:
                         raise _TeamAttachmentFailure(
                             HubError(
                                 "attachment_unavailable",
-                                "Attachment upload state was lost; declare it again",
+                                "Attachment upload staging is unsafe; declare it again",
                                 409,
                             )
-                        )
+                        ) from exc
                     os.lseek(descriptor, received, os.SEEK_SET)
                     view = memoryview(data)
                     while view:
                         written = os.write(descriptor, view)
+                        if written <= 0:
+                            raise OSError("Attachment staging write made no progress")
                         view = view[written:]
                     os.fsync(descriptor)
-                finally:
-                    os.close(descriptor)
-                new_received = received + len(data)
-                if new_received < byte_size:
-                    connection.execute(
-                        "UPDATE team_attachments SET received_bytes=? WHERE id=?",
-                        (new_received, attachment_id),
-                    )
-                else:
-                    digest = hashlib.sha256()
-                    with open(staging, "rb") as handle:
-                        while True:
-                            block = handle.read(1024 * 1024)
-                            if not block:
-                                break
-                            digest.update(block)
-                    if digest.hexdigest() != str(row["storage_key"]):
-                        with suppress(OSError):
-                            staging.unlink()
-                        raise _TeamAttachmentFailure(
-                            HubError(
-                                "attachment_hash_mismatch",
-                                "Uploaded bytes do not match the declared SHA-256",
-                                422,
-                            )
+                    new_received = received + len(data)
+                    if new_received < byte_size:
+                        connection.execute(
+                            "UPDATE team_attachments SET received_bytes=? WHERE id=?",
+                            (new_received, attachment_id),
                         )
-                    final = self._team_attachment_storage_path(str(row["storage_key"]))
-                    final.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-                    if final.is_file() and final.stat().st_size == byte_size:
-                        with suppress(OSError):
-                            staging.unlink()
                     else:
-                        os.replace(staging, final)
-                        os.chmod(final, 0o600)
-                        directory = os.open(final.parent, os.O_RDONLY)
                         try:
-                            os.fsync(directory)
+                            digest = self._verify_team_attachment_descriptor(
+                                descriptor,
+                                expected_size=byte_size,
+                                require_single_link=True,
+                                linked_stat=lambda: os.stat(
+                                    staging_filename,
+                                    dir_fd=staging_directory,
+                                    follow_symlinks=False,
+                                ),
+                            )
+                        except (OSError, RuntimeError) as exc:
+                            raise _TeamAttachmentFailure(
+                                HubError(
+                                    "attachment_unavailable",
+                                    "Attachment upload staging changed; declare it again",
+                                    409,
+                                )
+                            ) from exc
+                        if not hmac.compare_digest(digest, str(row["storage_key"])):
+                            with suppress(OSError, RuntimeError):
+                                self._unlink_open_team_attachment_staging(
+                                    descriptor,
+                                    staging_directory,
+                                    staging_filename,
+                                )
+                            raise _TeamAttachmentFailure(
+                                HubError(
+                                    "attachment_hash_mismatch",
+                                    "Uploaded bytes do not match the declared SHA-256",
+                                    422,
+                                )
+                            )
+                        final = self._team_attachment_storage_path(
+                            str(row["storage_key"])
+                        )
+                        ensure_private_directory(final.parent)
+                        directory_flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
+                        directory_flags |= getattr(os, "O_NOFOLLOW", 0) | getattr(
+                            os, "O_DIRECTORY", 0
+                        )
+                        final_directory = os.open(final.parent, directory_flags)
+                        try:
+                            directory_info = os.fstat(final_directory)
+                            if (
+                                not stat.S_ISDIR(directory_info.st_mode)
+                                or directory_info.st_uid != os.getuid()
+                                or stat.S_IMODE(directory_info.st_mode) != 0o700
+                            ):
+                                raise PermissionError(
+                                    "Team attachment content directory is unsafe"
+                                )
+                            opened = os.fstat(descriptor)
+                            linked = os.stat(
+                                staging_filename,
+                                dir_fd=staging_directory,
+                                follow_symlinks=False,
+                            )
+                            if (
+                                opened.st_nlink != 1
+                                or self._team_attachment_file_signature(opened)
+                                != self._team_attachment_file_signature(linked)
+                            ):
+                                raise PermissionError(
+                                    "Team attachment staging file changed"
+                                )
+                            # The verified staging inode is authoritative. A
+                            # same-sized blob at the digest name may be corrupt;
+                            # replacing the name is atomic and leaves existing
+                            # download descriptors safely pinned to their inode.
+                            os.replace(
+                                staging_filename,
+                                final.name,
+                                src_dir_fd=staging_directory,
+                                dst_dir_fd=final_directory,
+                            )
+                            published = os.stat(
+                                final.name,
+                                dir_fd=final_directory,
+                                follow_symlinks=False,
+                            )
+                            after = os.fstat(descriptor)
+                            if (
+                                self._team_attachment_file_signature(after)
+                                != self._team_attachment_file_signature(published)
+                            ):
+                                raise RuntimeError(
+                                    "Team attachment publication changed inode"
+                                )
+                            os.fsync(final_directory)
+                            os.fsync(staging_directory)
                         finally:
-                            os.close(directory)
-                    connection.execute(
-                        """
-                        UPDATE team_attachments
-                        SET received_bytes=?,state='ready',ready_at=?,expires_at=? WHERE id=?
-                        """,
-                        (
-                            byte_size,
+                            os.close(final_directory)
+                        self._mark_team_attachment_ready_locked(
+                            connection,
+                            row,
+                            claims,
+                            team_id,
                             timestamp,
-                            timestamp + TEAM_ATTACHMENT_UPLOAD_TTL_SECONDS,
-                            attachment_id,
-                        ),
-                    )
-                    self._audit(
-                        connection,
-                        team_id,
-                        claims.principal_id,
-                        "team.attachment.ready",
-                        "team_attachment",
-                        attachment_id,
-                        "succeeded",
-                        {"byte_size": byte_size},
-                        timestamp,
-                    )
-                    self._outbox(
-                        connection,
-                        team_id,
-                        "team_attachment",
-                        attachment_id,
-                        "team.attachment.ready",
-                        timestamp,
-                    )
+                        )
+                finally:
+                    if descriptor >= 0:
+                        os.close(descriptor)
+                    if staging_directory >= 0:
+                        os.close(staging_directory)
                 updated = connection.execute(
                     "SELECT * FROM team_attachments WHERE team_id=? AND id=?",
                     (team_id, attachment_id),
@@ -9387,14 +13429,12 @@ class HubStore:
                 raise HubError(
                     "attachment_unavailable", "Attachment upload is not complete", 409
                 )
-            path = self._team_attachment_storage_path(str(row["storage_key"]))
-            flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
-            flags |= getattr(os, "O_NOFOLLOW", 0)
-            flags |= getattr(os, "O_NONBLOCK", 0)
             try:
-                descriptor = os.open(path, flags)
-                info = os.fstat(descriptor)
-            except OSError as exc:
+                descriptor = self._open_verified_team_attachment_blob(
+                    str(row["storage_key"]),
+                    int(row["byte_size"]),
+                )
+            except (OSError, RuntimeError) as exc:
                 if descriptor >= 0:
                     with suppress(OSError):
                         os.close(descriptor)
@@ -9402,16 +13442,6 @@ class HubStore:
                 raise HubError(
                     "attachment_unavailable", "Attachment bytes are unavailable", 404
                 ) from exc
-            if (
-                not stat.S_ISREG(info.st_mode)
-                or info.st_uid != os.getuid()
-                or info.st_size != int(row["byte_size"])
-            ):
-                os.close(descriptor)
-                descriptor = -1
-                raise HubError(
-                    "attachment_unavailable", "Attachment bytes are unavailable", 404
-                )
             public = self._team_attachment_public(row)
             connection.execute("COMMIT")
             pinned_descriptor = descriptor
@@ -9468,20 +13498,19 @@ class HubStore:
                     "attachment_unavailable", "Attachment upload is not complete", 409
                 )
             path = self._team_attachment_storage_path(str(row["storage_key"]))
+            descriptor = -1
             try:
-                info = path.stat(follow_symlinks=False)
-            except OSError as exc:
+                descriptor = self._open_verified_team_attachment_blob(
+                    str(row["storage_key"]),
+                    int(row["byte_size"]),
+                )
+            except (OSError, RuntimeError) as exc:
                 raise HubError(
                     "attachment_unavailable", "Attachment bytes are unavailable", 404
                 ) from exc
-            if (
-                not stat.S_ISREG(info.st_mode)
-                or info.st_uid != os.getuid()
-                or info.st_size != int(row["byte_size"])
-            ):
-                raise HubError(
-                    "attachment_unavailable", "Attachment bytes are unavailable", 404
-                )
+            finally:
+                if descriptor >= 0:
+                    os.close(descriptor)
             public = self._team_attachment_public(row)
             connection.execute("COMMIT")
             return public, path
@@ -9545,9 +13574,12 @@ class HubStore:
                     connection.execute(
                         "DELETE FROM team_attachments WHERE id=?", (attachment_id,)
                     )
-                for storage_key in {
-                    str(row["storage_key"]) for row in stale if row["state"] == "ready"
-                }:
+                # An uploading row may already have published its verified
+                # final blob if the process died after rename+fsync but before
+                # the SQLite ready transaction committed. Queue every expired
+                # row's content key; missing files are replay-safe cleanup, and
+                # a surviving ready reference protects shared content below.
+                for storage_key in {str(row["storage_key"]) for row in stale}:
                     self._validate_team_attachment_cleanup_key("content", storage_key)
                     still_referenced = connection.execute(
                         """

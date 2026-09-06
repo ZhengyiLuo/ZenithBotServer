@@ -59,6 +59,7 @@ class TeamNetworkHarness:
             root / "host-hub",
             managed_host_identity=HOST_SERVER_IDENTITY,
             managed_server_instance_id="team_network_host_instance",
+            managed_host_display_name="Sonic",
         )
         proof = (root / "host-hub" / "bootstrap-owner.proof").read_text().strip()
         bootstrap = self.hub.bootstrap(
@@ -471,11 +472,40 @@ class TeamNetworkE2EAcceptanceTests(unittest.TestCase):
         host_node_id = host_servers[HOST_SERVER_IDENTITY]["id"]
         member_node_id = host_servers[MEMBER_SERVER_IDENTITY]["id"]
         self.assertTrue(host_servers[HOST_SERVER_IDENTITY]["is_host"])
+        self.assertEqual(host_servers[HOST_SERVER_IDENTITY]["display_name"], "Sonic")
+        self.assertEqual(peer_servers[HOST_SERVER_IDENTITY]["display_name"], "Sonic")
         self.assertTrue(host_servers[HOST_SERVER_IDENTITY]["owned_by_caller"])
         self.assertFalse(host_servers[MEMBER_SERVER_IDENTITY]["owned_by_caller"])
         self.assertTrue(peer_servers[MEMBER_SERVER_IDENTITY]["owned_by_caller"])
         self.assertFalse(peer_servers[HOST_SERVER_IDENTITY]["owned_by_caller"])
         self.assertTrue(all(server["status"] == "active" for server in host_servers.values()))
+
+        host_reference = {
+            "team_id": network.team_id,
+            "recipient_kind": "server",
+            "target_id": host_node_id,
+            "display_name_snapshot": "Sonic",
+        }
+        self.assertEqual(
+            network.member.resolve_team_references([host_reference]),
+            [host_reference],
+        )
+        with self.assertRaises(SecurePeerError) as stale_alias:
+            network.member.resolve_team_references([
+                {
+                    **host_reference,
+                    "display_name_snapshot": "Host server",
+                }
+            ])
+        self.assertEqual(stale_alias.exception.code, "team_reference_invalid")
+        remote_routes = network.member.agent_mail_route_profiles()
+        self.assertIn(
+            (host_node_id, "Sonic"),
+            {
+                (route["destination_id"], route["display_name"])
+                for route in remote_routes
+            },
+        )
 
         host_agent = network.hub.register_network_agent(
             network.owner,
@@ -618,15 +648,14 @@ class TeamNetworkE2EAcceptanceTests(unittest.TestCase):
             f"/v1/teams/{network.team_id}/network/mailbox",
             body={
                 "to": {"kind": "server", "id": host_node_id},
-                "from_agent_id": member_agent["id"],
+                "from_agent_id": None,
                 "body": "Peer mailbox item",
                 "body_format": "markdown",
                 "idempotency_key": _uuid(),
             },
         )
-        self.assertEqual(peer_to_host["item"]["from"]["kind"], "agent")
-        self.assertEqual(peer_to_host["item"]["from"]["id"], member_agent["id"])
-        self.assertEqual(peer_to_host["item"]["from"]["server_id"], member_node_id)
+        self.assertEqual(peer_to_host["item"]["from"]["kind"], "server")
+        self.assertEqual(peer_to_host["item"]["from"]["id"], member_node_id)
         host_mailbox = network.hub.list_network_mailbox(
             network.owner,
             network.team_id,
@@ -661,7 +690,7 @@ class TeamNetworkE2EAcceptanceTests(unittest.TestCase):
             network.owner,
             network.team_id,
             {
-                "to": {"kind": "agent", "id": member_agent["id"]},
+                "to": {"kind": "server", "id": member_node_id},
                 "from_agent_id": None,
                 "body": "Please acknowledge this passive request",
                 "body_format": "plain",
@@ -672,16 +701,16 @@ class TeamNetworkE2EAcceptanceTests(unittest.TestCase):
         request_id = passive_request["request"]["id"]
         self.assertEqual(request_id, passive_request["item"]["id"])
         self.assertEqual(passive_request["request"]["status"], "open")
-        agent_mailbox = network.peer_proxy_json(
+        member_request_mailbox = network.peer_proxy_json(
             "GET",
             f"/v1/teams/{network.team_id}/network/mailbox",
             query=(
-                f"address_kind=agent&address_id={member_agent['id']}"
-                "&after_sequence=0&limit=100"
+                f"address_kind=server&address_id={member_node_id}"
+                f"&after_sequence={host_to_peer['item']['sequence']}&limit=100"
             ),
         )
         self.assertEqual(
-            [entry["item"]["id"] for entry in agent_mailbox["items"]],
+            [entry["item"]["id"] for entry in member_request_mailbox["items"]],
             [request_id],
         )
         request_before_reply = network.peer_proxy_json(
@@ -696,27 +725,28 @@ class TeamNetworkE2EAcceptanceTests(unittest.TestCase):
             "POST",
             f"/v1/teams/{network.team_id}/network/requests/{request_id}/replies",
             body={
-                "from_agent_id": member_agent["id"],
+                "from_agent_id": None,
                 "body": "Acknowledged",
                 "body_format": "plain",
                 "idempotency_key": _uuid(),
             },
         )
         self.assertEqual(reply["item"]["kind"], "reply")
-        self.assertEqual(reply["item"]["from"]["id"], member_agent["id"])
+        self.assertEqual(reply["item"]["from"]["kind"], "server")
+        self.assertEqual(reply["item"]["from"]["id"], member_node_id)
         self.assertEqual(reply["item"]["to"]["id"], network.owner.principal_id)
         self.assertEqual(reply["request"]["status"], "replied")
         self.assertEqual(reply["request"]["reply_item_id"], reply["item"]["id"])
-        peer_human_mailbox = network.peer_proxy_json(
-            "GET",
-            f"/v1/teams/{network.team_id}/network/mailbox",
-            query=(
-                "address_kind=human&address_id="
-                f"{network.owner.principal_id}&after_sequence=0&limit=100"
-            ),
-            expected_status=422,
-        )
-        self.assertEqual(peer_human_mailbox["error"]["code"], "invalid_request")
+        with self.assertRaises(SecurePeerError) as peer_human_mailbox:
+            network.peer_proxy_json(
+                "GET",
+                f"/v1/teams/{network.team_id}/network/mailbox",
+                query=(
+                    "address_kind=human&address_id="
+                    f"{network.owner.principal_id}&after_sequence=0&limit=100"
+                ),
+            )
+        self.assertEqual(peer_human_mailbox.exception.code, "invalid_request")
         reopened_hub = HubStore(
             network.root / "host-hub",
             managed_host_identity=HOST_SERVER_IDENTITY,
@@ -757,7 +787,7 @@ class TeamNetworkE2EAcceptanceTests(unittest.TestCase):
             "POST",
             f"/v1/teams/{network.team_id}/network/requests/{request_id}/replies",
             body={
-                "from_agent_id": member_agent["id"],
+                "from_agent_id": None,
                 "body": "A duplicate reply",
                 "body_format": "plain",
                 "idempotency_key": _uuid(),

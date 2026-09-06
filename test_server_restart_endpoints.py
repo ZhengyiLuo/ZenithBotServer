@@ -78,6 +78,7 @@ def restart_body(
     server_instance_id: str = SERVER_INSTANCE_ID,
     force: bool = False,
     blocker_revision: str | None = None,
+    omit_revision: bool = False,
 ) -> agent_server.ServerRestartRequest:
     fields = {
         "request_id": request_id or uuid.uuid4(),
@@ -89,13 +90,14 @@ def restart_body(
         fields.update({
             "force": True,
             "force_confirmed": True,
-            "expected_blocker_revision": (
+        })
+        if not omit_revision:
+            fields["expected_blocker_revision"] = (
                 blocker_revision
                 or agent_server.server_restart_blocker_snapshot_locked()[
                     "revision"
                 ]
-            ),
-        })
+            )
     return agent_server.ServerRestartRequest(
         **fields,
     )
@@ -114,6 +116,13 @@ def restart_environment(root: Path):
             "SERVER_UPDATE_STATUS_FILE",
             root / "admin" / "server-update.json",
         ))
+        # The hard-kill watchdog consults the provider-child registry before
+        # SIGKILL; keep the test from reading the real state directory.
+        stack.enter_context(patch.object(
+            agent_server,
+            "PROVIDER_CHILDREN_FILE",
+            root / "admin" / "provider-children.json",
+        ))
         stack.enter_context(patch.object(agent_server, "AGENT_TOKEN", TOKEN))
         stack.enter_context(patch.object(
             agent_server,
@@ -129,6 +138,13 @@ def restart_environment(root: Path):
             agent_server,
             "detect_managed_server_service_kind",
             return_value="systemd-user",
+        ))
+        # The restart path consults the cached positive proof first; keep the
+        # cache empty so each test's patched probe decides.
+        stack.enter_context(patch.object(
+            agent_server,
+            "MANAGED_SERVER_SERVICE_KIND_CACHE",
+            None,
         ))
         stack.enter_context(patch.object(agent_server, "BUSY_SESSIONS", set()))
         stack.enter_context(patch.object(
@@ -146,7 +162,7 @@ def restart_environment(root: Path):
         stack.enter_context(patch.object(agent_server, "RUN_NOW_TURNS", {}))
         stack.enter_context(patch.object(
             agent_server,
-            "active_provider_background_work_labels",
+            "provider_background_work_labels_from_snapshot",
             return_value=[],
         ))
         stack.enter_context(patch.object(
@@ -159,7 +175,13 @@ def restart_environment(root: Path):
             "UNSAFE_HTTP_MUTATION_TASKS",
             {},
         ))
-        yield
+        # The forced path signals from a real thread that would SIGTERM the
+        # test runner. Stub the thread starter and hand it back for assertions.
+        forced_signal = stack.enter_context(patch.object(
+            agent_server,
+            "start_forced_server_restart_signal_thread",
+        ))
+        yield forced_signal
 
 
 class ServerRestartStateTests(unittest.TestCase):
@@ -272,8 +294,12 @@ class ServerRestartStateTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             request_id = str(uuid.uuid4())
+            # Behavior change: every managed restart now arms the hard-kill
+            # watchdog thread. With time.sleep patched a real thread would
+            # SIGKILL the test runner, so the thread is stubbed here.
             with restart_environment(root), \
                  patch.object(agent_server.time, "sleep"), \
+                 patch.object(agent_server.threading, "Thread"), \
                  patch.object(agent_server.os, "getpid", return_value=321), \
                  patch.object(agent_server.os, "kill") as kill:
                 agent_server.write_server_restart_status(
@@ -293,6 +319,7 @@ class ServerRestartStateTests(unittest.TestCase):
             request_id = str(uuid.uuid4())
             with restart_environment(root), \
                  patch.object(agent_server.time, "sleep"), \
+                 patch.object(agent_server.threading, "Thread"), \
                  patch.object(agent_server.os, "kill", side_effect=OSError("denied")):
                 agent_server.write_server_restart_status(
                     phase="accepted",
@@ -324,6 +351,88 @@ class ServerRestartStateTests(unittest.TestCase):
                 )
                 agent_server.signal_managed_server_restart(request_id)
 
+        # Behavior change: the watchdog is now armed for every managed
+        # restart; a forced restart selects the short emergency deadline.
+        thread.assert_called_once_with(
+            target=agent_server.force_kill_managed_server_after_deadline,
+            args=(
+                request_id,
+                321,
+                agent_server.SERVER_RESTART_FORCE_KILL_DELAY_SECONDS,
+            ),
+            daemon=True,
+            name="agents-server-force-restart",
+        )
+        watchdog.start.assert_called_once_with()
+        kill.assert_called_once_with(321, signal.SIGTERM)
+
+    def test_force_kill_watchdog_kills_unconditionally_after_deadline(self):
+        # An emergency restart must not be cancellable by a concurrent journal
+        # write, a superseding request, or an unreadable journal. The only
+        # guard is that the watchdog signals the process that armed it.
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            request_id = str(uuid.uuid4())
+            with restart_environment(root), \
+                 patch.object(agent_server.time, "sleep"), \
+                 patch.object(agent_server.os, "getpid", return_value=321), \
+                 patch.object(agent_server.os, "kill") as kill:
+                agent_server.write_server_restart_status(
+                    phase="signaling",
+                    request_id="different-request",
+                    _source_instance_id="other-instance",
+                    _forced=False,
+                )
+                agent_server.force_kill_managed_server_after_deadline(
+                    request_id,
+                    321,
+                )
+                with patch.object(
+                    agent_server,
+                    "read_server_restart_status",
+                    side_effect=OSError("journal unreadable"),
+                ):
+                    agent_server.force_kill_managed_server_after_deadline(
+                        request_id,
+                        321,
+                    )
+                # Never signal a pid other than the process that armed it.
+                agent_server.force_kill_managed_server_after_deadline(
+                    request_id,
+                    999,
+                )
+
+        self.assertEqual(
+            kill.call_args_list,
+            [((321, signal.SIGKILL),), ((321, signal.SIGKILL),)],
+        )
+
+    def test_forced_signal_worker_arms_watchdog_and_sigterms_without_journal(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            request_id = str(uuid.uuid4())
+            watchdog = MagicMock()
+            with restart_environment(root), \
+                 patch.object(agent_server.time, "sleep"), \
+                 patch.object(agent_server.os, "getpid", return_value=321), \
+                 patch.object(agent_server.os, "kill") as kill, \
+                 patch.object(
+                     agent_server,
+                     "read_server_restart_status",
+                     side_effect=OSError("journal unreadable"),
+                 ), \
+                 patch.object(
+                     agent_server,
+                     "write_server_restart_status",
+                     side_effect=OSError("disk full"),
+                 ), \
+                 patch.object(
+                     agent_server.threading,
+                     "Thread",
+                     return_value=watchdog,
+                 ) as thread:
+                agent_server.signal_forced_server_restart(request_id)
+
         thread.assert_called_once_with(
             target=agent_server.force_kill_managed_server_after_deadline,
             args=(request_id, 321),
@@ -333,35 +442,24 @@ class ServerRestartStateTests(unittest.TestCase):
         watchdog.start.assert_called_once_with()
         kill.assert_called_once_with(321, signal.SIGTERM)
 
-    def test_force_kill_watchdog_rechecks_request_instance_and_force_fences(self):
+    def test_forced_signal_worker_stands_down_after_duplicate_signal(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             request_id = str(uuid.uuid4())
             with restart_environment(root), \
                  patch.object(agent_server.time, "sleep"), \
-                 patch.object(agent_server.os, "kill") as kill:
+                 patch.object(agent_server.os, "kill") as kill, \
+                 patch.object(agent_server.threading, "Thread") as thread:
                 agent_server.write_server_restart_status(
                     phase="signaling",
                     request_id=request_id,
                     _source_instance_id=SERVER_INSTANCE_ID,
                     _forced=True,
                 )
-                agent_server.force_kill_managed_server_after_deadline(
-                    request_id,
-                    321,
-                )
-                agent_server.write_server_restart_status(
-                    phase="signaling",
-                    request_id="different-request",
-                    _source_instance_id=SERVER_INSTANCE_ID,
-                    _forced=True,
-                )
-                agent_server.force_kill_managed_server_after_deadline(
-                    request_id,
-                    321,
-                )
+                agent_server.signal_forced_server_restart(request_id)
 
-        kill.assert_called_once_with(321, signal.SIGKILL)
+        thread.assert_not_called()
+        kill.assert_not_called()
 
     def test_duplicate_signal_workers_claim_only_one_restart(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -369,6 +467,7 @@ class ServerRestartStateTests(unittest.TestCase):
             request_id = str(uuid.uuid4())
             with restart_environment(root), \
                  patch.object(agent_server.time, "sleep"), \
+                 patch.object(agent_server.threading, "Thread"), \
                  patch.object(agent_server.os, "getpid", return_value=321), \
                  patch.object(agent_server.os, "kill") as kill:
                 agent_server.write_server_restart_status(
@@ -658,7 +757,11 @@ class ServerRestartEndpointTests(unittest.IsolatedAsyncioTestCase):
             "action": None,
         }
         capability_builder = MagicMock(return_value=capability)
-        with patch.object(agent_server, "SERVER_INSTANCE_ID", SERVER_INSTANCE_ID), \
+        # Other modules can leave queued rows in module-global state; the
+        # capability contract must be asserted against an isolated snapshot.
+        with tempfile.TemporaryDirectory() as temporary, \
+             restart_environment(Path(temporary)), \
+             patch.object(agent_server, "SERVER_INSTANCE_ID", SERVER_INSTANCE_ID), \
              patch.object(agent_server, "server_restart_capability", capability_builder), \
              patch.object(
                  agent_server,
@@ -673,13 +776,18 @@ class ServerRestartEndpointTests(unittest.IsolatedAsyncioTestCase):
         snapshot = capability_builder.call_args.args[0]
         self.assertEqual(snapshot["version"], 2)
         self.assertRegex(snapshot["revision"], r"^[0-9a-f]{64}$")
-        self.assertFalse(snapshot["has_blockers"])
+        self.assertFalse(snapshot["has_blockers"], snapshot)
 
     async def test_authenticated_get_exposes_bounded_private_blocker_digest(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             with restart_environment(root), \
                  patch.object(agent_server, "BUSY_SESSIONS", {"private-chat-id"}), \
+                 patch.object(
+                     agent_server,
+                     "provider_background_work_labels_from_snapshot",
+                     return_value=["private provider label"],
+                 ), \
                  patch.object(
                      agent_server,
                      "active_provider_background_work_labels",
@@ -715,6 +823,10 @@ class ServerRestartEndpointTests(unittest.IsolatedAsyncioTestCase):
                     agent_server,
                     "detect_managed_server_service_kind",
                     return_value=None,
+                ), patch.object(
+                    agent_server,
+                    "MANAGED_SERVER_SERVICE_KIND_CACHE",
+                    None,
                 ), self.assertRaises(HTTPException) as unmanaged:
                     agent_server.require_server_restart_control(http_request())
                 self.assertEqual(unmanaged.exception.status_code, 503)
@@ -729,6 +841,54 @@ class ServerRestartEndpointTests(unittest.IsolatedAsyncioTestCase):
                         http_request(token=None)
                     )
                 self.assertEqual(unavailable.exception.status_code, 503)
+
+    async def test_restart_auth_accepts_one_documented_header_and_rejects_ambiguity(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            with restart_environment(root):
+                accepted = (
+                    [(b"x-agentsdock-token", TOKEN.encode())],
+                    [(b"x-zenithdock-token", TOKEN.encode())],
+                    [(b"authorization", f"Bearer {TOKEN}".encode())],
+                )
+                for headers in accepted:
+                    with self.subTest(accepted=headers):
+                        request = http_request(token=None)
+                        request.scope["headers"] = headers
+                        agent_server.require_server_restart_control(request)
+
+                rejected = (
+                    [
+                        (b"x-agentsdock-token", TOKEN.encode()),
+                        (b"x-agentsdock-token", TOKEN.encode()),
+                    ],
+                    [
+                        (b"x-agentsdock-token", TOKEN.encode()),
+                        (b"x-zenithdock-token", TOKEN.encode()),
+                    ],
+                    [
+                        (b"x-agentsdock-token", TOKEN.encode()),
+                        (b"authorization", f"Bearer {TOKEN}".encode()),
+                    ],
+                )
+                for headers in rejected:
+                    with self.subTest(rejected=headers):
+                        with self.assertRaises(
+                            HTTPException
+                        ) as unauthorized:
+                            request = http_request(token=None)
+                            request.scope["headers"] = headers
+                            agent_server.require_server_restart_control(request)
+                        self.assertEqual(
+                            unauthorized.exception.status_code,
+                            401,
+                        )
+
+                with self.assertRaises(HTTPException) as query_ambiguity:
+                    agent_server.require_server_restart_control(
+                        http_request(query=f"token={TOKEN}")
+                    )
+                self.assertEqual(query_ambiguity.exception.status_code, 401)
 
     async def test_restart_routes_reject_browser_ambient_authority_headers(self):
         forbidden_headers = (
@@ -920,6 +1080,60 @@ class ServerRestartEndpointTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(list(queued)[0]["queued_id"], "kept")
         self.assertEqual(private["_source_instance_id"], SERVER_INSTANCE_ID)
 
+    async def test_restart_repair_admission_allows_failed_team_hub_startup(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            prepare = AsyncMock(return_value=None)
+            reopen = AsyncMock()
+            with restart_environment(root), \
+                 patch.object(
+                     agent_server.TEAM_HUB_RUNTIME,
+                     "prepare_maintenance",
+                     new=prepare,
+                 ), \
+                 patch.object(
+                     agent_server.TEAM_HUB_RUNTIME,
+                     "reopen_admission",
+                     new=reopen,
+                 ):
+                status = await agent_server.restart_server_endpoint(
+                    restart_body(),
+                    http_request(method="POST"),
+                    BackgroundTasks(),
+                )
+
+        self.assertEqual(status["phase"], "accepted")
+        prepare.assert_awaited_once_with(
+            "server-restart",
+            persistent_fence=False,
+            allow_unavailable_host=True,
+        )
+        reopen.assert_awaited_once_with()
+
+    async def test_forced_restart_repair_attempt_allows_failed_team_hub_startup(self):
+        prepare = AsyncMock(return_value=None)
+        reopen = AsyncMock()
+        with patch.object(
+            agent_server.TEAM_HUB_RUNTIME,
+            "prepare_maintenance",
+            new=prepare,
+        ), patch.object(
+            agent_server.TEAM_HUB_RUNTIME,
+            "reopen_admission",
+            new=reopen,
+        ):
+            succeeded = (
+                await agent_server.forced_server_restart_team_hub_snapshot_attempt()
+            )
+
+        self.assertTrue(succeeded)
+        prepare.assert_awaited_once_with(
+            "server-restart",
+            persistent_fence=False,
+            allow_unavailable_host=True,
+        )
+        reopen.assert_awaited_once_with()
+
     async def test_same_accepted_request_reattaches_one_recovery_worker(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -1108,26 +1322,45 @@ class ServerRestartEndpointTests(unittest.IsolatedAsyncioTestCase):
                     )
 
     async def test_update_active_blocks_restart(self):
-        for force in (False, True):
-            with self.subTest(force=force), tempfile.TemporaryDirectory() as temporary:
-                root = Path(temporary)
-                with restart_environment(root):
-                    agent_server.write_server_update_status(
-                        phase="installing",
-                        update_id="update-1",
-                    )
-                    with self.assertRaises(HTTPException) as raised:
-                        await agent_server.restart_server_endpoint(
-                            restart_body(force=force),
-                            http_request(method="POST"),
-                            BackgroundTasks(),
-                        )
-
-                self.assertEqual(raised.exception.status_code, 409)
-                self.assertEqual(
-                    raised.exception.detail["code"],
-                    "server_update_in_progress",
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            with restart_environment(root):
+                agent_server.write_server_update_status(
+                    phase="installing",
+                    update_id="update-1",
                 )
+                with self.assertRaises(HTTPException) as raised:
+                    await agent_server.restart_server_endpoint(
+                        restart_body(),
+                        http_request(method="POST"),
+                        BackgroundTasks(),
+                    )
+
+        self.assertEqual(raised.exception.status_code, 409)
+        self.assertEqual(
+            raised.exception.detail["code"],
+            "server_update_in_progress",
+        )
+
+    async def test_force_restart_overrides_active_update_and_audits_it(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            with restart_environment(root) as forced_signal:
+                agent_server.write_server_update_status(
+                    phase="installing",
+                    update_id="update-1",
+                )
+                status = await agent_server.restart_server_endpoint(
+                    restart_body(force=True),
+                    http_request(method="POST"),
+                    BackgroundTasks(),
+                )
+                forced_signal.assert_called_once_with(status["request_id"])
+
+        self.assertEqual(status["phase"], "accepted")
+        self.assertTrue(status["forced"])
+        self.assertTrue(status["forced_audit"]["update_in_progress_overridden"])
+        self.assertEqual(status["forced_audit"]["update_phase"], "installing")
 
     async def test_pending_update_allows_restart_and_rearms_after_startup(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -1224,7 +1457,7 @@ class ServerRestartEndpointTests(unittest.IsolatedAsyncioTestCase):
             root = Path(temporary)
             with restart_environment(root), patch.object(
                 agent_server,
-                "active_provider_background_work_labels",
+                "provider_background_work_labels_from_snapshot",
                 return_value=["private provider label"],
             ):
                 with self.assertRaises(HTTPException) as raised:
@@ -1358,7 +1591,11 @@ class ServerRestartEndpointTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("private-mutation-a", public_json)
         self.assertNotIn("private-mutation-b", public_json)
 
-    async def test_safety_critical_work_blocks_normal_and_force_restart(self):
+    async def test_safety_critical_work_blocks_normal_restart_only(self):
+        # Safety-critical work still refuses a cooperative restart. A forced
+        # restart is the emergency path: it must proceed and audit the
+        # overridden work instead, because a wedged maintenance operation or
+        # stuck HTTP mutation is exactly what operators need to escape from.
         scenarios = (
             ({"SERVER_MAINTENANCE_SESSIONS": {"chat"}}, "server_maintenance_count"),
             ({"DELETING_SESSIONS": {"chat"}}, "deleting_session_count"),
@@ -1366,28 +1603,34 @@ class ServerRestartEndpointTests(unittest.IsolatedAsyncioTestCase):
             ({"UNSAFE_HTTP_MUTATION_TASKS": {"mutation": asyncio.current_task()}}, "mutation_count"),
         )
         for changes, count_name in scenarios:
-            for force in (False, True):
-                with self.subTest(
-                    count_name=count_name,
-                    force=force,
-                ), tempfile.TemporaryDirectory() as temporary:
-                    root = Path(temporary)
-                    with restart_environment(root), ExitStack() as stack:
-                        for name, value in changes.items():
-                            stack.enter_context(patch.object(agent_server, name, value))
-                        with self.assertRaises(HTTPException) as raised:
-                            await agent_server.restart_server_endpoint(
-                                restart_body(force=force),
-                                http_request(method="POST"),
-                                BackgroundTasks(),
-                            )
-                    self.assertEqual(raised.exception.status_code, 409)
-                    self.assertEqual(
-                        raised.exception.detail["code"],
-                        "server_restart_unsafe_busy",
+            expected = True if count_name == "codex_goals_reconfiguring" else 1
+            with self.subTest(count_name=count_name), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                with restart_environment(root) as forced_signal, ExitStack() as stack:
+                    for name, value in changes.items():
+                        stack.enter_context(patch.object(agent_server, name, value))
+                    with self.assertRaises(HTTPException) as raised:
+                        await agent_server.restart_server_endpoint(
+                            restart_body(),
+                            http_request(method="POST"),
+                            BackgroundTasks(),
+                        )
+                    forced_signal.assert_not_called()
+                    forced = await agent_server.restart_server_endpoint(
+                        restart_body(force=True),
+                        http_request(method="POST"),
+                        BackgroundTasks(),
                     )
-                    expected = True if count_name == "codex_goals_reconfiguring" else 1
-                    self.assertEqual(raised.exception.detail[count_name], expected)
+                    forced_signal.assert_called_once_with(forced["request_id"])
+                self.assertEqual(raised.exception.status_code, 409)
+                self.assertEqual(
+                    raised.exception.detail["code"],
+                    "server_restart_unsafe_busy",
+                )
+                self.assertEqual(raised.exception.detail[count_name], expected)
+                self.assertEqual(forced["phase"], "accepted")
+                self.assertTrue(forced["forced_audit"]["safety_blockers_overridden"])
+                self.assertEqual(forced["interrupted_work"][count_name], expected)
 
     async def test_force_restart_accepts_busy_server_and_audits_interrupted_work(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -1397,10 +1640,15 @@ class ServerRestartEndpointTests(unittest.IsolatedAsyncioTestCase):
                 {"queued_id": "durable", "_durable": True},
             ])
             run_now = {"queued_id": "unsafe-2", "_update_transitioning": True}
-            with restart_environment(root), \
+            with restart_environment(root) as forced_signal, \
                  patch.object(agent_server, "BUSY_SESSIONS", {"chat-1", "chat-2"}), \
                  patch.object(agent_server, "QUEUED_TURNS", {"chat-1": queued}), \
                  patch.object(agent_server, "RUN_NOW_TURNS", {"chat-5": run_now}), \
+                 patch.object(
+                     agent_server,
+                     "provider_background_work_labels_from_snapshot",
+                     return_value=["private provider label"],
+                 ), \
                  patch.object(
                      agent_server,
                      "active_provider_background_work_labels",
@@ -1413,6 +1661,7 @@ class ServerRestartEndpointTests(unittest.IsolatedAsyncioTestCase):
                     tasks,
                 )
                 private = agent_server.read_server_restart_status()
+                forced_signal.assert_called_once_with(status["request_id"])
 
         self.assertEqual(status["phase"], "accepted")
         self.assertTrue(status["forced"])
@@ -1427,7 +1676,20 @@ class ServerRestartEndpointTests(unittest.IsolatedAsyncioTestCase):
             "mutation_count": 0,
             "deleting_session_count": 0,
         })
-        self.assertEqual(len(tasks.tasks), 1)
+        # The forced path signals from its own thread, never via the
+        # response's background tasks, so a stalled response cycle cannot
+        # delay the restart.
+        self.assertEqual(len(tasks.tasks), 0)
+        self.assertEqual(status["forced_audit"], {
+            "snapshot_degraded": False,
+            "blockers_changed_after_confirmation": False,
+            "blocker_revision_omitted": False,
+            "safety_blockers_overridden": False,
+            "cooldown_overridden": False,
+            "superseded_pending_restart": False,
+            "update_in_progress_overridden": False,
+            "team_hub_snapshot_skipped": False,
+        })
         self.assertTrue(private["_forced"])
         self.assertEqual(
             private["_forced_work_snapshot"],
@@ -1435,32 +1697,247 @@ class ServerRestartEndpointTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertNotIn("private provider label", json.dumps(status))
 
-    async def test_force_restart_rejects_stale_blocker_revision(self):
+    async def test_force_restart_accepts_stale_blocker_revision_and_audits_it(self):
+        # On a busy server the blocker revision changes continuously (every
+        # health poll, every provider event). Refusing a forced restart on a
+        # stale revision made emergency restarts impossible in practice.
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
-            with restart_environment(root):
+            with restart_environment(root) as forced_signal:
                 confirmed = agent_server.server_restart_blocker_snapshot_locked()
                 body = restart_body(
                     force=True,
                     blocker_revision=confirmed["revision"],
                 )
                 agent_server.BUSY_SESSIONS.add("newly-started-chat")
-                with self.assertRaises(HTTPException) as raised:
-                    await agent_server.restart_server_endpoint(
-                        body,
+                status = await agent_server.restart_server_endpoint(
+                    body,
+                    http_request(method="POST"),
+                    BackgroundTasks(),
+                )
+                forced_signal.assert_called_once_with(status["request_id"])
+
+        self.assertEqual(status["phase"], "accepted")
+        self.assertTrue(status["forced_audit"]["blockers_changed_after_confirmation"])
+        self.assertEqual(status["interrupted_work"]["active_count"], 1)
+        self.assertNotIn("newly-started-chat", json.dumps(status))
+
+    async def test_force_restart_accepts_omitted_blocker_revision(self):
+        # A wedged server may not be able to serve the blocker snapshot at
+        # all; the client must still be able to force a restart.
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            with restart_environment(root) as forced_signal:
+                status = await agent_server.restart_server_endpoint(
+                    restart_body(force=True, omit_revision=True),
+                    http_request(method="POST"),
+                    BackgroundTasks(),
+                )
+                forced_signal.assert_called_once_with(status["request_id"])
+
+        self.assertEqual(status["phase"], "accepted")
+        self.assertTrue(status["forced_audit"]["blocker_revision_omitted"])
+
+    async def test_force_restart_supersedes_pending_restart_from_other_request(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            with restart_environment(root) as forced_signal:
+                pending = await agent_server.restart_server_endpoint(
+                    restart_body(),
+                    http_request(method="POST"),
+                    BackgroundTasks(),
+                )
+                status = await agent_server.restart_server_endpoint(
+                    restart_body(force=True),
+                    http_request(method="POST"),
+                    BackgroundTasks(),
+                )
+                private = agent_server.read_server_restart_status()
+                forced_signal.assert_called_once_with(status["request_id"])
+
+        self.assertEqual(pending["phase"], "accepted")
+        self.assertEqual(status["phase"], "accepted")
+        self.assertNotEqual(status["request_id"], pending["request_id"])
+        self.assertTrue(status["forced_audit"]["superseded_pending_restart"])
+        self.assertEqual(private["request_id"], status["request_id"])
+
+    async def test_force_restart_degrades_instead_of_hanging_on_wedged_locks(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            # Contending the module-level locks would bind them to this test's
+            # event loop; use fresh instances so other test loops stay clean.
+            with restart_environment(root) as forced_signal, \
+                 patch.object(agent_server, "ACTIVE_LOCK", asyncio.Lock()), \
+                 patch.object(agent_server, "QUEUE_LOCK", asyncio.Lock()), \
+                 patch.object(
+                     agent_server,
+                     "UNSAFE_HTTP_MUTATION_ADMISSION_LOCK",
+                     asyncio.Lock(),
+                 ), \
+                 patch.object(
+                     agent_server,
+                     "SERVER_UPDATE_OPERATION_LOCK",
+                     asyncio.Lock(),
+                 ), \
+                 patch.object(
+                     agent_server,
+                     "SERVER_RESTART_FORCE_LOCK_TIMEOUT_SECONDS",
+                     0.05,
+                 ), \
+                 patch.object(
+                     agent_server,
+                     "SERVER_RESTART_STATUS_LOCK_TIMEOUT_SECONDS",
+                     0.05,
+                 ):
+                await agent_server.ACTIVE_LOCK.acquire()
+                await agent_server.SERVER_UPDATE_OPERATION_LOCK.acquire()
+                try:
+                    status = await asyncio.wait_for(
+                        agent_server.restart_server_endpoint(
+                            restart_body(force=True),
+                            http_request(method="POST"),
+                            BackgroundTasks(),
+                        ),
+                        timeout=5,
+                    )
+                    degraded_snapshot = await asyncio.wait_for(
+                        agent_server.current_server_restart_blocker_snapshot(),
+                        timeout=5,
+                    )
+                finally:
+                    agent_server.ACTIVE_LOCK.release()
+                    agent_server.SERVER_UPDATE_OPERATION_LOCK.release()
+                forced_signal.assert_called_once_with(status["request_id"])
+
+        self.assertEqual(status["phase"], "accepted")
+        self.assertTrue(status["forced_audit"]["snapshot_degraded"])
+        self.assertIn(
+            "update_operation_lock",
+            status["forced_audit"]["snapshot_degraded_reasons"],
+        )
+        self.assertIn(
+            "active_lock",
+            status["forced_audit"]["snapshot_degraded_reasons"],
+        )
+        self.assertTrue(degraded_snapshot["snapshot_degraded"])
+        self.assertEqual(degraded_snapshot["snapshot_degraded_reasons"], ["active_lock"])
+
+    async def test_force_restart_proceeds_when_journal_cannot_be_written(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            with restart_environment(root) as forced_signal, patch.object(
+                agent_server,
+                "write_server_restart_status",
+                side_effect=OSError("disk full"),
+            ):
+                status = await agent_server.restart_server_endpoint(
+                    restart_body(force=True),
+                    http_request(method="POST"),
+                    BackgroundTasks(),
+                )
+                forced_signal.assert_called_once_with(status["request_id"])
+
+        self.assertEqual(status["phase"], "accepted")
+        self.assertTrue(status["forced"])
+
+    async def test_force_restart_proceeds_when_team_hub_snapshot_fails(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            with restart_environment(root) as forced_signal, patch.object(
+                agent_server.TEAM_HUB_RUNTIME,
+                "prepare_maintenance",
+                AsyncMock(side_effect=RuntimeError("hub drain timed out")),
+            ):
+                status = await agent_server.restart_server_endpoint(
+                    restart_body(force=True),
+                    http_request(method="POST"),
+                    BackgroundTasks(),
+                )
+                forced_signal.assert_called_once_with(status["request_id"])
+
+        self.assertEqual(status["phase"], "accepted")
+        self.assertTrue(status["forced_audit"]["team_hub_snapshot_skipped"])
+
+    async def test_force_restart_hub_snapshot_deadline_retains_late_settlement(
+        self,
+    ) -> None:
+        snapshot_started = asyncio.Event()
+        release_snapshot = asyncio.Event()
+        snapshot_settled = asyncio.Event()
+        cancellation_seen = asyncio.Event()
+        reopened = asyncio.Event()
+        stragglers: set[asyncio.Task[object]] = set()
+
+        async def cancellation_resistant_snapshot(*_args, **_kwargs):
+            snapshot_started.set()
+            try:
+                await release_snapshot.wait()
+            except asyncio.CancelledError:
+                # This is the behavior that made asyncio.wait_for exceed its
+                # deadline: maintenance must finish its native worker first.
+                cancellation_seen.set()
+                await release_snapshot.wait()
+            snapshot_settled.set()
+
+        async def reopen_after_settlement() -> None:
+            self.assertTrue(snapshot_settled.is_set())
+            reopened.set()
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            with (
+                restart_environment(root) as forced_signal,
+                patch.object(
+                    agent_server.TEAM_HUB_RUNTIME,
+                    "prepare_maintenance",
+                    new=AsyncMock(side_effect=cancellation_resistant_snapshot),
+                ),
+                patch.object(
+                    agent_server.TEAM_HUB_RUNTIME,
+                    "reopen_admission",
+                    new=AsyncMock(side_effect=reopen_after_settlement),
+                ) as reopen_admission,
+                patch.object(
+                    agent_server,
+                    "SERVER_RESTART_FORCE_HUB_SNAPSHOT_TIMEOUT_SECONDS",
+                    0.01,
+                ),
+                patch.object(
+                    agent_server,
+                    "SERVER_RESTART_FORCE_HUB_STRAGGLERS",
+                    stragglers,
+                ),
+            ):
+                started_at = asyncio.get_running_loop().time()
+                status = await asyncio.wait_for(
+                    agent_server.restart_server_endpoint(
+                        restart_body(force=True),
                         http_request(method="POST"),
                         BackgroundTasks(),
-                    )
+                    ),
+                    timeout=1,
+                )
+                elapsed = asyncio.get_running_loop().time() - started_at
 
-        self.assertEqual(raised.exception.status_code, 409)
-        self.assertEqual(
-            raised.exception.detail["code"],
-            "server_restart_blockers_changed",
-        )
-        refreshed = raised.exception.detail["blocker_snapshot"]
-        self.assertNotEqual(refreshed["revision"], confirmed["revision"])
-        self.assertEqual(refreshed["active_count"], 1)
-        self.assertNotIn("newly-started-chat", json.dumps(raised.exception.detail))
+                self.assertLess(elapsed, 0.5)
+                self.assertTrue(snapshot_started.is_set())
+                self.assertFalse(cancellation_seen.is_set())
+                self.assertFalse(snapshot_settled.is_set())
+                self.assertFalse(reopened.is_set())
+                self.assertEqual(len(stragglers), 1)
+                forced_signal.assert_called_once_with(status["request_id"])
+
+                release_snapshot.set()
+                await asyncio.wait_for(reopened.wait(), 1)
+                for _ in range(100):
+                    if not stragglers:
+                        break
+                    await asyncio.sleep(0)
+                self.assertFalse(stragglers)
+                reopen_admission.assert_awaited_once_with()
+
+        self.assertEqual(status["phase"], "accepted")
+        self.assertTrue(status["forced_audit"]["team_hub_snapshot_skipped"])
 
     async def test_tmux_cgroup_risk_requires_force_and_is_privately_revision_bound(self):
         service_cgroup = (
@@ -1523,7 +2000,7 @@ class ServerRestartEndpointTests(unittest.IsolatedAsyncioTestCase):
                     state["tmux_server_cgroup_unknown"],
                 )
 
-    async def test_tmux_private_pid_change_invalidates_force_confirmation(self):
+    async def test_tmux_private_pid_change_is_audited_not_refused_when_forced(self):
         service_cgroup = "/user.slice/agents-server.service"
         confirmed_state = tmux_restart_state(
             in_service_cgroup=True,
@@ -1549,30 +2026,24 @@ class ServerRestartEndpointTests(unittest.IsolatedAsyncioTestCase):
                     agent_server,
                     "server_restart_tmux_cgroup_state",
                     return_value=changed_state,
-                ), self.assertRaises(HTTPException) as raised:
-                    await agent_server.restart_server_endpoint(
+                ):
+                    status = await agent_server.restart_server_endpoint(
                         body,
                         http_request(method="POST"),
                         BackgroundTasks(),
                     )
 
-        self.assertEqual(
-            raised.exception.detail["code"],
-            "server_restart_blockers_changed",
-        )
-        self.assertTrue(
-            raised.exception.detail["blocker_snapshot"][
-                "tmux_server_in_service_cgroup"
-            ]
-        )
-        self.assertNotIn("4343", json.dumps(raised.exception.detail))
+        self.assertEqual(status["phase"], "accepted")
+        self.assertTrue(status["forced_audit"]["blockers_changed_after_confirmation"])
+        self.assertTrue(status["interrupted_work"]["tmux_server_in_service_cgroup"])
+        self.assertNotIn("4343", json.dumps(status))
 
     async def test_force_restart_audits_provider_only_background_blockers(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             with restart_environment(root), patch.object(
                 agent_server,
-                "active_provider_background_work_labels",
+                "provider_background_work_labels_from_snapshot",
                 return_value=["private provider label", "second private label"],
             ):
                 status = await agent_server.restart_server_endpoint(
@@ -1587,10 +2058,10 @@ class ServerRestartEndpointTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertNotIn("private provider label", json.dumps(status))
 
-    async def test_force_restart_preserves_recent_terminal_cooldown(self):
+    async def test_force_restart_overrides_recent_terminal_cooldown(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
-            with restart_environment(root), patch.object(
+            with restart_environment(root) as forced_signal, patch.object(
                 agent_server,
                 "server_restart_status_age_seconds",
                 return_value=2,
@@ -1600,18 +2071,15 @@ class ServerRestartEndpointTests(unittest.IsolatedAsyncioTestCase):
                     request_id=str(uuid.uuid4()),
                     failed_at="2026-08-19T00:00:00Z",
                 )
-                with self.assertRaises(HTTPException) as raised:
-                    await agent_server.restart_server_endpoint(
-                        restart_body(force=True),
-                        http_request(method="POST"),
-                        BackgroundTasks(),
-                    )
+                status = await agent_server.restart_server_endpoint(
+                    restart_body(force=True),
+                    http_request(method="POST"),
+                    BackgroundTasks(),
+                )
+                forced_signal.assert_called_once_with(status["request_id"])
 
-        self.assertEqual(raised.exception.status_code, 409)
-        self.assertEqual(
-            raised.exception.detail["code"],
-            "server_restart_cooldown",
-        )
+        self.assertEqual(status["phase"], "accepted")
+        self.assertTrue(status["forced_audit"]["cooldown_overridden"])
 
     async def test_existing_http_mutation_blocks_restart_until_it_finishes(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -1627,7 +2095,7 @@ class ServerRestartEndpointTests(unittest.IsolatedAsyncioTestCase):
             with restart_environment(root):
                 mutation_task = asyncio.create_task(
                     agent_server.require_agent_token(
-                        http_request(method="PATCH", path="/api/sessions/chat"),
+                        http_request(method="DELETE", path="/api/sessions/chat"),
                         call_next,
                     )
                 )
@@ -1666,7 +2134,7 @@ class ServerRestartEndpointTests(unittest.IsolatedAsyncioTestCase):
                     _source_instance_id=SERVER_INSTANCE_ID,
                 )
                 response = await agent_server.require_agent_token(
-                    http_request(method="POST", path="/api/sessions"),
+                    http_request(method="DELETE", path="/api/sessions/chat"),
                     call_next,
                 )
 
@@ -1730,6 +2198,7 @@ class ServerRestartEndpointTests(unittest.IsolatedAsyncioTestCase):
             request_id = str(uuid.uuid4())
             with restart_environment(root), \
                  patch.object(agent_server.time, "sleep"), \
+                 patch.object(agent_server.threading, "Thread"), \
                  patch.object(
                      agent_server.os,
                      "kill",
@@ -1776,6 +2245,10 @@ class ServerRestartEndpointTests(unittest.IsolatedAsyncioTestCase):
             forced.expected_blocker_revision or "",
             r"^[0-9a-f]{64}$",
         )
+        # The blocker revision is an optional audit hint for forced restarts.
+        emergency = restart_body(force=True, omit_revision=True)
+        self.assertTrue(emergency.force)
+        self.assertIsNone(emergency.expected_blocker_revision)
         revision = "b" * 64
         for changes in (
             {"force": True},
@@ -1795,10 +2268,6 @@ class ServerRestartEndpointTests(unittest.IsolatedAsyncioTestCase):
                 "force": True,
                 "force_confirmed": "true",
                 "expected_blocker_revision": revision,
-            },
-            {
-                "force": True,
-                "force_confirmed": True,
             },
             {"expected_blocker_revision": revision},
             {

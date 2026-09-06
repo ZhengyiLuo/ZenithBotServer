@@ -301,12 +301,42 @@ class CancellationHostileConnectClient(FakeClaudeClient):
         self.connected = True
 
 
+class DisconnectSettledHostileConnectClient(CancellationHostileConnectClient):
+    """A hostile connect that settles only when its transport is disconnected."""
+
+    async def connect(self) -> None:
+        await super().connect()
+        if self.disconnected:
+            self.connected = False
+
+    async def disconnect(self) -> None:
+        await super().disconnect()
+        # A real SDK disconnect tears down the transport that connect() is
+        # awaiting. The connect coroutine remains cancellation-hostile, but
+        # must settle once its exact process has been disconnected.
+        self.release_connect.set()
+
+
 class HostileConnectFactory:
     def __init__(self) -> None:
         self.clients: list[CancellationHostileConnectClient] = []
 
     def __call__(self, options: Any) -> CancellationHostileConnectClient:
         client = CancellationHostileConnectClient(options)
+        self.clients.append(client)
+        return client
+
+
+class HostileConnectThenNormalFactory:
+    def __init__(self) -> None:
+        self.clients: list[FakeClaudeClient] = []
+
+    def __call__(self, options: Any) -> FakeClaudeClient:
+        client: FakeClaudeClient
+        if self.clients:
+            client = FakeClaudeClient(options)
+        else:
+            client = DisconnectSettledHostileConnectClient(options)
         self.clients.append(client)
         return client
 
@@ -1290,6 +1320,174 @@ class ClaudeSDKSupervisorTests(unittest.IsolatedAsyncioTestCase):
                 configuration_key="a",
             )
         self.assertTrue(raised.exception.safe_to_fallback)
+
+    async def test_cold_connect_timeout_retires_owner_and_reconnects_cleanly(self) -> None:
+        factory = HostileConnectThenNormalFactory()
+        manager = ClaudeSDKSupervisorManager(
+            client_factory=factory,
+            idle_ttl_seconds=None,
+            connect_timeout_seconds=0.02,
+            disconnect_timeout_seconds=0.02,
+        )
+        try:
+            with self.assertRaisesRegex(
+                ClaudeSDKUnavailable,
+                r"connect timed out after 0\.02s",
+            ):
+                await asyncio.wait_for(manager.start_run(
+                    "chat-connect-timeout",
+                    "Never delivered",
+                    run_id="run-timeout",
+                    options={},
+                    configuration_key="a",
+                ), 0.5)
+
+            hostile = factory.clients[0]
+            self.assertIsInstance(hostile, CancellationHostileConnectClient)
+            self.assertTrue(hostile.disconnected)
+            self.assertFalse(any(call[0] == "query" for call in hostile.calls))
+            self.assertFalse(manager.snapshots())
+            await asyncio.sleep(0)
+            self.assertFalse([
+                task
+                for task in asyncio.all_tasks()
+                if task is not asyncio.current_task()
+                and not task.done()
+                and "chat-connect-timeout" in task.get_name()
+            ])
+
+            replacement = await asyncio.wait_for(manager.start_run(
+                "chat-connect-timeout",
+                "Retry",
+                run_id="run-retry",
+                options={},
+                configuration_key="a",
+            ), 0.5)
+            self.assertEqual(len(factory.clients), 2)
+            await factory.clients[1].emit({"type": "result", "result": "done"})
+            await replacement.wait_result()
+        finally:
+            await manager.close_all()
+
+    async def test_late_connect_is_disconnected_again_after_owner_retirement(self) -> None:
+        factory = HostileConnectFactory()
+        manager = ClaudeSDKSupervisorManager(
+            client_factory=factory,
+            idle_ttl_seconds=None,
+            connect_timeout_seconds=0.02,
+            disconnect_timeout_seconds=0.01,
+        )
+        try:
+            with self.assertRaisesRegex(
+                ClaudeSDKUnavailable,
+                r"connect timed out after 0\.02s",
+            ):
+                await asyncio.wait_for(manager.start_run(
+                    "chat-late-connect",
+                    "Never delivered",
+                    run_id="run-timeout",
+                    options={},
+                    configuration_key="a",
+                ), 0.5)
+
+            hostile = factory.clients[0]
+            self.assertFalse(hostile.connected)
+            self.assertEqual(
+                sum(call[0] == "disconnect" for call in hostile.calls),
+                1,
+            )
+            self.assertFalse(manager.snapshots())
+
+            # The SDK ignored cancellation and established its transport only
+            # after its supervisor had been retired. The retained exact-client
+            # cleanup must observe that late completion and disconnect again.
+            hostile.release_connect.set()
+            for _ in range(50):
+                if (
+                    not hostile.connected
+                    and sum(
+                        call[0] == "disconnect" for call in hostile.calls
+                    ) >= 2
+                ):
+                    break
+                await asyncio.sleep(0.01)
+            self.assertFalse(hostile.connected)
+            self.assertGreaterEqual(
+                sum(call[0] == "disconnect" for call in hostile.calls),
+                2,
+            )
+            self.assertFalse([
+                task
+                for task in asyncio.all_tasks()
+                if task is not asyncio.current_task()
+                and not task.done()
+                and "chat-late-connect" in task.get_name()
+            ])
+        finally:
+            for client in factory.clients:
+                client.release_connect.set()
+            await asyncio.sleep(0)
+            await manager.close_all()
+
+    async def test_cancelled_cold_start_retires_owner_without_ready_callback(self) -> None:
+        factory = HostileConnectThenNormalFactory()
+        manager = ClaudeSDKSupervisorManager(
+            client_factory=factory,
+            idle_ttl_seconds=None,
+            connect_timeout_seconds=1,
+            disconnect_timeout_seconds=0.02,
+        )
+        ready_owners: list[str] = []
+
+        async def capture_owner(ownership_token: str) -> None:
+            ready_owners.append(ownership_token)
+
+        try:
+            start_task = asyncio.create_task(manager.start_run(
+                "chat-cancelled-connect",
+                "Never delivered",
+                run_id="run-cancelled",
+                options={},
+                configuration_key="a",
+                on_supervisor_ready=capture_owner,
+            ))
+            while not factory.clients:
+                await asyncio.sleep(0)
+            hostile = factory.clients[0]
+            assert isinstance(hostile, CancellationHostileConnectClient)
+            await asyncio.wait_for(hostile.connect_started.wait(), 0.5)
+
+            start_task.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await asyncio.wait_for(start_task, 0.5)
+
+            self.assertFalse(ready_owners)
+            self.assertTrue(hostile.disconnected)
+            self.assertFalse(any(call[0] == "query" for call in hostile.calls))
+            self.assertFalse(manager.snapshots())
+            await asyncio.sleep(0)
+            self.assertFalse([
+                task
+                for task in asyncio.all_tasks()
+                if task is not asyncio.current_task()
+                and not task.done()
+                and "chat-cancelled-connect" in task.get_name()
+            ])
+
+            replacement = await asyncio.wait_for(manager.start_run(
+                "chat-cancelled-connect",
+                "Retry",
+                run_id="run-retry",
+                options={},
+                configuration_key="a",
+                on_supervisor_ready=capture_owner,
+            ), 0.5)
+            self.assertEqual(len(factory.clients), 2)
+            self.assertEqual(len(ready_owners), 1)
+            await factory.clients[1].emit({"type": "result", "result": "done"})
+            await replacement.wait_result()
+        finally:
+            await manager.close_all()
 
     async def test_query_failure_is_delivery_uncertain_and_retires_only_chat(self) -> None:
         self.factory.query_error = RuntimeError("pipe broke")

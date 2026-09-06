@@ -1,6 +1,7 @@
 import asyncio
 import json
 import tempfile
+import threading
 import time
 import unittest
 import uuid
@@ -156,6 +157,16 @@ class LedgerBackedPeerRuntime:
     def pending_outbound_handoffs(self, *, limit: int = 8) -> list[dict[str, Any]]:
         return self.delivery_ledger.pending_outbound(limit=limit)
 
+    def recoverable_outbound_handoffs(
+        self,
+        *,
+        limit: int = 50,
+    ) -> list[dict[str, Any]]:
+        return self.delivery_ledger.recoverable_outbound(limit=limit)
+
+    def retire_agent_routes_locally(self) -> int:
+        return 0
+
     def bind_delivery_owner(
         self,
         envelope_id: str,
@@ -259,6 +270,7 @@ class SecurePeerConnectorTests(unittest.IsolatedAsyncioTestCase):
             "lifecycle_locks": agent_server.SESSION_LIFECYCLE_LOCKS,
             "event_cache": agent_server.CROSS_CHAT_EVENT_TYPE_CACHE,
             "agent_token": agent_server.AGENT_TOKEN,
+            "agent_relay_enabled": agent_server.SECURE_PEER_AGENT_RELAY_ENABLED,
             "busy": set(agent_server.BUSY_SESSIONS),
             "stopped": set(agent_server.STOPPED_RUNS),
             "deleting": set(agent_server.DELETING_SESSIONS),
@@ -267,6 +279,9 @@ class SecurePeerConnectorTests(unittest.IsolatedAsyncioTestCase):
         self.runtime = LedgerBackedPeerRuntime(self.root / "runtime")
         agent_server.SECURE_PEER_RUNTIME = self.runtime
         agent_server.AGENT_TOKEN = "test-admin-token"
+        # This suite exercises the retired relay protocol in isolation. The
+        # production server hard-disables it and has separate boundary tests.
+        agent_server.SECURE_PEER_AGENT_RELAY_ENABLED = True
         agent_server.CROSS_CHAT = agent_server.CrossChatStore(
             self.root / "cross-chat.sqlite3"
         )
@@ -322,6 +337,9 @@ class SecurePeerConnectorTests(unittest.IsolatedAsyncioTestCase):
         agent_server.SESSION_LIFECYCLE_LOCKS = self.original["lifecycle_locks"]
         agent_server.CROSS_CHAT_EVENT_TYPE_CACHE = self.original["event_cache"]
         agent_server.AGENT_TOKEN = self.original["agent_token"]
+        agent_server.SECURE_PEER_AGENT_RELAY_ENABLED = self.original[
+            "agent_relay_enabled"
+        ]
         agent_server.BUSY_SESSIONS.clear()
         agent_server.BUSY_SESSIONS.update(self.original["busy"])
         agent_server.STOPPED_RUNS.clear()
@@ -454,11 +472,13 @@ class SecurePeerConnectorTests(unittest.IsolatedAsyncioTestCase):
     def prepare_running(
         self,
         *,
+        kind: str = "request_reply",
         used_legs: int = 1,
         expires_at: int | None = None,
         run_id: str = "run_target",
     ) -> dict[str, Any]:
         envelope = self.envelope(
+            kind=kind,
             used_legs=used_legs,
             expires_at=expires_at,
         )
@@ -845,6 +865,110 @@ class SecurePeerConnectorTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(closed["state"], "completed")
         self.assertEqual(closed["response_committed"], 1)
 
+    async def test_incoming_terminal_response_does_not_create_a_response_to_response(
+        self,
+    ) -> None:
+        record = self.prepare_running(kind="response", used_legs=2)
+        await agent_server.finalize_secure_peer_delivery_run({
+            "type": "turn_finished",
+            "run_id": "run_target",
+            "secure_peer_envelope_id": record["envelope_id"],
+            "result_text": "Response received successfully",
+            "exit_code": 0,
+        })
+
+        closed = self.runtime.delivery(str(record["envelope_id"]))
+        self.assertEqual(closed["state"], "completed")
+        self.assertEqual(self.runtime.submissions, [])
+
+    async def test_exact_secure_send_retry_freezes_expiry_in_idempotency_digest(
+        self,
+    ) -> None:
+        snapshot = self.snapshot(action="instruction")
+        token = await self.issue_secure_send("run_expiry_retry", snapshot)
+        request = agent_server.CrossChatHandoffRequest(
+            target_session_id=self.target_route_id,
+            action="instruction",
+            body="Deliver exactly once",
+            idempotency_key="expiry-retry-key",
+        )
+
+        with patch.object(agent_server.time, "time", return_value=1_000_000):
+            first, first_created = (
+                await agent_server.create_authorized_cross_chat_instruction(
+                    token,
+                    request,
+                )
+            )
+        with patch.object(agent_server.time, "time", return_value=1_000_001):
+            replay, replay_created = (
+                await agent_server.create_authorized_cross_chat_instruction(
+                    token,
+                    request,
+                )
+            )
+
+        self.assertTrue(first_created)
+        self.assertFalse(replay_created)
+        self.assertEqual(first["envelope_id"], replay["envelope_id"])
+        self.assertEqual(first["expires_at"], replay["expires_at"])
+
+    async def test_corrected_send_after_definite_rejection_gets_fresh_expiry(
+        self,
+    ) -> None:
+        snapshot = self.snapshot(action="instruction")
+        token = await self.issue_secure_send("run_expiry_reopen", snapshot)
+        original_prepare = self.runtime.prepare_outbound_handoff
+        attempts = 0
+
+        def reject_once(**kwargs: Any):
+            nonlocal attempts
+            attempts += 1
+            if attempts == 1:
+                raise SecurePeerError(
+                    "route_changed",
+                    "Correct the stale route",
+                    409,
+                )
+            return original_prepare(**kwargs)
+
+        first_request = agent_server.CrossChatHandoffRequest(
+            target_session_id=self.target_route_id,
+            action="instruction",
+            body="First shape",
+            idempotency_key="expiry-rejected-key",
+        )
+        with patch.object(
+            self.runtime,
+            "prepare_outbound_handoff",
+            side_effect=reject_once,
+        ), patch.object(agent_server.time, "time", return_value=1_000_000):
+            with self.assertRaises(HTTPException) as rejected:
+                await agent_server.create_authorized_cross_chat_instruction(
+                    token,
+                    first_request,
+                )
+        self.assertEqual(rejected.exception.status_code, 409)
+
+        corrected = first_request.model_copy(update={
+            "body": "Corrected shape",
+            "idempotency_key": "expiry-corrected-key",
+        })
+        with patch.object(
+            self.runtime,
+            "prepare_outbound_handoff",
+            side_effect=reject_once,
+        ), patch.object(agent_server.time, "time", return_value=1_000_100):
+            accepted, created = (
+                await agent_server.create_authorized_cross_chat_instruction(
+                    token,
+                    corrected,
+                )
+            )
+
+        self.assertTrue(created)
+        self.assertEqual(accepted["expires_at"], 1_000_100 + (72 * 60 * 60))
+
     async def test_live_response_intent_does_not_block_newer_same_peer_work(self) -> None:
         base = int(time.time())
         with patch("secure_peer_delivery.time.time", return_value=base - 30):
@@ -1088,6 +1212,146 @@ class SecurePeerConnectorTests(unittest.IsolatedAsyncioTestCase):
             )
         finalize.assert_awaited_once_with(terminal)
 
+    async def test_inbox_only_migration_terminalizes_all_relay_state_offline(
+        self,
+    ) -> None:
+        envelope = self.envelope(kind="request_reply")
+        record, created = self.runtime.delivery_ledger.prepare(
+            envelope,
+            transport_role="client",
+            connection_id=self.connection_id,
+            lease_token="lease-token",
+            target_chat_id="target",
+        )
+        self.assertTrue(created)
+        record = self.runtime.delivery_ledger.authorize(envelope["envelope_id"])
+        self.assertIsNotNone(record)
+        record = self.runtime.bind_delivery_owner(
+            envelope["envelope_id"],
+            queued_id="legacy-queued-delivery",
+            run_id=None,
+        )
+        self.assertIsNotNone(record)
+        self.runtime.prepare_delivery_response(
+            envelope["envelope_id"],
+            request_id=uuid4_text(),
+            body="legacy response",
+            request_response=False,
+        )
+        outbound_request_id = uuid4_text()
+        self.runtime.prepare_outbound_handoff(
+            request_id=outbound_request_id,
+            source_session_id="source",
+            source_run_id="run-source",
+            snapshot=self.snapshot(action="instruction"),
+            body="legacy outbound",
+            action="instruction",
+            expires_at=int(time.time()) + 3600,
+        )
+        self.runtime.defer_outbound_handoff(
+            outbound_request_id,
+            error="peer offline",
+        )
+
+        with patch.object(
+            agent_server,
+            "SECURE_PEER_AGENT_RELAY_ENABLED",
+            False,
+        ):
+            retired = await agent_server.retire_secure_peer_agent_relay_state()
+
+        self.assertEqual(retired, 2)
+        delivery = self.runtime.delivery(envelope["envelope_id"])
+        self.assertEqual(delivery["state"], "failed")
+        self.assertIn("retired", str(delivery["error"]))
+        outbound = self.runtime.delivery_ledger.outbound(outbound_request_id)
+        self.assertEqual(outbound["state"], "failed")
+        self.assertIn("retired", str(outbound["last_error"]))
+        self.assertEqual(self.runtime.delivery_ledger.recoverable(), [])
+        self.assertEqual(
+            self.runtime.delivery_ledger.recoverable_outbound(),
+            [],
+        )
+        self.assertEqual(self.runtime.submissions, [])
+
+    async def test_inbox_only_retirement_is_one_shot_across_background_loops(
+        self,
+    ) -> None:
+        runtime = Mock()
+        entered = threading.Event()
+        release = threading.Event()
+
+        def recoverable_deliveries() -> list[dict[str, Any]]:
+            entered.set()
+            if not release.wait(timeout=5):
+                raise RuntimeError("test retirement release timed out")
+            return []
+
+        runtime.recoverable_deliveries.side_effect = recoverable_deliveries
+        runtime.recoverable_outbound_handoffs.return_value = []
+        runtime.retire_agent_routes_locally.return_value = 0
+        with (
+            patch.object(agent_server, "SECURE_PEER_RUNTIME", runtime),
+            patch.object(
+                agent_server,
+                "SECURE_PEER_AGENT_RELAY_ENABLED",
+                False,
+            ),
+        ):
+            connector = asyncio.create_task(
+                agent_server.secure_peer_connector_once()
+            )
+            self.assertTrue(await asyncio.to_thread(entered.wait, 5))
+            outbox = asyncio.create_task(
+                agent_server.reconcile_secure_peer_response_outbox()
+            )
+            await asyncio.sleep(0)
+            release.set()
+            self.assertEqual(
+                await asyncio.gather(connector, outbox),
+                [0, 0],
+            )
+            self.assertEqual(await agent_server.secure_peer_connector_once(), 0)
+            self.assertEqual(
+                await agent_server.reconcile_secure_peer_response_outbox(),
+                0,
+            )
+
+        runtime.recoverable_deliveries.assert_called_once_with()
+        runtime.recoverable_outbound_handoffs.assert_called_once_with(limit=50)
+        runtime.retire_agent_routes_locally.assert_called_once_with()
+        runtime.fail_outbound_handoff.assert_not_called()
+        runtime.finish_delivery.assert_not_called()
+        runtime.proxy.assert_not_called()
+
+    async def test_inbox_only_retirement_retries_after_failed_attempt(self) -> None:
+        runtime = Mock()
+        runtime.recoverable_deliveries.side_effect = [
+            RuntimeError("retirement failed"),
+            [],
+        ]
+        runtime.recoverable_outbound_handoffs.return_value = []
+        runtime.retire_agent_routes_locally.return_value = 0
+        with (
+            patch.object(agent_server, "SECURE_PEER_RUNTIME", runtime),
+            patch.object(
+                agent_server,
+                "SECURE_PEER_AGENT_RELAY_ENABLED",
+                False,
+            ),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "retirement failed"):
+                await agent_server.secure_peer_connector_once()
+            self.assertEqual(
+                await agent_server.reconcile_secure_peer_response_outbox(),
+                0,
+            )
+            self.assertEqual(await agent_server.secure_peer_connector_once(), 0)
+
+        self.assertEqual(runtime.recoverable_deliveries.call_count, 2)
+        runtime.recoverable_outbound_handoffs.assert_called_once_with(limit=50)
+        runtime.retire_agent_routes_locally.assert_called_once_with()
+
     async def test_unsupported_target_is_rejected_before_delivered_receipt(self) -> None:
         actual = SecurePeerRuntime(
             self.root / "unsupported-runtime",
@@ -1119,6 +1383,45 @@ class SecurePeerConnectorTests(unittest.IsolatedAsyncioTestCase):
             self.assertIsNone(admitted)
             self.assertEqual(outcomes, ["failed"])
             self.assertEqual(actual.delivery(envelope["envelope_id"])["state"], "failed")
+        finally:
+            actual.shutdown()
+
+    async def test_unsupported_target_terminalizes_accepted_ownerless_delivery(
+        self,
+    ) -> None:
+        actual = SecurePeerRuntime(
+            self.root / "accepted-unsupported-runtime",
+            server_identity=self.local_identity,
+            server_instance_id="test-instance",
+            display_name="Test server",
+        )
+        agent_server.SECURE_PEER_RUNTIME = actual
+        envelope = self.envelope()
+        record, _created = actual.delivery_ledger.prepare(
+            envelope,
+            transport_role="client",
+            connection_id=self.connection_id,
+            lease_token="lease-token",
+            target_chat_id="target",
+        )
+        record = actual.delivery_ledger.authorize(envelope["envelope_id"])
+        self.assertIsNotNone(record)
+        agent_server.STORE.sessions["target"]["backend"] = "unsupported"
+
+        try:
+            admitted = await agent_server.admit_prepared_secure_peer_delivery(
+                record,  # type: ignore[arg-type]
+            )
+            self.assertIsNone(admitted)
+            self.assertEqual(
+                actual.delivery(envelope["envelope_id"])["state"],
+                "failed",
+            )
+            self.assertEqual(actual.delivery_ledger.pending_admissions(), [])
+            self.assertEqual(
+                actual.delivery_ledger.nonterminal_for_chat("target"),
+                [],
+            )
         finally:
             actual.shutdown()
 
