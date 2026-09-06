@@ -1,6 +1,50 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# A managed update can be launched by a long-lived tmux server that itself was
+# started from a translated Intel process. On Apple silicon that makes
+# universal tools such as bash and uname inherit the x86_64 slice, even though
+# the host and the release runtime are arm64-capable. Re-enter the installer
+# natively before parsing arguments, reading configuration, creating paths, or
+# changing service state. A real Intel Mac has no hw.optional.arm64 capability
+# and continues to the explicit unsupported-architecture rejection below.
+bootstrap_native_macos_architecture() {
+  local operating_system=""
+  local process_architecture=""
+  local physical_arm64=""
+  local sysctl_binary=""
+  local arch_binary=""
+
+  operating_system="$(uname -s 2>/dev/null || true)"
+  process_architecture="$(uname -m 2>/dev/null || true)"
+  [[ "$operating_system" == "Darwin" \
+    && "$process_architecture" == "x86_64" ]] || return 0
+
+  sysctl_binary="$(command -v sysctl 2>/dev/null || true)"
+  [[ "$sysctl_binary" == /* && -x "$sysctl_binary" ]] || return 0
+  physical_arm64="$("$sysctl_binary" -n hw.optional.arm64 2>/dev/null || true)"
+  [[ "$physical_arm64" == "1" ]] || return 0
+
+  if [[ "${AGENTS_SERVER_NATIVE_ARCH_REEXEC:-}" == "1" ]]; then
+    echo "Could not leave the translated x86_64 macOS process environment." >&2
+    echo "Run the installer from a native arm64 shell; no state, release, configuration, or service changes were made." >&2
+    exit 1
+  fi
+  arch_binary="$(command -v arch 2>/dev/null || true)"
+  if [[ "$arch_binary" != /* || ! -x "$arch_binary" \
+    || ! -x /bin/bash ]]; then
+    echo "Apple silicon was detected, but the native macOS launcher is unavailable." >&2
+    echo "Run the installer from a native arm64 shell; no state, release, configuration, or service changes were made." >&2
+    exit 1
+  fi
+
+  export AGENTS_SERVER_NATIVE_ARCH_REEXEC=1
+  exec "$arch_binary" -arm64 /bin/bash "$0" "$@"
+}
+
+bootstrap_native_macos_architecture "$@"
+unset AGENTS_SERVER_NATIVE_ARCH_REEXEC
+
 PORT="7850"
 BIND_ADDRESS="0.0.0.0"
 RELEASE_VERSION=""

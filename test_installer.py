@@ -2483,6 +2483,67 @@ chmod 755 "$project/.venv/bin/python"
             self.assertFalse((root / "config").exists())
             self.assertFalse((root / "state").exists())
 
+    def test_rosetta_macos_reexecs_native_arm64_before_parsing_arguments(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            home = root / "home"
+            fake_bin = root / "bin"
+            arch_log = root / "arch-arguments.log"
+            fake_bin.mkdir()
+            home.mkdir()
+            self.write_executable(
+                fake_bin / "uname",
+                """#!/bin/sh
+if [ "${1:-}" = "-s" ]; then
+  echo Darwin
+elif [ "${1:-}" = "-m" ]; then
+  if [ "${FAKE_NATIVE_ARCH:-}" = "1" ]; then echo arm64; else echo x86_64; fi
+else
+  echo Darwin
+fi
+""",
+            )
+            self.write_executable(
+                fake_bin / "sysctl",
+                """#!/bin/sh
+if [ "${1:-}" = "-n" ] && [ "${2:-}" = "hw.optional.arm64" ]; then
+  echo 1
+  exit 0
+fi
+exit 1
+""",
+            )
+            self.write_executable(
+                fake_bin / "arch",
+                """#!/bin/sh
+printf '%s\\n' "$@" > "$FAKE_ARCH_LOG"
+[ "${1:-}" = "-arm64" ] || exit 97
+[ "${2:-}" = "/bin/bash" ] || exit 98
+shift 2
+FAKE_NATIVE_ARCH=1 exec /bin/bash "$@"
+""",
+            )
+
+            result = subprocess.run(
+                ["/bin/bash", str(INSTALLER), "--help"],
+                env={
+                    **os.environ,
+                    "HOME": str(home),
+                    "PATH": f"{fake_bin}:/usr/bin:/bin",
+                    "FAKE_ARCH_LOG": str(arch_log),
+                },
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn("Usage: ./install.sh", result.stdout)
+            self.assertEqual(
+                arch_log.read_text().splitlines(),
+                ["-arm64", "/bin/bash", str(INSTALLER), "--help"],
+            )
+
     def test_explicit_port_is_pinned_without_allow_port_fallback(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary).resolve()
