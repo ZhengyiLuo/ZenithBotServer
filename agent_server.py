@@ -18147,7 +18147,7 @@ def cross_chat_provider_authority_block(
             f"- Send a message (Markdown body on stdin, never argv): `{team_command} send --route ROUTE_ID --kind message [--attach /abs/path]...`",
             *(
                 (
-                    f"- Publish a skill: `{team_command} send --route ROUTE_ID --kind skill --skill-slug SLUG --title T [--attach /abs/path]...`. Use this only for @@all or a mentioned skill; when updating an existing skill pass `--expected-version` from `skill get`. Skill bodies should be complete, runnable instructions.",
+                    f"- Publish a skill: `{team_command} send --route ROUTE_ID --kind skill --skill-slug SLUG --title T [--attach /abs/path]...`. Use this only for @@bulletin (legacy @@all) or a mentioned skill; when updating an existing skill pass `--expected-version` from `skill get`. Skill bodies should be complete, runnable instructions.",
                 )
                 if "team_skill_publish" in actions
                 else ()
@@ -73422,7 +73422,7 @@ async def send_provider_team_message(
         if "team_skill_publish" not in capability.get("actions", set()):
             raise HTTPException(
                 status_code=403,
-                detail="skill publishing was not authorized for this turn; mention @@all or the skill",
+                detail="skill publishing was not authorized for this turn; mention @@bulletin or the skill",
             )
         if not (
             reference.get("kind") == "skill"
@@ -73430,7 +73430,7 @@ async def send_provider_team_message(
         ):
             raise HTTPException(
                 status_code=409,
-                detail="skills can only be published to @@all or to a mentioned skill",
+                detail="skills can only be published to @@bulletin or to a mentioned skill",
             )
         if reference.get("kind") == "skill":
             requested_slug = str((req.skill or {}).get("slug") or "").strip().lower()

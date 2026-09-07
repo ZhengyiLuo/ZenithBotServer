@@ -439,6 +439,17 @@ class TeamReferenceResolutionTests(unittest.TestCase):
         resolved = runtime.resolve_team_references([_all_reference().model_dump()])
         self.assertEqual(resolved[0]["team_id"], "team_alpha_0001")
 
+        bulletin = runtime.resolve_team_references(
+            [_bulletin_reference().model_dump()]
+        )
+        self.assertEqual(bulletin[0]["team_id"], "team_alpha_0001")
+        self.assertEqual(bulletin[0]["recipient_kind"], "all")
+
+        invalid_alias = _all_reference().model_dump()
+        invalid_alias["display_name_snapshot"] = "everyone"
+        with self.assertRaisesRegex(SecurePeerError, "@@bulletin"):
+            runtime.resolve_team_references([invalid_alias])
+
     def test_hidden_automation_member_is_not_a_human_recipient(self) -> None:
         runtime, _realms = self.runtime(
             members={

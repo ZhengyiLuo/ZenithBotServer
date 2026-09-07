@@ -5824,10 +5824,11 @@ class SecurePeerRuntime:
                     )
                 reference["authorized_skill_slug"] = slug
             elif reference.get("recipient_kind") == "all":
-                if target_id != "all" or display_name != "all":
+                if target_id != "all" or display_name not in {"all", "bulletin"}:
                     raise SecurePeerError(
                         "team_reference_invalid",
-                        "Team-wide references must use @@all",
+                        "Team-wide references must use @@bulletin "
+                        "(legacy @@all is also accepted)",
                         409,
                     )
             elif reference.get("recipient_kind") == "server":
