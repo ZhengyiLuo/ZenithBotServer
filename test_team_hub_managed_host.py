@@ -21,7 +21,7 @@ from fastapi.testclient import TestClient
 
 import agentsdock_team_hub.cli as team_hub_cli
 from agentsdock_team_hub.cli import main as cli_main
-from agentsdock_team_hub.database import MIGRATIONS, _statements
+from agentsdock_team_hub.database import LATEST_SCHEMA_VERSION, MIGRATIONS, _statements
 from agentsdock_team_hub.service import (
     MANAGED_SERVER_SESSION_SCOPE_KEY,
     create_app,
@@ -704,6 +704,8 @@ sys.exit(10)
             connection.execute("PRAGMA wal_checkpoint(TRUNCATE)")
             connection.execute("BEGIN IMMEDIATE")
             for trigger in (
+                "team_message_revisions_are_immutable",
+                "team_message_revisions_cannot_be_deleted",
                 "network_agents_limit_per_server",
                 "network_bulletin_body_limit_on_insert",
                 "network_bulletin_body_limit_on_update",
@@ -715,6 +717,8 @@ sys.exit(10)
             ):
                 connection.execute(f"DROP TRIGGER {trigger}")
             for index in (
+                "team_message_revisions_by_message",
+                "team_message_revisions_by_team",
                 "device_sessions_human_created_id_idx",
                 "invitations_pending_team_created_id_idx",
                 "memberships_active_team_created_principal_idx",
@@ -722,6 +726,7 @@ sys.exit(10)
             ):
                 connection.execute(f"DROP INDEX {index}")
             for table in (
+                "team_message_revisions",
                 "network_content_deletions",
                 "human_admin_page_entries",
                 "team_attachment_cleanup_queue",
@@ -759,6 +764,8 @@ sys.exit(10)
             connection.execute("DROP TRIGGER network_bulletin_body_limit_on_insert")
             connection.execute("DROP TRIGGER network_bulletin_body_limit_on_update")
             for trigger in (
+                "team_message_revisions_are_immutable",
+                "team_message_revisions_cannot_be_deleted",
                 "human_admin_page_device_session_insert",
                 "human_admin_page_invitation_insert",
                 "human_admin_page_membership_insert",
@@ -767,6 +774,8 @@ sys.exit(10)
             ):
                 connection.execute(f"DROP TRIGGER {trigger}")
             for index in (
+                "team_message_revisions_by_message",
+                "team_message_revisions_by_team",
                 "device_sessions_human_created_id_idx",
                 "invitations_pending_team_created_id_idx",
                 "memberships_active_team_created_principal_idx",
@@ -774,6 +783,7 @@ sys.exit(10)
             ):
                 connection.execute(f"DROP INDEX {index}")
             for table in (
+                "team_message_revisions",
                 "network_content_deletions",
                 "human_admin_page_entries",
                 "team_attachment_cleanup_queue",
@@ -2037,7 +2047,10 @@ sys.exit(10)
             self.assertEqual(migrated.bootstrap_proof_path.read_bytes(), expected_proof)
             connection = migrated.connect()
             try:
-                self.assertEqual(connection.execute("PRAGMA user_version").fetchone()[0], 12)
+                self.assertEqual(
+                    connection.execute("PRAGMA user_version").fetchone()[0],
+                    LATEST_SCHEMA_VERSION,
+                )
                 self.assertEqual(
                     connection.execute(
                         "SELECT count(*) FROM bootstrap_delegations"
@@ -2131,7 +2144,7 @@ sys.exit(10)
                 try:
                     self.assertEqual(
                         connection.execute("PRAGMA user_version").fetchone()[0],
-                        12,
+                        LATEST_SCHEMA_VERSION,
                     )
                     preserved = connection.execute(
                         "SELECT * FROM channels WHERE id=?", (old_board_id,)
