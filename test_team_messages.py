@@ -211,6 +211,93 @@ class TeamMessagesServiceTests(unittest.TestCase):
         )
         self.assertEqual([item["id"] for item in page["messages"]], [second["id"]])
 
+    def test_bulletin_edits_are_poster_only_and_versioned(self) -> None:
+        created = self.send(
+            self.member,
+            [{"kind": "all"}],
+            body="Original bulletin",
+        )
+        message_id = created["id"]
+
+        legacy = self.get(self.member, f"{self.base}/messages/{message_id}")["message"]
+        self.assertNotIn("revision", legacy)
+        current = self.get(
+            self.member,
+            f"{self.base}/messages/{message_id}?include_revision=true",
+        )["message"]
+        self.assertEqual(current["revision"], {
+            "version": 1,
+            "versions_count": 1,
+            "edited_at": None,
+        })
+
+        key = _key()
+        request = {
+            "body": "Edited bulletin",
+            "body_format": "markdown",
+            "expected_version": 1,
+            "idempotency_key": key,
+        }
+        edited = self.post(
+            self.member,
+            f"{self.base}/messages/{message_id}/revisions",
+            request,
+        )["message"]
+        self.assertEqual(edited["body"], "Edited bulletin")
+        self.assertEqual(edited["revision"]["version"], 2)
+
+        replay = self.post(
+            self.member,
+            f"{self.base}/messages/{message_id}/revisions",
+            request,
+        )["message"]
+        self.assertEqual(replay, edited)
+
+        history = self.get(
+            self.owner,
+            f"{self.base}/messages/{message_id}/revisions",
+        )
+        self.assertEqual([item["version"] for item in history["versions"]], [2, 1])
+        self.assertEqual(history["versions"][0]["preview"], "Edited bulletin")
+        self.assertEqual(history["versions"][1]["preview"], "Original bulletin")
+
+        self.post(
+            self.owner,
+            f"{self.base}/messages/{message_id}/revisions",
+            {
+                **request,
+                "body": "Owner overwrite",
+                "idempotency_key": _key(),
+                "expected_version": 2,
+            },
+            expected=403,
+        )
+        self.post(
+            self.member,
+            f"{self.base}/messages/{message_id}/revisions",
+            {
+                **request,
+                "body": "Stale edit",
+                "idempotency_key": _key(),
+            },
+            expected=409,
+        )
+
+        database = sqlite3.connect(self.data_dir / "team-hub.sqlite3")
+        try:
+            original = database.execute(
+                "SELECT body FROM team_messages WHERE id=?",
+                (message_id,),
+            ).fetchone()
+            self.assertEqual(original, ("Original bulletin",))
+            revisions = database.execute(
+                "SELECT version,body FROM team_message_revisions WHERE message_id=?",
+                (message_id,),
+            ).fetchall()
+            self.assertEqual(revisions, [(2, "Edited bulletin")])
+        finally:
+            database.close()
+
     def test_idempotent_replay_returns_same_message_and_conflicts_on_changed_body(self) -> None:
         key = _key()
         payload = {

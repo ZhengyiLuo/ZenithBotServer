@@ -93,6 +93,7 @@ MAX_TEAM_MESSAGE_ATTACHMENTS = 16
 MAX_TEAM_MESSAGE_ATTACHMENT_BYTES = 2 * 1024 * 1024 * 1024
 MAX_TEAM_MESSAGE_TITLE_CHARS = 160
 MAX_TEAM_MESSAGE_PREVIEW_CHARS = 280
+MAX_TEAM_MESSAGE_REVISIONS = 200
 TEAM_MESSAGE_PROVENANCE_KEYS = ("via", "backend", "chat_id", "run_id")
 DEFAULT_TEAM_ATTACHMENT_MAX_BYTES = 512 * 1024 * 1024
 DEFAULT_TEAM_ATTACHMENT_QUOTA_BYTES = 50 * 1024 * 1024 * 1024
@@ -11725,6 +11726,25 @@ class HubStore:
         caller = self._caller_network_node(connection, claims, team_id)
         return str(caller["node_id"]) == node_id
 
+    def _team_message_author_matches(
+        self,
+        connection: sqlite3.Connection,
+        claims: AccessClaims,
+        team_id: str,
+        row: sqlite3.Row,
+    ) -> bool:
+        """Match the exact posting identity; moderation never grants authorship."""
+
+        if row["sender_kind"] == "human":
+            return (
+                claims.auth_kind not in NETWORK_AUTOMATION_AUTH_KINDS
+                and str(row["sender_principal_id"]) == claims.principal_id
+            )
+        if claims.auth_kind not in NETWORK_AUTOMATION_AUTH_KINDS:
+            return False
+        caller = self._caller_network_node(connection, claims, team_id)
+        return str(caller["node_id"]) == str(row["sender_node_id"])
+
     @staticmethod
     def _team_can_write(claims: AccessClaims, membership_role: str | None) -> bool:
         if claims.auth_kind in NETWORK_AUTOMATION_AUTH_KINDS:
@@ -11736,7 +11756,13 @@ class HubStore:
     @staticmethod
     def _team_message_select() -> str:
         return """
-            SELECT m.*, length(CAST(m.body AS BLOB)) AS body_bytes,
+            SELECT m.*,
+                   COALESCE(mr.body, m.body) AS current_body,
+                   COALESCE(mr.body_format, m.body_format) AS current_body_format,
+                   COALESCE(mr.body_sha256, m.body_sha256) AS current_body_sha256,
+                   length(CAST(COALESCE(mr.body, m.body) AS BLOB)) AS body_bytes,
+                   COALESCE(mr.version, 1) AS message_version,
+                   mr.created_at AS message_edited_at,
                    sp.display_name AS sender_principal_display_name,
                    sn.display_name AS sender_node_display_name,
                    s.slug AS skill_slug
@@ -11744,6 +11770,47 @@ class HubStore:
             JOIN principals AS sp ON sp.id=m.sender_principal_id
             LEFT JOIN nodes AS sn ON sn.team_id=m.team_id AND sn.id=m.sender_node_id
             LEFT JOIN team_skills AS s ON s.team_id=m.team_id AND s.id=m.skill_id
+            LEFT JOIN team_message_revisions AS mr
+              ON mr.team_id=m.team_id AND mr.message_id=m.id
+             AND mr.version=(
+                 SELECT MAX(latest.version)
+                 FROM team_message_revisions AS latest
+                 WHERE latest.team_id=m.team_id AND latest.message_id=m.id
+             )
+        """
+
+    @staticmethod
+    def _team_message_revisions_select() -> str:
+        return """
+            SELECT 1 AS revision_version,
+                   m.body AS revision_body,
+                   m.body_format AS revision_body_format,
+                   m.body_sha256 AS revision_body_sha256,
+                   m.sender_kind AS revision_editor_kind,
+                   m.sender_principal_id AS revision_editor_principal_id,
+                   m.sender_node_id AS revision_editor_node_id,
+                   sp.display_name AS revision_editor_principal_display_name,
+                   sn.display_name AS revision_editor_node_display_name,
+                   m.created_at AS revision_created_at
+            FROM team_messages AS m
+            JOIN principals AS sp ON sp.id=m.sender_principal_id
+            LEFT JOIN nodes AS sn ON sn.team_id=m.team_id AND sn.id=m.sender_node_id
+            WHERE m.team_id=? AND m.id=?
+            UNION ALL
+            SELECT r.version AS revision_version,
+                   r.body AS revision_body,
+                   r.body_format AS revision_body_format,
+                   r.body_sha256 AS revision_body_sha256,
+                   r.editor_kind AS revision_editor_kind,
+                   r.edited_by_principal_id AS revision_editor_principal_id,
+                   r.editor_node_id AS revision_editor_node_id,
+                   ep.display_name AS revision_editor_principal_display_name,
+                   en.display_name AS revision_editor_node_display_name,
+                   r.created_at AS revision_created_at
+            FROM team_message_revisions AS r
+            JOIN principals AS ep ON ep.id=r.edited_by_principal_id
+            LEFT JOIN nodes AS en ON en.team_id=r.team_id AND en.id=r.editor_node_id
+            WHERE r.team_id=? AND r.message_id=?
         """
 
     @staticmethod
@@ -11832,13 +11899,14 @@ class HubStore:
         row: sqlite3.Row,
         *,
         include_body: bool,
+        include_revision: bool = False,
         owned: list[tuple[str, str]] | None = None,
         delivery_address: tuple[str, str] | None = None,
     ) -> dict[str, Any]:
         team_id = str(row["team_id"])
         message_id = str(row["id"])
         recipient_rows = self._team_message_recipients(connection, team_id, message_id)
-        body = str(row["body"])
+        body = str(row["current_body"])
         item: dict[str, Any] = {
             "id": message_id,
             "sequence": int(row["queue_ordinal"]),
@@ -11847,9 +11915,9 @@ class HubStore:
             # Keep the wire contract strict so one legacy row cannot poison a
             # client's entire inbox/feed response.
             "title": row["title"] if row["kind"] == "skill" else None,
-            "body_format": row["body_format"],
+            "body_format": row["current_body_format"],
             "body_bytes": int(row["body_bytes"]),
-            "body_sha256": bytes(row["body_sha256"]).hex(),
+            "body_sha256": bytes(row["current_body_sha256"]).hex(),
             "sender": self._team_sender_party(row),
             "recipients": [self._team_recipient_public(item) for item in recipient_rows],
             "attachments": self._team_message_attachments(connection, team_id, message_id),
@@ -11866,6 +11934,12 @@ class HubStore:
             "provenance": self._team_provenance_public(row["provenance_json"]),
             "created_at": _iso8601(row["created_at"]),
         }
+        if include_revision:
+            item["revision"] = {
+                "version": int(row["message_version"]),
+                "versions_count": int(row["message_version"]),
+                "edited_at": _iso8601(row["message_edited_at"]),
+            }
         if include_body:
             item["body"] = body
         else:
@@ -11893,6 +11967,42 @@ class HubStore:
                     and recipient["id"] == delivery_id
                 ]
             item["delivery"] = mine[0] if mine else None
+        return item
+
+    @staticmethod
+    def _team_message_revision_public(
+        row: sqlite3.Row,
+        *,
+        include_body: bool,
+    ) -> dict[str, Any]:
+        body = str(row["revision_body"])
+        item: dict[str, Any] = {
+            "version": int(row["revision_version"]),
+            "body_format": row["revision_body_format"],
+            "body_bytes": len(body.encode("utf-8")),
+            "body_sha256": bytes(row["revision_body_sha256"]).hex(),
+            "editor": HubStore._team_party(
+                str(row["revision_editor_kind"]),
+                str(
+                    row["revision_editor_node_id"]
+                    if row["revision_editor_kind"] == "server"
+                    else row["revision_editor_principal_id"]
+                ),
+                row[
+                    "revision_editor_node_display_name"
+                    if row["revision_editor_kind"] == "server"
+                    else "revision_editor_principal_display_name"
+                ],
+            ),
+            "created_at": _iso8601(row["revision_created_at"]),
+        }
+        if include_body:
+            item["body"] = body
+        else:
+            preview = " ".join(body.split())
+            if len(preview) > MAX_TEAM_MESSAGE_PREVIEW_CHARS:
+                preview = preview[: MAX_TEAM_MESSAGE_PREVIEW_CHARS - 1] + "…"
+            item["preview"] = preview
         return item
 
     def _team_message_visible(
@@ -12391,6 +12501,7 @@ class HubStore:
         since: Any = None,
         after_sequence: int = 0,
         limit: int = 50,
+        include_revision: bool = False,
     ) -> dict[str, Any]:
         if box not in {"inbox", "feed", "sent"}:
             raise HubError("invalid_request", "Message box is invalid", 422)
@@ -12477,6 +12588,7 @@ class HubStore:
                     connection,
                     row,
                     include_body=False,
+                    include_revision=include_revision,
                     owned=owned if box == "inbox" else None,
                     delivery_address=(str(address_kind), str(address_id))
                     if box == "inbox"
@@ -12509,7 +12621,12 @@ class HubStore:
             connection.close()
 
     def get_team_message(
-        self, claims: AccessClaims, team_id: str, message_id: str
+        self,
+        claims: AccessClaims,
+        team_id: str,
+        message_id: str,
+        *,
+        include_revision: bool = False,
     ) -> dict[str, Any]:
         connection = self.connect()
         try:
@@ -12537,7 +12654,11 @@ class HubStore:
                 raise HubError("not_found", "Resource not found", 404)
             response = {
                 "message": self._team_message_public(
-                    connection, row, include_body=True, owned=owned
+                    connection,
+                    row,
+                    include_body=True,
+                    include_revision=include_revision,
+                    owned=owned,
                 )
             }
             connection.execute("COMMIT")
@@ -12546,6 +12667,236 @@ class HubStore:
             if connection.in_transaction:
                 connection.execute("ROLLBACK")
             raise
+        finally:
+            connection.close()
+
+    def list_team_message_revisions(
+        self,
+        claims: AccessClaims,
+        team_id: str,
+        message_id: str,
+    ) -> dict[str, Any]:
+        """Return immutable revision summaries for one visible Team Message."""
+
+        connection = self.connect()
+        try:
+            connection.execute("BEGIN")
+            membership = self._require_network_scope(
+                connection, claims, team_id, write=False
+            )
+            row = connection.execute(
+                self._team_message_select()
+                + """
+                WHERE m.team_id=? AND m.id=?
+                  AND NOT EXISTS (
+                    SELECT 1 FROM network_content_deletions AS deletion
+                    WHERE deletion.team_id=m.team_id
+                      AND deletion.resource_kind='message'
+                      AND deletion.resource_id=m.id
+                  )
+                """,
+                (team_id, message_id),
+            ).fetchone()
+            if row is None:
+                raise HubError("not_found", "Resource not found", 404)
+            owned = self._team_owned_addresses(
+                connection, claims, team_id, str(membership["role"])
+            )
+            if not self._team_message_visible(connection, claims, row, owned):
+                raise HubError("not_found", "Resource not found", 404)
+            revision_rows = connection.execute(
+                self._team_message_revisions_select()
+                + " ORDER BY revision_version DESC",
+                (team_id, message_id, team_id, message_id),
+            ).fetchall()
+            response = {
+                "message_id": message_id,
+                "versions": [
+                    self._team_message_revision_public(item, include_body=False)
+                    for item in revision_rows
+                ],
+            }
+            connection.execute("COMMIT")
+            return response
+        except BaseException:
+            if connection.in_transaction:
+                connection.execute("ROLLBACK")
+            raise
+        finally:
+            connection.close()
+
+    def revise_team_message(
+        self,
+        claims: AccessClaims,
+        team_id: str,
+        message_id: str,
+        request: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Append an author-only body revision to a broadcast Team Message."""
+
+        timestamp = _now()
+        body, body_format, body_digest, body_bytes = self._team_body(request)
+        expected_version = request.get("expected_version")
+        if type(expected_version) is not int or expected_version < 1:
+            raise HubError("invalid_request", "expected_version is invalid", 422)
+        idempotency_key = self._team_idempotency_key(request)
+        fingerprint = canonical_fingerprint(
+            {
+                "team_id": team_id,
+                "message_id": message_id,
+                "body": body,
+                "body_format": body_format,
+                "expected_version": expected_version,
+            }
+        )
+        connection = self.connect()
+        try:
+            with _write_transaction(connection):
+                self._require_network_scope(connection, claims, team_id, write=True)
+                cached = self._idempotency_lookup(
+                    connection,
+                    team_id,
+                    claims.principal_id,
+                    "team.message.revise",
+                    idempotency_key,
+                    fingerprint,
+                )
+                if cached is not None:
+                    return cached
+                row = connection.execute(
+                    self._team_message_select()
+                    + """
+                    WHERE m.team_id=? AND m.id=?
+                      AND NOT EXISTS (
+                        SELECT 1 FROM network_content_deletions AS deletion
+                        WHERE deletion.team_id=m.team_id
+                          AND deletion.resource_kind='message'
+                          AND deletion.resource_id=m.id
+                      )
+                    """,
+                    (team_id, message_id),
+                ).fetchone()
+                if row is None:
+                    raise HubError("not_found", "Resource not found", 404)
+                if row["kind"] != "message":
+                    raise HubError(
+                        "skill_version_required",
+                        "Publish a new skill version in the Skills library instead",
+                        409,
+                    )
+                recipients = self._team_message_recipients(
+                    connection, team_id, message_id
+                )
+                if len(recipients) != 1 or recipients[0]["recipient_kind"] != "all":
+                    raise HubError(
+                        "invalid_request",
+                        "Only Bulletin messages can be edited",
+                        409,
+                    )
+                if not self._team_message_author_matches(
+                    connection, claims, team_id, row
+                ):
+                    raise HubError("forbidden", "Only the poster can edit this message", 403)
+                current_version = int(row["message_version"])
+                if expected_version != current_version:
+                    raise HubError(
+                        "version_conflict",
+                        "The message changed; reload it before editing",
+                        409,
+                    )
+                if current_version >= MAX_TEAM_MESSAGE_REVISIONS:
+                    raise HubError(
+                        "revision_limit_reached",
+                        "This message has reached its revision limit",
+                        409,
+                    )
+                if (
+                    body == str(row["current_body"])
+                    and body_format == str(row["current_body_format"])
+                ):
+                    raise HubError("unchanged", "The edited message is unchanged", 409)
+                self._charge_network_peer_write(
+                    connection, claims, team_id, body_bytes, timestamp
+                )
+                revision_id = _id("message_revision")
+                next_version = current_version + 1
+                sender_kind, sender_node_id = self._team_sender(
+                    connection, claims, team_id
+                )
+                connection.execute(
+                    """
+                    INSERT INTO team_message_revisions(
+                        id,team_id,message_id,version,body_format,body,body_sha256,
+                        editor_kind,edited_by_principal_id,editor_node_id,
+                        idempotency_key,created_at
+                    ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
+                    """,
+                    (
+                        revision_id,
+                        team_id,
+                        message_id,
+                        next_version,
+                        body_format,
+                        body,
+                        body_digest,
+                        sender_kind,
+                        claims.principal_id,
+                        sender_node_id,
+                        hashlib.sha256(
+                            f"{team_id}\0{claims.principal_id}\0team.message.revise\0{idempotency_key}".encode(
+                                "utf-8"
+                            )
+                        ).digest(),
+                        timestamp,
+                    ),
+                )
+                updated = connection.execute(
+                    self._team_message_select() + " WHERE m.team_id=? AND m.id=?",
+                    (team_id, message_id),
+                ).fetchone()
+                assert updated is not None
+                response = {
+                    "message": self._team_message_public(
+                        connection,
+                        updated,
+                        include_body=True,
+                        include_revision=True,
+                    )
+                }
+                self._idempotency_store(
+                    connection,
+                    team_id,
+                    claims.principal_id,
+                    "team.message.revise",
+                    idempotency_key,
+                    fingerprint,
+                    "team_message_revision",
+                    revision_id,
+                    response,
+                    timestamp,
+                )
+                self._audit(
+                    connection,
+                    team_id,
+                    claims.principal_id,
+                    "team.message.revise",
+                    "team_message",
+                    message_id,
+                    "succeeded",
+                    {"version": next_version},
+                    timestamp,
+                )
+                self._outbox(
+                    connection,
+                    team_id,
+                    "team_message_revision",
+                    revision_id,
+                    "team.message.revised",
+                    timestamp,
+                )
+                return response
+        except sqlite3.IntegrityError as exc:
+            raise HubError("conflict", "Team message revision conflicts", 409) from exc
         finally:
             connection.close()
 
