@@ -16,6 +16,7 @@ import re
 import tomllib
 from pathlib import Path
 
+from agentsdock_team_hub.database import LATEST_SCHEMA_VERSION
 from agentsdock_team_hub.store import HubStore
 from scripts import package_release
 
@@ -3160,7 +3161,7 @@ FAKE_NATIVE_ARCH=1 exec /bin/bash "$@"
             try:
                 self.assertEqual(
                     connection.execute("PRAGMA user_version").fetchone()[0],
-                    12,
+                    LATEST_SCHEMA_VERSION,
                 )
                 self.assertIsNone(
                     connection.execute(
@@ -4231,7 +4232,10 @@ exit 0
             self.assertFalse(store.maintenance_fence_path.exists())
             connection = sqlite3.connect(store.database_path)
             try:
-                self.assertEqual(connection.execute("PRAGMA user_version").fetchone()[0], 12)
+                self.assertEqual(
+                    connection.execute("PRAGMA user_version").fetchone()[0],
+                    LATEST_SCHEMA_VERSION,
+                )
                 self.assertEqual(
                     connection.execute(
                         "SELECT hub_id, server_identity FROM managed_host_bindings"
@@ -7094,6 +7098,8 @@ exit 0
             connection.execute("DROP TRIGGER network_bulletin_body_limit_on_insert")
             connection.execute("DROP TRIGGER network_bulletin_body_limit_on_update")
             for trigger in (
+                "team_message_revisions_are_immutable",
+                "team_message_revisions_cannot_be_deleted",
                 "human_admin_page_device_session_insert",
                 "human_admin_page_invitation_insert",
                 "human_admin_page_membership_insert",
@@ -7102,6 +7108,8 @@ exit 0
             ):
                 connection.execute(f"DROP TRIGGER {trigger}")
             for index in (
+                "team_message_revisions_by_message",
+                "team_message_revisions_by_team",
                 "device_sessions_human_created_id_idx",
                 "invitations_pending_team_created_id_idx",
                 "memberships_active_team_created_principal_idx",
@@ -7109,6 +7117,8 @@ exit 0
             ):
                 connection.execute(f"DROP INDEX {index}")
             for table in (
+                # Migration 0013 (immutable Team Message revision journal).
+                "team_message_revisions",
                 # Migration 0012 (immutable network content deletion journal).
                 "network_content_deletions",
                 # Migration 0011 (bounded human-administration paging).
