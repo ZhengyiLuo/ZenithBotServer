@@ -48,6 +48,18 @@ def _all_reference() -> agent_server.TeamReference:
     )
 
 
+def _bulletin_reference() -> agent_server.TeamReference:
+    return agent_server.TeamReference(
+        kind="recipient",
+        recipient_kind="all",
+        team_id="team_alpha_0001",
+        target_id="all",
+        display_name_snapshot="bulletin",
+        source_text_start=18,
+        source_text_end=28,
+    )
+
+
 def _skill_reference() -> agent_server.TeamReference:
     return agent_server.TeamReference(
         kind="skill",
@@ -85,6 +97,16 @@ class TeamReferenceModelTests(unittest.TestCase):
             _server_reference(source_text_start=9, source_text_end=3)
         with self.assertRaises(ValidationError):
             _server_reference(grant_intent=False)
+
+    def test_bulletin_is_the_team_wide_alias_and_all_remains_compatible(self) -> None:
+        self.assertEqual(_bulletin_reference().display_name_snapshot, "bulletin")
+        self.assertEqual(_all_reference().display_name_snapshot, "all")
+        with self.assertRaises(ValidationError):
+            _server_reference(
+                recipient_kind="all",
+                target_id="all",
+                display_name_snapshot="everyone",
+            )
 
     def test_turn_request_keeps_team_references_apart_from_chat_references(self) -> None:
         request = agent_server.TurnRequest(
@@ -170,6 +192,16 @@ class TeamPurposeGatingTests(unittest.TestCase):
         self.assertEqual(
             agent_server.validate_team_references(prompt, [reference]),
             [reference],
+        )
+
+        bulletin_prompt = "Send an update to @@bulletin now"
+        bulletin_reference = _bulletin_reference()
+        self.assertEqual(
+            agent_server.validate_team_references(
+                bulletin_prompt,
+                [bulletin_reference],
+            ),
+            [bulletin_reference],
         )
 
         unicode_prompt = "Send @@李😀 now"
@@ -406,6 +438,17 @@ class TeamReferenceResolutionTests(unittest.TestCase):
         )
         resolved = runtime.resolve_team_references([_all_reference().model_dump()])
         self.assertEqual(resolved[0]["team_id"], "team_alpha_0001")
+
+        bulletin = runtime.resolve_team_references(
+            [_bulletin_reference().model_dump()]
+        )
+        self.assertEqual(bulletin[0]["team_id"], "team_alpha_0001")
+        self.assertEqual(bulletin[0]["recipient_kind"], "all")
+
+        invalid_alias = _all_reference().model_dump()
+        invalid_alias["display_name_snapshot"] = "everyone"
+        with self.assertRaisesRegex(SecurePeerError, "@@bulletin"):
+            runtime.resolve_team_references([invalid_alias])
 
     def test_hidden_automation_member_is_not_a_human_recipient(self) -> None:
         runtime, _realms = self.runtime(

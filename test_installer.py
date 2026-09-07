@@ -1541,6 +1541,10 @@ exit 0
                 f"agents-server-{version}/agentsdock_team_hub/migrations/0012_network_content_deletions.sql",
                 members,
             )
+            self.assertIn(
+                f"agents-server-{version}/agentsdock_team_hub/migrations/0013_team_message_revisions.sql",
+                members,
+            )
             self.assertFalse(
                 any("__pycache__" in name or name.endswith((".pyc", ".pyo")) for name in members)
             )

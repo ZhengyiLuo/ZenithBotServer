@@ -467,6 +467,18 @@ class SecurePeerHubAdapter:
         }
 
     @classmethod
+    def _team_message_revision_body(cls, request: ProxyRequest) -> dict[str, Any]:
+        value = cls._object_body(
+            request,
+            allowed={"body", "body_format", "expected_version", "idempotency_key"},
+            required={"body", "expected_version", "idempotency_key"},
+        )
+        value["idempotency_key"] = cls._identifier(
+            value["idempotency_key"], minimum=8
+        )
+        return value
+
+    @classmethod
     def _network_delete_body(cls, request: ProxyRequest) -> dict[str, Any]:
         value = cls._object_body(
             request,
@@ -855,6 +867,7 @@ class SecurePeerHubAdapter:
                             "address_id",
                             "after_sequence",
                             "limit",
+                            "include_revision",
                         },
                     )
                     if not {"address_kind", "address_id"}.issubset(values):
@@ -908,9 +921,22 @@ class SecurePeerHubAdapter:
                         since=values.get("since"),
                         after_sequence=int(values.get("after_sequence", "0")),
                         limit=int(values.get("limit", "50")),
+                        include_revision=self._query_flag(values, "include_revision"),
                     )
                 elif len(pieces) == 4 and pieces[1:3] == [_NETWORK_CHILD, "messages"]:
+                    values = self._team_query(request, allowed={"include_revision"})
                     result = self.store.get_team_message(
+                        claims,
+                        team_id,
+                        self._resource_id(pieces[3]),
+                        include_revision=self._query_flag(values, "include_revision"),
+                    )
+                elif (
+                    len(pieces) == 5
+                    and pieces[1:3] == [_NETWORK_CHILD, "messages"]
+                    and pieces[4] == "revisions"
+                ):
+                    result = self.store.list_team_message_revisions(
                         claims, team_id, self._resource_id(pieces[3])
                     )
                 elif len(pieces) == 4 and pieces[1:3] == [_NETWORK_CHILD, "attachments"]:
@@ -1039,6 +1065,17 @@ class SecurePeerHubAdapter:
                         team_id,
                         self._resource_id(pieces[3]),
                         self._team_receipt_body(request),
+                    )
+                elif (
+                    len(pieces) == 5
+                    and pieces[1:3] == [_NETWORK_CHILD, "messages"]
+                    and pieces[4] == "revisions"
+                ):
+                    result = self.store.revise_team_message(
+                        claims,
+                        team_id,
+                        self._resource_id(pieces[3]),
+                        self._team_message_revision_body(request),
                     )
                 elif len(pieces) == 3 and pieces[1:] == [_NETWORK_CHILD, "attachments"]:
                     result = self.store.declare_team_attachment(

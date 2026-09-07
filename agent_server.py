@@ -6032,9 +6032,12 @@ class TeamReference(BaseModel):
                 raise ValueError("team-wide recipients use target_id 'all'")
             if (
                 self.recipient_kind == "all"
-                and self.display_name_snapshot != "all"
+                and self.display_name_snapshot not in {"all", "bulletin"}
             ):
-                raise ValueError("team-wide recipients use the visible token '@@all'")
+                raise ValueError(
+                    "team-wide recipients use the visible token '@@bulletin' "
+                    "(legacy '@@all' is also accepted)"
+                )
         elif self.recipient_kind is not None:
             raise ValueError("skill references cannot carry recipient_kind")
         if self.source_text_end <= self.source_text_start:
@@ -7465,6 +7468,12 @@ class ServerRestartRequest(BaseModel):
         max_length=64,
         pattern=r"^[0-9a-f]{64}$",
     )
+    expected_update_schedule_id: str | None = Field(
+        default=None,
+        min_length=32,
+        max_length=32,
+        pattern=r"^[0-9a-f]{32}$",
+    )
 
     @field_validator("confirmed", mode="before")
     @classmethod
@@ -7493,6 +7502,13 @@ class ServerRestartRequest(BaseModel):
         if self.expected_blocker_revision is not None and self.force is not True:
             raise ValueError(
                 "expected_blocker_revision requires a forced restart"
+            )
+        if (
+            self.expected_update_schedule_id is not None
+            and self.force is not True
+        ):
+            raise ValueError(
+                "expected_update_schedule_id requires a forced restart"
             )
         return self
 
@@ -18144,7 +18160,7 @@ def cross_chat_provider_authority_block(
             f"- Send a message (Markdown body on stdin, never argv): `{team_command} send --route ROUTE_ID --kind message [--attach /abs/path]...`",
             *(
                 (
-                    f"- Publish a skill: `{team_command} send --route ROUTE_ID --kind skill --skill-slug SLUG --title T [--attach /abs/path]...`. Use this only for @@all or a mentioned skill; when updating an existing skill pass `--expected-version` from `skill get`. Skill bodies should be complete, runnable instructions.",
+                    f"- Publish a skill: `{team_command} send --route ROUTE_ID --kind skill --skill-slug SLUG --title T [--attach /abs/path]...`. Use this only for @@bulletin (legacy @@all) or a mentioned skill; when updating an existing skill pass `--expected-version` from `skill get`. Skill bodies should be complete, runnable instructions.",
                 )
                 if "team_skill_publish" in actions
                 else ()
@@ -60257,6 +60273,10 @@ SERVER_UPDATE_PER_RUN_STATUS_FIELDS = (
     "error_action",
     "retryable",
 )
+SERVER_UPDATE_PRIVATE_PER_RUN_STATUS_FIELDS = (
+    "_force_restart_request_id",
+    "_force_restart_requested_at",
+)
 SERVER_UPDATE_OPERATION_LOCK = asyncio.Lock()
 SERVER_UPDATE_START_GRACE_SECONDS = 45.0
 SERVER_RESTART_PHASES = {"idle", "accepted", "signaling", "complete", "failed"}
@@ -60422,6 +60442,29 @@ def managed_server_update_is_pending(
     return str(current.get("phase") or "") == SERVER_UPDATE_PENDING_PHASE
 
 
+def managed_server_force_update_is_pending(
+    status: dict[str, Any] | None = None,
+) -> bool:
+    """Return whether an exact pending update was armed for forced restart."""
+
+    current = status if status is not None else read_server_update_status()
+    if (
+        not managed_server_update_is_pending(current)
+        or current.get("cancelable") is not False
+        or re.fullmatch(
+            r"[0-9a-f]{32}",
+            str(current.get("schedule_id") or ""),
+        )
+        is None
+    ):
+        return False
+    request_id = str(current.get("_force_restart_request_id") or "").strip()
+    try:
+        return str(uuid.UUID(request_id)) == request_id
+    except (ValueError, AttributeError):
+        return False
+
+
 def managed_server_update_blocker() -> str | None:
     if managed_server_update_blocks_work():
         return MANAGED_SERVER_UPDATE_ACTIVE_DETAIL
@@ -60433,15 +60476,19 @@ def managed_server_update_blocker() -> str | None:
 def managed_server_update_admission_blocker() -> str | None:
     """Fence new agent work only while an update or restart replaces this process.
 
-    A pending update-when-idle reservation is deliberately NOT a blocker: it
-    waits for a moment when nothing is running and must never refuse a turn,
-    a Force Send, a manual Run Now, or a provider control. Automatic
-    scheduled jobs use the narrower durable deferral path below. Earlier
-    releases parked every new turn behind the reservation, which locked the
-    operator out of every chat while one long turn ran.
+    An ordinary pending update-when-idle reservation is deliberately NOT a
+    blocker. The exception is a schedule-bound force update: its cleanup
+    restart has already been explicitly confirmed, so execution stays fenced
+    while user messages continue through the durable queue fallback. Automatic
+    scheduled jobs use the narrower durable deferral path below.
     """
 
-    return managed_server_update_blocker()
+    blocker = managed_server_update_blocker()
+    if blocker:
+        return blocker
+    if managed_server_force_update_is_pending():
+        return MANAGED_SERVER_UPDATE_PENDING_DETAIL
+    return None
 
 
 def managed_server_update_scheduled_job_blocker(
@@ -60536,6 +60583,7 @@ def request_route_parses_body(request: Request) -> bool:
 def unsafe_http_mutation_blocked_response(
     *,
     hub_maintenance_route: bool,
+    durable_turn_route: bool = False,
 ) -> JSONResponse | None:
     if managed_server_restart_blocks_work():
         if hub_maintenance_route:
@@ -60579,6 +60627,33 @@ def unsafe_http_mutation_blocked_response(
             )
         return JSONResponse(
             {"detail": "AgentsServer is preparing a managed update"},
+            status_code=409,
+        )
+    if managed_server_force_update_is_pending() and not durable_turn_route:
+        if hub_maintenance_route:
+            return JSONResponse(
+                {
+                    "error": {
+                        "code": "hub_maintenance",
+                        "message": (
+                            "Team Hub is unavailable during server maintenance"
+                        ),
+                    }
+                },
+                status_code=503,
+            )
+        return JSONResponse(
+            {
+                "detail": server_update_error_detail(
+                    "server_force_update_armed",
+                    (
+                        "AgentsServer is restarting to apply a confirmed "
+                        "force update and is not accepting server changes."
+                    ),
+                    action="Wait for the managed update to finish, then retry.",
+                    retryable=True,
+                )
+            },
             status_code=409,
         )
     return None
@@ -60766,6 +60841,11 @@ def public_server_restart_status(
         raw_audit = current.get("_forced_audit")
         if isinstance(raw_audit, dict):
             result["forced_audit"] = public_forced_restart_audit(raw_audit)
+        update_schedule_id = str(
+            current.get("_update_schedule_id") or ""
+        ).strip()
+        if re.fullmatch(r"[0-9a-f]{32}", update_schedule_id):
+            result["update_schedule_id"] = update_schedule_id
     if blocker_snapshot is not None:
         result["blocker_snapshot"] = blocker_snapshot
     for name in (
@@ -61242,11 +61322,12 @@ def server_restart_request_fingerprint(body: ServerRestartRequest) -> str:
 
     canonical = json.dumps(
         {
-            "contract": 2,
+            "contract": 3,
             "expected_server_identity": body.expected_server_identity,
             "expected_server_instance_id": body.expected_server_instance_id,
             "forced": body.force is True and body.force_confirmed is True,
             "expected_blocker_revision": body.expected_blocker_revision,
+            "expected_update_schedule_id": body.expected_update_schedule_id,
         },
         ensure_ascii=True,
         separators=(",", ":"),
@@ -62047,7 +62128,14 @@ def public_server_update_status(status: dict[str, Any]) -> dict[str, Any]:
     """Attach the live responder identity without persisting process identity."""
 
     return {
-        **status,
+        **{
+            key: value
+            for key, value in status.items()
+            if key not in {
+                "_force_restart_request_id",
+                "_force_restart_requested_at",
+            }
+        },
         "server_identity": server_identity(),
         "server_instance_id": SERVER_INSTANCE_ID,
     }
@@ -62071,7 +62159,13 @@ def _write_fresh_server_update_status_unlocked(
 ) -> dict[str, Any]:
     """Start a new public status row without leaking an older run's fields."""
 
-    clean = {name: None for name in SERVER_UPDATE_PER_RUN_STATUS_FIELDS}
+    clean = {
+        name: None
+        for name in (
+            *SERVER_UPDATE_PER_RUN_STATUS_FIELDS,
+            *SERVER_UPDATE_PRIVATE_PER_RUN_STATUS_FIELDS,
+        )
+    }
     clean.update(changes)
     return _write_server_update_status_unlocked(**clean)
 
@@ -62442,12 +62536,34 @@ def reconcile_pending_server_update_after_startup(
         schedule_id = str(current.get("schedule_id") or "").strip()
         target = str(current.get("target_version") or "").strip()
         track = str(current.get("track") or "").strip()
+        force_marker_present = any(
+            current.get(name) is not None
+            for name in (
+                "_force_restart_request_id",
+                "_force_restart_requested_at",
+            )
+        )
         valid = (
             re.fullmatch(r"[0-9a-f]{32}", schedule_id) is not None
             and track in {"stable", "beta"}
             and bool(target)
             and current.get("when_idle") is True
         )
+        if force_marker_present:
+            requested_at = str(
+                current.get("_force_restart_requested_at") or ""
+            ).strip()
+            try:
+                datetime.fromisoformat(requested_at.replace("Z", "+00:00"))
+            except (TypeError, ValueError):
+                force_requested_at_valid = False
+            else:
+                force_requested_at_valid = True
+            valid = (
+                valid
+                and managed_server_force_update_is_pending(current)
+                and force_requested_at_valid
+            )
         if valid:
             try:
                 version_key(target)
@@ -62466,8 +62582,15 @@ def reconcile_pending_server_update_after_startup(
                 latest_version=(target or None),
                 update_available=bool(target),
                 message=(
-                    "The saved update-when-idle reservation was incomplete "
-                    "and was not resumed."
+                    (
+                        "The saved force-update reservation was incomplete "
+                        "and was not resumed."
+                    )
+                    if force_marker_present
+                    else (
+                        "The saved update-when-idle reservation was incomplete "
+                        "and was not resumed."
+                    )
                 ),
                 error_code="server_update_schedule_invalid",
                 error_action=(
@@ -63026,6 +63149,28 @@ async def lifespan(app: FastAPI):
     reconcile_server_restart_status_after_startup()
     clear_imported_active_runs()
     startup_update_status = await reconcile_server_update_status_after_startup()
+    abandoned_compaction_count = (
+        await recover_abandoned_codex_compactions_after_start(
+            forced_restart_request_id=(forced_restart_request_id or None),
+        )
+    )
+    abandoned_turn_count = await recover_abandoned_turns_after_start(
+        forced_restart_request_id=(forced_restart_request_id or None),
+    )
+    if managed_server_force_update_is_pending(startup_update_status):
+        # Give an explicitly confirmed force update first admission after its
+        # cleanup restart. Durable queued turns are reconstructed later, and
+        # the force marker keeps every provider start fenced if preflight must
+        # retry instead of allowing recovery work to starve the update again.
+        try:
+            startup_update_status = await advance_pending_server_update_once()
+        except Exception as exc:
+            logger.warning(
+                "startup force update advance deferred error_type=%s detail=%s",
+                type(exc).__name__,
+                concise_error_message(exc),
+            )
+            startup_update_status = read_server_update_status()
     active_update_schedule_id = (
         str(startup_update_status.get("schedule_id") or "").strip()
         if managed_server_update_is_pending(startup_update_status)
@@ -63037,14 +63182,6 @@ async def lifespan(app: FastAPI):
     # the one reservation that is still live.
     await JOBS.resume_update_parked(
         active_schedule_id=active_update_schedule_id,
-    )
-    abandoned_compaction_count = (
-        await recover_abandoned_codex_compactions_after_start(
-            forced_restart_request_id=(forced_restart_request_id or None),
-        )
-    )
-    abandoned_turn_count = await recover_abandoned_turns_after_start(
-        forced_restart_request_id=(forced_restart_request_id or None),
     )
     removed_authority_files = (
         await purge_cross_chat_authority_files_after_restart()
@@ -64311,6 +64448,10 @@ async def require_agent_token(request: Request, call_next):
         or team_hub_server_session_route
         or team_hub_bootstrap_route
     )
+    durable_turn_route = re.fullmatch(
+        r"/api/sessions/[^/]+/turns",
+        request.url.path,
+    ) is not None
     mutation_id = ""
     mutation_task: asyncio.Task[Any] | None = None
     mutation_registry = UNSAFE_HTTP_MUTATION_TASKS
@@ -64341,6 +64482,7 @@ async def require_agent_token(request: Request, call_next):
                 return
             blocked = unsafe_http_mutation_blocked_response(
                 hub_maintenance_route=hub_maintenance_route,
+                durable_turn_route=durable_turn_route,
             )
             if blocked is not None:
                 admission_rejected_response = blocked
@@ -64379,6 +64521,7 @@ async def require_agent_token(request: Request, call_next):
             async with UNSAFE_HTTP_MUTATION_ADMISSION_LOCK:
                 blocked = unsafe_http_mutation_blocked_response(
                     hub_maintenance_route=hub_maintenance_route,
+                    durable_turn_route=durable_turn_route,
                 )
                 if blocked is not None:
                     return blocked
@@ -65264,6 +65407,15 @@ async def health() -> dict[str, Any]:
                 "max_attachments_per_send": PROVIDER_TEAM_ATTACHMENT_LIMIT,
                 "max_body_bytes": PROVIDER_TEAM_BODY_MAX_BYTES,
             },
+            "team_bulletin_alias_v1": {
+                "available": bool(
+                    AGENT_TOKEN and (SERVER_ROOT / "agentsdock_team.py").is_file()
+                ),
+                "required": False,
+                "version": 1,
+                "mention": "@@bulletin",
+                "legacy_mention": "@@all",
+            },
             "local_session_import_v1": {
                 "available": True,
                 "required": False,
@@ -65357,10 +65509,10 @@ async def health() -> dict[str, Any]:
                 "required": False,
                 "message": "Signed Stable and Beta AgentsServer channels are available.",
                 "action": None,
-                # v10 keeps human work passive while pending updates defer
-                # autonomous scheduled-job admission. v9 binds status and
-                # controls to the exact live responder.
-                "version": 10,
+                # v11 adds an exact schedule-bound force-update restart. v10
+                # keeps human work passive while ordinary pending updates
+                # defer autonomous scheduled-job admission.
+                "version": 11,
                 "tracks": ["stable", "beta"],
             },
             "tmux": tmux,
@@ -65631,12 +65783,328 @@ def active_codex_work_labels() -> list[str]:
 
 
 SERVER_UPDATE_PROVIDER_WORK_LABEL_LIMIT = 32
+SERVER_UPDATE_CODEX_SUBAGENT_SCAN_LIMIT = SUBAGENT_SNAPSHOT_STATE_LIMIT
+SERVER_UPDATE_CODEX_SUBAGENT_SCAN_TIMEOUT_SECONDS = 5.0
 MAX_CLAUDE_BACKGROUND_EVENT_SCAN_BYTES = 64 * 1024 * 1024
 CLAUDE_PROVIDER_INSPECTION_OVERFLOW_LABEL = (
     "Claude provider state exceeds safe inspection limit"
 )
 CLAUDE_BACKGROUND_WORK_CACHE_KEY: tuple[Any, ...] | None = None
 CLAUDE_BACKGROUND_WORK_CACHE_LABELS: tuple[str, ...] = ()
+CODEX_SUBAGENT_NATIVE_STATUS_CACHE_MANAGER: Any = None
+CODEX_SUBAGENT_NATIVE_STATUS_CACHE_GENERATION: int | None = None
+CODEX_SUBAGENT_NATIVE_STATUS_CACHE: dict[
+    tuple[Any, ...],
+    tuple[str | None, int],
+] = {}
+CODEX_SUBAGENT_NATIVE_STATUS_CACHE_CLOCK = 0
+
+
+def codex_subagent_native_turn_candidates() -> tuple[
+    Any,
+    int | None,
+    tuple[tuple[Any, ...], ...],
+]:
+    """Return generation-owned child states that need native turn proof.
+
+    ``CODEX_SUBAGENT_LIVE_GENERATIONS`` is deliberately conservative: a
+    collaboration item observed in the current app-server generation marks a
+    child as live even when that item was replayed after the child's turn had
+    already stopped.  Busy owning chats and turns started through this server
+    have direct runtime ownership; only the generation-only fallback needs an
+    authoritative ``thread/turns/list`` check before restart/update admission.
+    """
+
+    manager = CODEX_APP_SERVER_MANAGER
+    generation = (
+        getattr(manager, "generation", None) if manager is not None else None
+    )
+    if (
+        manager is None
+        or getattr(manager, "ready", False) is not True
+        or not isinstance(generation, int)
+        or not callable(getattr(manager, "list_turns", None))
+    ):
+        return manager, generation, ()
+
+    with CODEX_SUBAGENT_INDEX_LOCK:
+        states = [
+            (
+                thread_id,
+                dict(state),
+                CODEX_SUBAGENT_SESSION_INDEX.get(thread_id),
+                CODEX_SUBAGENT_LIVE_GENERATIONS.get(thread_id),
+            )
+            for thread_id, state in CODEX_SUBAGENT_STATE.items()
+        ]
+
+    candidates: list[tuple[Any, ...]] = []
+    for thread_id, state, indexed_session_id, live_generation in states:
+        status = normalize_subagent_status(
+            state.get("subagent_status") or state.get("status")
+        )
+        if status not in {"starting", "running"}:
+            continue
+        session_id = str(
+            state.get("session_id") or indexed_session_id or ""
+        ).strip()
+        state_run_id = str(state.get("run_id") or "").strip()
+        if session_id and session_id in BUSY_SESSIONS:
+            owner = ACTIVE.get(session_id) or CURRENT_TURNS.get(session_id) or {}
+            owner_run_id = str(owner.get("run_id") or "").strip()
+            if (
+                not state_run_id
+                or not owner_run_id
+                or state_run_id == owner_run_id
+            ):
+                continue
+        direct_turn = None
+        with suppress(Exception):
+            direct_turn = manager.active_turn(thread_id)
+        direct_turn_id = str(
+            getattr(direct_turn, "turn_id", None) or ""
+        ).strip()
+        if direct_turn is None and live_generation != generation:
+            continue
+        if direct_turn is not None and not direct_turn_id:
+            # A provisional locally-owned turn has not received an ID that can
+            # be matched to native history yet. Its local handle remains the
+            # stronger, conservative proof that work may have been accepted.
+            continue
+        candidates.append(
+            (
+                thread_id,
+                session_id,
+                state_run_id,
+                status,
+                live_generation,
+                direct_turn_id,
+                str(state.get("id") or ""),
+                int(durable_event_seq(state) or 0),
+                str(state.get("ts") or ""),
+            )
+        )
+    candidates.sort()
+    return manager, generation, tuple(candidates)
+
+
+def cached_codex_subagent_native_statuses(
+    manager: Any,
+    generation: int | None,
+    candidates: tuple[tuple[Any, ...], ...],
+) -> dict[tuple[Any, ...], tuple[str | None, int]]:
+    """Return only proofs bound to the current manager and state revisions."""
+
+    global CODEX_SUBAGENT_NATIVE_STATUS_CACHE_MANAGER
+    global CODEX_SUBAGENT_NATIVE_STATUS_CACHE_GENERATION
+
+    candidate_set = set(candidates)
+    with CODEX_SUBAGENT_INDEX_LOCK:
+        if (
+            CODEX_SUBAGENT_NATIVE_STATUS_CACHE_MANAGER is not manager
+            or CODEX_SUBAGENT_NATIVE_STATUS_CACHE_GENERATION != generation
+        ):
+            CODEX_SUBAGENT_NATIVE_STATUS_CACHE.clear()
+            CODEX_SUBAGENT_NATIVE_STATUS_CACHE_MANAGER = manager
+            CODEX_SUBAGENT_NATIVE_STATUS_CACHE_GENERATION = generation
+        for candidate in tuple(CODEX_SUBAGENT_NATIVE_STATUS_CACHE):
+            if candidate not in candidate_set:
+                CODEX_SUBAGENT_NATIVE_STATUS_CACHE.pop(candidate, None)
+        return dict(CODEX_SUBAGENT_NATIVE_STATUS_CACHE)
+
+
+def cache_codex_subagent_native_statuses(
+    manager: Any,
+    generation: int | None,
+    candidates: tuple[tuple[Any, ...], ...],
+    results: list[tuple[tuple[Any, ...], str | None]],
+) -> dict[tuple[Any, ...], tuple[str | None, int]]:
+    """Commit one bounded inspection batch if its manager scope is current."""
+
+    global CODEX_SUBAGENT_NATIVE_STATUS_CACHE_CLOCK
+
+    cached_codex_subagent_native_statuses(manager, generation, candidates)
+    candidate_set = set(candidates)
+    with CODEX_SUBAGENT_INDEX_LOCK:
+        if (
+            CODEX_SUBAGENT_NATIVE_STATUS_CACHE_MANAGER is manager
+            and CODEX_SUBAGENT_NATIVE_STATUS_CACHE_GENERATION == generation
+        ):
+            for candidate, status in results:
+                if candidate in candidate_set:
+                    CODEX_SUBAGENT_NATIVE_STATUS_CACHE_CLOCK += 1
+                    CODEX_SUBAGENT_NATIVE_STATUS_CACHE[candidate] = (
+                        status,
+                        CODEX_SUBAGENT_NATIVE_STATUS_CACHE_CLOCK,
+                    )
+        return dict(CODEX_SUBAGENT_NATIVE_STATUS_CACHE)
+
+
+async def prepare_codex_subagent_terminal_snapshot(
+    *,
+    timeout_seconds: float | None = None,
+) -> dict[str, Any]:
+    """Prove which otherwise-live Codex child blockers are terminal.
+
+    A child is removable from the provider blocker list only when its latest
+    native turn has an explicit terminal status. Inspections run in bounded
+    batches and cache proofs against the exact manager generation and durable
+    child-state revision. This lets any finite replay backlog make progress
+    across pending-update polls without trusting missing or unknown turns.
+    """
+
+    manager, generation, candidates = codex_subagent_native_turn_candidates()
+    cached = cached_codex_subagent_native_statuses(
+        manager,
+        generation,
+        candidates,
+    )
+    terminal_statuses = {"completed", "stopped", "failed"}
+
+    def cached_terminal_thread_ids() -> tuple[str, ...]:
+        return tuple(sorted(
+            candidate[0]
+            for candidate, (status, _inspected_at) in cached.items()
+            if status in terminal_statuses
+        ))
+
+    if not candidates:
+        return {
+            "manager": manager,
+            "generation": generation,
+            "candidates": candidates,
+            "terminal_thread_ids": (),
+            "consistent": True,
+            "error": None,
+        }
+
+    uninspected = [candidate for candidate in candidates if candidate not in cached]
+    if uninspected:
+        inspection_batch = uninspected[:SERVER_UPDATE_CODEX_SUBAGENT_SCAN_LIMIT]
+    else:
+        # Once every child has a result, rotate through live/unknown results by
+        # least-recently inspected first. A missed terminal notification can
+        # therefore recover without starving children beyond the first batch.
+        inspection_batch = [
+            candidate
+            for candidate, _value in sorted(
+                (
+                    (candidate, cached[candidate])
+                    for candidate in candidates
+                    if cached[candidate][0] not in terminal_statuses
+                ),
+                key=lambda pair: (pair[1][1], pair[0]),
+            )[:SERVER_UPDATE_CODEX_SUBAGENT_SCAN_LIMIT]
+        ]
+    if not inspection_batch:
+        return {
+            "manager": manager,
+            "generation": generation,
+            "candidates": candidates,
+            "terminal_thread_ids": cached_terminal_thread_ids(),
+            "consistent": True,
+            "error": None,
+        }
+
+    async def latest_turn_status(
+        candidate: tuple[Any, ...],
+    ) -> tuple[tuple[Any, ...], str | None, bool]:
+        thread_id = candidate[0]
+        direct_turn_id = candidate[5]
+        try:
+            turns = await manager.list_turns(
+                thread_id,
+                limit=1,
+                items_view="summary",
+                sort_direction="desc",
+            )
+            latest_turn = turns[0] if turns else None
+            latest_turn_id = str(
+                latest_turn.get("id") if isinstance(latest_turn, dict) else ""
+            ).strip()
+            status = codex_child_status_from_turn(latest_turn)
+            if direct_turn_id and latest_turn_id != direct_turn_id:
+                # Native history has not caught up to the local turn handle,
+                # so an older terminal turn cannot retire the newer owner.
+                status = None
+            return candidate, status, True
+        except Exception:
+            # Keep this one child's existing generation blocker while still
+            # allowing independently proven terminal siblings to be ignored.
+            return candidate, None, False
+
+    try:
+        scan = asyncio.gather(
+            *(latest_turn_status(candidate) for candidate in inspection_batch)
+        )
+        effective_timeout = (
+            SERVER_UPDATE_CODEX_SUBAGENT_SCAN_TIMEOUT_SECONDS
+            if timeout_seconds is None
+            else max(0.0, float(timeout_seconds))
+        )
+        results = await asyncio.wait_for(scan, timeout=effective_timeout)
+    except (TimeoutError, asyncio.TimeoutError):
+        manager_after, generation_after, candidates_after = (
+            codex_subagent_native_turn_candidates()
+        )
+        consistent = (
+            manager_after is manager
+            and generation_after == generation
+            and candidates_after == candidates
+        )
+        return {
+            "manager": manager,
+            "generation": generation,
+            "candidates": candidates,
+            "terminal_thread_ids": (
+                cached_terminal_thread_ids() if consistent else ()
+            ),
+            "consistent": consistent,
+            "error": "timeout",
+        }
+    except Exception:
+        return {
+            "manager": manager,
+            "generation": generation,
+            "candidates": candidates,
+            "terminal_thread_ids": (),
+            "consistent": False,
+            "error": "scan_failed",
+        }
+
+    manager_after, generation_after, candidates_after = (
+        codex_subagent_native_turn_candidates()
+    )
+    consistent = (
+        manager_after is manager
+        and generation_after == generation
+        and candidates_after == candidates
+    )
+    scan_failed = any(not inspected for _, _, inspected in results)
+    if consistent:
+        cached = cache_codex_subagent_native_statuses(
+            manager,
+            generation,
+            candidates,
+            [
+                (candidate, status)
+                for candidate, status, _inspected in results
+            ],
+        )
+    return {
+        "manager": manager,
+        "generation": generation,
+        "candidates": candidates,
+        "terminal_thread_ids": (
+            cached_terminal_thread_ids() if consistent else ()
+        ),
+        "consistent": consistent,
+        "error": (
+            "state_changed"
+            if not consistent
+            else "scan_failed" if scan_failed else None
+        ),
+    }
 
 
 def loaded_claude_background_session_state(
@@ -65796,11 +66264,14 @@ async def prepare_provider_background_work_snapshot(
     *,
     timeout_seconds: float | None = None,
 ) -> dict[str, Any]:
-    """Fold Claude events before admission locks and bind them to metadata."""
+    """Inspect provider work before admission locks and bind it to metadata."""
 
     global CLAUDE_BACKGROUND_WORK_CACHE_KEY
     global CLAUDE_BACKGROUND_WORK_CACHE_LABELS
 
+    codex_snapshot = await prepare_codex_subagent_terminal_snapshot(
+        timeout_seconds=timeout_seconds,
+    )
     manager = CLAUDE_SDK_MANAGER
     session_ids, unknown_labels = loaded_claude_background_session_state(manager)
     fingerprints_before = await asyncio.to_thread(
@@ -65832,6 +66303,7 @@ async def prepare_provider_background_work_snapshot(
                 )
             )
             return {
+                "codex": codex_snapshot,
                 "manager": manager,
                 "session_ids": session_ids,
                 "unknown_labels": unknown_labels,
@@ -65842,6 +66314,7 @@ async def prepare_provider_background_work_snapshot(
             }
         except Exception:
             return {
+                "codex": codex_snapshot,
                 "manager": manager,
                 "session_ids": session_ids,
                 "unknown_labels": unknown_labels,
@@ -65860,6 +66333,7 @@ async def prepare_provider_background_work_snapshot(
         CLAUDE_BACKGROUND_WORK_CACHE_KEY = cache_key
         CLAUDE_BACKGROUND_WORK_CACHE_LABELS = tuple(claude_labels)
     return {
+        "codex": codex_snapshot,
         "manager": manager,
         "session_ids": session_ids,
         "unknown_labels": unknown_labels,
@@ -65875,7 +66349,23 @@ def provider_background_work_labels_from_snapshot(
 ) -> list[str]:
     """Validate a pre-lock fold using bounded process state and stat calls."""
 
-    labels = active_codex_work_labels()[:SERVER_UPDATE_PROVIDER_WORK_LABEL_LIMIT]
+    labels = active_codex_work_labels()
+    codex_snapshot = snapshot.get("codex")
+    if isinstance(codex_snapshot, dict):
+        manager, generation, candidates = codex_subagent_native_turn_candidates()
+        codex_snapshot_is_current = (
+            codex_snapshot.get("consistent") is True
+            and manager is codex_snapshot.get("manager")
+            and generation == codex_snapshot.get("generation")
+            and candidates == tuple(codex_snapshot.get("candidates") or ())
+        )
+        if codex_snapshot_is_current:
+            terminal_labels = {
+                f"Codex subagent {thread_id}"
+                for thread_id in codex_snapshot.get("terminal_thread_ids") or ()
+            }
+            labels = [label for label in labels if label not in terminal_labels]
+    labels = sorted(set(labels))[:SERVER_UPDATE_PROVIDER_WORK_LABEL_LIMIT]
     remaining = SERVER_UPDATE_PROVIDER_WORK_LABEL_LIMIT - len(labels)
     if remaining <= 0:
         return labels
@@ -66221,6 +66711,106 @@ def require_server_restart_control(request: Request) -> None:
         )
 
 
+def force_update_schedule_changed(
+    expected_schedule_id: str,
+    status: dict[str, Any],
+) -> HTTPException:
+    """Return the fail-closed response for a stale force-update confirmation."""
+
+    actual_schedule_id = str(status.get("schedule_id") or "").strip()
+    return HTTPException(
+        status_code=409,
+        detail=server_restart_error_detail(
+            "server_force_update_changed",
+            (
+                "The scheduled server update changed before force update "
+                "confirmation. AgentsServer was not restarted."
+            ),
+            action="Refresh update status and confirm the force update again.",
+            retryable=True,
+            expected_update_schedule_id=expected_schedule_id,
+            update_schedule_id=(actual_schedule_id or None),
+            update_phase=str(status.get("phase") or "idle")[:64],
+        ),
+    )
+
+
+def validate_schedule_bound_force_update(
+    expected_schedule_id: str,
+    request_id: str,
+    status: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Validate exact ownership without converting force into a generic restart."""
+
+    current = status if status is not None else read_server_update_status()
+    actual_schedule_id = str(current.get("schedule_id") or "").strip()
+    marker = str(current.get("_force_restart_request_id") or "").strip()
+    target = str(current.get("target_version") or "").strip()
+    track = str(current.get("track") or "").strip()
+    marker_valid = not marker
+    if marker == request_id and managed_server_force_update_is_pending(current):
+        requested_at = str(
+            current.get("_force_restart_requested_at") or ""
+        ).strip()
+        try:
+            datetime.fromisoformat(requested_at.replace("Z", "+00:00"))
+        except (TypeError, ValueError):
+            marker_valid = False
+        else:
+            marker_valid = True
+    target_valid = bool(target) and track in {"stable", "beta"}
+    if target_valid:
+        try:
+            version_key(target)
+        except ValueError:
+            target_valid = False
+        else:
+            target_valid = (
+                server_release_track(target) == track
+                and server_release_transition_allowed(
+                    target,
+                    SERVER_VERSION,
+                    track,
+                )
+            )
+    if (
+        not managed_server_update_is_pending(current)
+        or actual_schedule_id != expected_schedule_id
+        or current.get("when_idle") is not True
+        or not target_valid
+        or not marker_valid
+        or (not marker and current.get("cancelable") is not True)
+    ):
+        raise force_update_schedule_changed(expected_schedule_id, current)
+    return current
+
+
+def arm_schedule_bound_force_update(
+    expected_schedule_id: str,
+    request_id: str,
+) -> dict[str, Any]:
+    """Atomically make one pending reservation noncancelable across restart."""
+
+    with server_update_status_lock(SERVER_UPDATE_STATUS_FILE):
+        current = validate_schedule_bound_force_update(
+            expected_schedule_id,
+            request_id,
+            read_server_update_status(),
+        )
+        if managed_server_force_update_is_pending(current):
+            return current
+        target = str(current.get("target_version") or "").strip()
+        return _write_server_update_status_unlocked(
+            cancelable=False,
+            _force_restart_request_id=request_id,
+            _force_restart_requested_at=update_utc_now(),
+            message=(
+                f"Force update to AgentsServer {target} was accepted; "
+                "AgentsServer is restarting before installing it."
+            ),
+        )
+
+
 def signal_forced_server_restart(request_id: str) -> None:
     """Signal an emergency restart without depending on the restart journal.
 
@@ -66332,7 +66922,7 @@ async def accept_forced_server_restart(
     request_id: str,
     request_fingerprint: str,
 ) -> dict[str, Any]:
-    """Accept an emergency restart without refusing or waiting on server state.
+    """Accept an emergency restart or an exact schedule-bound force update.
 
     Guarantees for ``force: true`` + ``force_confirmed: true``:
 
@@ -66344,8 +66934,10 @@ async def accept_forced_server_restart(
       update, safety-critical work (maintenance, deletions, HTTP mutations,
       goal reconfiguration), a stale or omitted blocker revision, and a Team
       Hub snapshot failure.
-    * No lock or probe is awaited beyond its bounded timeout; a wedged lock
-      degrades the audit snapshot rather than hanging the request.
+    * No lock or probe is awaited beyond its bounded timeout. A generic
+      emergency restart degrades a wedged lock into an audited snapshot, but
+      a schedule-bound force update refuses without restarting because exact
+      validation and durable arming must be atomic.
     * The journal is best effort: if it cannot be written the restart still
       proceeds, because the journal exists to explain the restart, not to
       authorize it.
@@ -66367,6 +66959,7 @@ async def accept_forced_server_restart(
             ),
         )
 
+    expected_schedule_id = body.expected_update_schedule_id
     audit: dict[str, Any] = {}
     degraded_reasons: list[str] = []
     async with bounded_lock(
@@ -66374,6 +66967,22 @@ async def accept_forced_server_restart(
         SERVER_RESTART_FORCE_LOCK_TIMEOUT_SECONDS,
     ) as operation_lock_held:
         if not operation_lock_held:
+            if expected_schedule_id is not None:
+                raise HTTPException(
+                    status_code=503,
+                    detail=server_restart_error_detail(
+                        "server_force_update_busy",
+                        (
+                            "AgentsServer could not atomically reserve the "
+                            "scheduled force update. It was not restarted."
+                        ),
+                        action=(
+                            "Refresh update status and retry the force update."
+                        ),
+                        retryable=True,
+                        expected_update_schedule_id=expected_schedule_id,
+                    ),
+                )
             degraded_reasons.append("update_operation_lock")
         try:
             restart_status = reconcile_stale_server_restart_acceptance()
@@ -66406,6 +67015,15 @@ async def accept_forced_server_restart(
             ):
                 start_forced_server_restart_signal_thread(request_id)
             return public_server_restart_status(restart_status)
+
+        if expected_schedule_id is not None:
+            # Cancellation, pending advancement, and this reservation all use
+            # SERVER_UPDATE_OPERATION_LOCK. Holding it through journal commit
+            # makes the schedule check and noncancelable arming one operation.
+            validate_schedule_bound_force_update(
+                expected_schedule_id,
+                request_id,
+            )
 
         phase = str(restart_status.get("phase") or "")
         if phase in SERVER_RESTART_ACTIVE_PHASES:
@@ -66475,17 +67093,34 @@ async def accept_forced_server_restart(
                 audit["team_hub_snapshot_skipped"] = True
 
         now = update_utc_now()
+        if expected_schedule_id is not None:
+            # No await may separate this durable arm from restart acceptance.
+            # If the restart journal write fails, the emergency signal still
+            # proceeds and the replacement process owns the exact reservation.
+            arm_schedule_bound_force_update(
+                expected_schedule_id,
+                request_id,
+            )
         journal_changes: dict[str, Any] = dict(
             phase="accepted",
             request_id=request_id,
             _source_instance_id=SERVER_INSTANCE_ID,
             _request_fingerprint=request_fingerprint,
             _forced=True,
+            _update_schedule_id=expected_schedule_id,
             _forced_work_snapshot=public_server_restart_work_counts(snapshot),
             _forced_audit=audit,
             message=(
-                "AgentsServer accepted the forced restart; any active work "
-                "will be interrupted while its user service relaunches."
+                (
+                    "AgentsServer accepted the force update and is restarting "
+                    "before installing the exact scheduled release; active "
+                    "work will be interrupted."
+                )
+                if expected_schedule_id is not None
+                else (
+                    "AgentsServer accepted the forced restart; any active work "
+                    "will be interrupted while its user service relaunches."
+                )
             ),
             requested_at=now,
             completed_at=None,
@@ -66852,6 +67487,7 @@ async def _restart_server_endpoint_impl(
                             _source_instance_id=SERVER_INSTANCE_ID,
                             _request_fingerprint=request_fingerprint,
                             _forced=forced,
+                            _update_schedule_id=None,
                             _forced_work_snapshot=(
                                 forced_work_snapshot if forced else None
                             ),
@@ -67200,6 +67836,10 @@ async def _start_server_update(
                                 if schedule_id == pending_schedule_id
                                 else update_utc_now()
                             )
+                            force_restart_armed = (
+                                schedule_id == pending_schedule_id
+                                and managed_server_force_update_is_pending(status)
+                            )
                             pending_status = write_fresh_server_update_status(
                                 schedule_id=schedule_id,
                                 phase=SERVER_UPDATE_PENDING_PHASE,
@@ -67210,12 +67850,29 @@ async def _start_server_update(
                                 latest_version=requested,
                                 update_available=True,
                                 when_idle=True,
-                                cancelable=True,
+                                cancelable=(not force_restart_armed),
                                 pending_at=pending_at,
                                 blocker_counts=blocker_counts,
-                                message=server_update_pending_message(
-                                    requested,
-                                    blocker_counts,
+                                _force_restart_request_id=(
+                                    status.get("_force_restart_request_id")
+                                    if force_restart_armed
+                                    else None
+                                ),
+                                _force_restart_requested_at=(
+                                    status.get("_force_restart_requested_at")
+                                    if force_restart_armed
+                                    else None
+                                ),
+                                message=(
+                                    (
+                                        f"Force update to AgentsServer {requested} "
+                                        "is armed and waiting for restart cleanup."
+                                    )
+                                    if force_restart_armed
+                                    else server_update_pending_message(
+                                        requested,
+                                        blocker_counts,
+                                    )
                                 ),
                                 checked_at=status.get("checked_at"),
                             )
@@ -67668,6 +68325,21 @@ async def cancel_server_update(
                     update_id=status.get("update_id"),
                 ),
             )
+        if status.get("cancelable") is not True:
+            raise HTTPException(
+                status_code=409,
+                detail=server_update_error_detail(
+                    "server_update_not_cancelable",
+                    (
+                        "The force update was already accepted and can no "
+                        "longer be canceled."
+                    ),
+                    action="Wait for AgentsServer to reconnect and finish updating.",
+                    retryable=False,
+                    phase=status.get("phase"),
+                    schedule_id=actual_schedule_id,
+                ),
+            )
         target = str(status.get("target_version") or "").strip()
         track: Literal["stable", "beta"] = (
             "beta" if status.get("track") == "beta" else "stable"
@@ -67847,7 +68519,13 @@ def fail_pending_server_update(
         terminal_phase = "available" if isinstance(exc, HTTPException) else "failed"
         return _write_server_update_status_unlocked(
             **{
-                **{name: None for name in SERVER_UPDATE_PER_RUN_STATUS_FIELDS},
+                **{
+                    name: None
+                    for name in (
+                        *SERVER_UPDATE_PER_RUN_STATUS_FIELDS,
+                        *SERVER_UPDATE_PRIVATE_PER_RUN_STATUS_FIELDS,
+                    )
+                },
                 "phase": terminal_phase,
                 "track": track,
                 "current_track": server_release_track(SERVER_VERSION),
@@ -67910,6 +68588,10 @@ async def server_update_pending_waiter_loop() -> None:
                         == schedule_id
                     ):
                         await JOBS.resume_update_parked(schedule_id)
+                        # A failed force-update preflight clears its execution
+                        # fence. Wake every durable row parked during startup
+                        # immediately instead of waiting for a retry timer.
+                        schedule_rebuilt_queued_turns()
                 logger.warning(
                     "pending server update advance stopped phase=%s "
                     "error_type=%s error_code=%s detail=%s",
@@ -73072,7 +73754,7 @@ async def send_provider_team_message(
         if "team_skill_publish" not in capability.get("actions", set()):
             raise HTTPException(
                 status_code=403,
-                detail="skill publishing was not authorized for this turn; mention @@all or the skill",
+                detail="skill publishing was not authorized for this turn; mention @@bulletin or the skill",
             )
         if not (
             reference.get("kind") == "skill"
@@ -73080,7 +73762,7 @@ async def send_provider_team_message(
         ):
             raise HTTPException(
                 status_code=409,
-                detail="skills can only be published to @@all or to a mentioned skill",
+                detail="skills can only be published to @@bulletin or to a mentioned skill",
             )
         if reference.get("kind") == "skill":
             requested_slug = str((req.skill or {}).get("slug") or "").strip().lower()

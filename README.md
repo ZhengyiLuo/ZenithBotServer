@@ -546,6 +546,33 @@ Forced restarts interrupt active agent turns and can leave provider children
 to be reaped by the relaunched server; use the cooperative restart when the
 server is healthy.
 
+### Schedule-bound force update
+
+`capabilities.server_updates` v11 lets a native client bind that audited force
+restart to one exact pending update. The existing restart POST body adds:
+
+```json
+{
+  "force": true,
+  "force_confirmed": true,
+  "expected_update_schedule_id": "0123456789abcdef0123456789abcdef"
+}
+```
+
+The remaining restart fields are still required. Unlike a generic emergency
+restart, this path must acquire the update-operation lock, confirm that the
+exact schedule is still pending, and durably make it noncancelable before the
+restart is accepted. A canceled, replaced, or already-started schedule returns
+`409 server_force_update_changed`; lock contention returns retryable
+`503 server_force_update_busy`. Neither refusal signals a restart. The `202`
+restart status includes the exact `update_schedule_id`.
+
+After relaunch, that reservation gets update admission before durable queue
+recovery can execute work. New user messages remain durably queueable, while
+other mutations and provider execution stay fenced until the updater starts or
+reports an actionable failure. Active turns are interrupted; already durable
+queued turns are preserved for the updated server.
+
 ## Remote Access With Tailscale
 
 Remote access is expected to go through Tailscale. This keeps the server
@@ -618,10 +645,11 @@ terminate its own installer. Progress is written to
 sessions remain under the persistent state/configuration roots and are never
 placed inside a release directory.
 
-`capabilities.server_updates` v10 defines install-when-idle as a passive,
-durable reservation for human work. Chats, ordinary turns, durable message
-intake, Force Send, provider controls, terminal connections, settings changes,
-and manual restart remain available while the reservation is pending.
+`capabilities.server_updates` v11 retains v10's install-when-idle behavior: an
+ordinary pending reservation is passive and durable for human work. Chats,
+ordinary turns, durable message intake, Force Send, provider controls,
+terminal connections, settings changes, and manual restart remain available
+while the reservation is pending.
 Autonomous scheduled and loop job admissions are deferred losslessly so they
 cannot replenish the active set forever; they resume after the update or an
 explicit cancellation. The server begins maintenance only when one shared-lock

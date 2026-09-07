@@ -307,6 +307,13 @@ class TeamMessageRequest(StrictModel):
         return value
 
 
+class TeamMessageRevisionRequest(StrictModel):
+    body: str = Field(min_length=1, max_length=MAX_TEAM_MESSAGE_BODY_BYTES)
+    body_format: Literal["plain", "markdown"] = "markdown"
+    expected_version: int = Field(ge=1)
+    idempotency_key: str = Field(min_length=8, max_length=240)
+
+
 class TeamReceiptRequest(StrictModel):
     state: Literal["delivered", "read"]
     idempotency_key: str = Field(min_length=8, max_length=240)
@@ -1439,6 +1446,7 @@ def create_app(
             int, Query(ge=0, le=9_223_372_036_854_775_807)
         ] = 0,
         limit: Annotated[int, Query(ge=1, le=MAX_NETWORK_PAGE_ITEMS)] = 50,
+        include_revision: Annotated[bool, Query()] = False,
     ) -> dict[str, Any]:
         return store.list_team_messages(
             claims,
@@ -1452,6 +1460,7 @@ def create_app(
             since=since,
             after_sequence=after_sequence,
             limit=limit,
+            include_revision=include_revision,
         )
 
     @app.get("/v1/teams/{team_id}/network/deletions")
@@ -1479,8 +1488,40 @@ def create_app(
         return store.create_team_message(claims, team_id, body.model_dump())
 
     @app.get("/v1/teams/{team_id}/network/messages/{message_id}")
-    def team_message(team_id: str, message_id: str, claims: Auth) -> dict[str, Any]:
-        return store.get_team_message(claims, team_id, message_id)
+    def team_message(
+        team_id: str,
+        message_id: str,
+        claims: Auth,
+        include_revision: Annotated[bool, Query()] = False,
+    ) -> dict[str, Any]:
+        return store.get_team_message(
+            claims,
+            team_id,
+            message_id,
+            include_revision=include_revision,
+        )
+
+    @app.get("/v1/teams/{team_id}/network/messages/{message_id}/revisions")
+    def team_message_revisions(
+        team_id: str,
+        message_id: str,
+        claims: Auth,
+    ) -> dict[str, Any]:
+        return store.list_team_message_revisions(claims, team_id, message_id)
+
+    @app.post("/v1/teams/{team_id}/network/messages/{message_id}/revisions")
+    def revise_team_message(
+        team_id: str,
+        message_id: str,
+        body: TeamMessageRevisionRequest,
+        claims: Auth,
+    ) -> dict[str, Any]:
+        return store.revise_team_message(
+            claims,
+            team_id,
+            message_id,
+            body.model_dump(),
+        )
 
     @app.delete("/v1/teams/{team_id}/network/messages/{message_id}")
     def delete_team_message(
