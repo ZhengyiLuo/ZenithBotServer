@@ -961,7 +961,7 @@ class ServerUpdateEndpointTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(response["managed_updates"])
         self.assertEqual(
             response["capabilities"]["server_updates"]["version"],
-            10,
+            11,
         )
         self.assertEqual(response["update_service_cgroup"], {
             "safe": True,
@@ -2603,6 +2603,64 @@ class ServerUpdateEndpointTests(unittest.IsolatedAsyncioTestCase):
         resolve_codex.assert_awaited_once()
         resolve_claude.assert_awaited_once()
 
+    async def test_armed_force_update_fences_execution_but_queues_user_message(self):
+        queued = {"status": "queued", "queued_id": "queued-force-update"}
+        store = MagicMock()
+        store.sessions = {"chat": {"id": "chat", "backend": "codex"}}
+        request_id = "8ae62d8f-08f6-42d2-96fe-d136e3e3bb59"
+        with tempfile.TemporaryDirectory() as temporary, patch.object(
+            agent_server,
+            "SERVER_UPDATE_STATUS_FILE",
+            Path(temporary) / "status.json",
+        ), patch.object(agent_server, "STORE", store), patch.object(
+            agent_server,
+            "start_turn",
+            new=AsyncMock(
+                side_effect=agent_server.ManagedServerUpdatePendingError()
+            ),
+        ), patch.object(
+            agent_server,
+            "enqueue_turn",
+            new=AsyncMock(return_value=queued),
+        ) as enqueue:
+            private = agent_server.write_fresh_server_update_status(
+                phase="pending",
+                schedule_id="7" * 32,
+                target_version="1.1.0",
+                latest_version="1.1.0",
+                track="stable",
+                when_idle=True,
+                cancelable=False,
+                _force_restart_request_id=request_id,
+                _force_restart_requested_at=agent_server.update_utc_now(),
+            )
+            public = agent_server.public_server_update_status(private)
+            blocker = agent_server.managed_server_update_admission_blocker()
+            blocked_mutation = agent_server.unsafe_http_mutation_blocked_response(
+                hub_maintenance_route=False,
+            )
+            durable_turn_mutation = (
+                agent_server.unsafe_http_mutation_blocked_response(
+                    hub_maintenance_route=False,
+                    durable_turn_route=True,
+                )
+            )
+            request = agent_server.TurnRequest(prompt="preserve this message")
+            result = await agent_server.post_turn("chat", request)
+
+        self.assertTrue(agent_server.managed_server_force_update_is_pending(private))
+        self.assertEqual(
+            blocker,
+            agent_server.MANAGED_SERVER_UPDATE_PENDING_DETAIL,
+        )
+        self.assertEqual(result, queued)
+        self.assertIsNotNone(blocked_mutation)
+        self.assertEqual(blocked_mutation.status_code, 409)
+        self.assertIsNone(durable_turn_mutation)
+        enqueue.assert_awaited_once_with("chat", request, store.sessions["chat"])
+        self.assertNotIn("_force_restart_request_id", public)
+        self.assertNotIn("_force_restart_requested_at", public)
+
     async def test_scheduled_job_admission_rechecks_pending_after_blocker_probe(self):
         """The turn reservation is the final fence for a scheduler race."""
 
@@ -3377,6 +3435,22 @@ class ServerUpdateEndpointTests(unittest.IsolatedAsyncioTestCase):
                 blocker_counts={"active_runs": 1},
             )
             recovered = await agent_server.reconcile_server_update_status_after_startup()
+            armed = agent_server.write_fresh_server_update_status(
+                phase="pending",
+                schedule_id="f" * 32,
+                target_version="1.1.0",
+                latest_version="1.1.0",
+                track="stable",
+                when_idle=True,
+                cancelable=False,
+                _force_restart_request_id=(
+                    "93635426-cf34-466f-9bf2-c62021ed69d8"
+                ),
+                _force_restart_requested_at=agent_server.update_utc_now(),
+            )
+            recovered_armed = (
+                await agent_server.reconcile_server_update_status_after_startup()
+            )
             agent_server.write_fresh_server_update_status(
                 phase="pending",
                 schedule_id=None,
@@ -3385,17 +3459,42 @@ class ServerUpdateEndpointTests(unittest.IsolatedAsyncioTestCase):
                 when_idle=True,
                 cancelable=True,
             )
-            malformed = await agent_server.reconcile_server_update_status_after_startup()
+            malformed_schedule = (
+                await agent_server.reconcile_server_update_status_after_startup()
+            )
+            agent_server.write_fresh_server_update_status(
+                phase="pending",
+                schedule_id="a" * 32,
+                target_version="1.2.0",
+                track="stable",
+                when_idle=True,
+                cancelable=False,
+                _force_restart_request_id="not-a-uuid",
+                _force_restart_requested_at=agent_server.update_utc_now(),
+            )
+            malformed_force = (
+                await agent_server.reconcile_server_update_status_after_startup()
+            )
 
         self.assertEqual(recovered["phase"], "pending")
         self.assertEqual(recovered["schedule_id"], original["schedule_id"])
         self.assertEqual(recovered["updated_at"], original["updated_at"])
-        self.assertEqual(malformed["phase"], "failed")
+        self.assertEqual(recovered_armed["phase"], "pending")
+        self.assertEqual(recovered_armed["schedule_id"], armed["schedule_id"])
+        self.assertFalse(recovered_armed["cancelable"])
+        self.assertEqual(recovered_armed["updated_at"], armed["updated_at"])
+        self.assertEqual(malformed_schedule["phase"], "failed")
         self.assertEqual(
-            malformed["error_code"],
+            malformed_schedule["error_code"],
             "server_update_schedule_invalid",
         )
-        self.assertTrue(malformed["retryable"])
+        self.assertTrue(malformed_schedule["retryable"])
+        self.assertEqual(malformed_force["phase"], "failed")
+        self.assertEqual(
+            malformed_force["error_code"],
+            "server_update_schedule_invalid",
+        )
+        self.assertIn("force-update", malformed_force["message"])
 
     async def test_start_rejects_update_while_queued_turns_are_not_durable(self):
         with tempfile.TemporaryDirectory() as temporary:

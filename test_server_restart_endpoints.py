@@ -79,6 +79,7 @@ def restart_body(
     force: bool = False,
     blocker_revision: str | None = None,
     omit_revision: bool = False,
+    update_schedule_id: str | None = None,
 ) -> agent_server.ServerRestartRequest:
     fields = {
         "request_id": request_id or uuid.uuid4(),
@@ -98,6 +99,8 @@ def restart_body(
                     "revision"
                 ]
             )
+        if update_schedule_id is not None:
+            fields["expected_update_schedule_id"] = update_schedule_id
     return agent_server.ServerRestartRequest(
         **fields,
     )
@@ -115,6 +118,11 @@ def restart_environment(root: Path):
             agent_server,
             "SERVER_UPDATE_STATUS_FILE",
             root / "admin" / "server-update.json",
+        ))
+        stack.enter_context(patch.object(
+            agent_server,
+            "SERVER_UPDATE_OPERATION_LOCK",
+            asyncio.Lock(),
         ))
         # The hard-kill watchdog consults the provider-child registry before
         # SIGKILL; keep the test from reading the real state directory.
@@ -185,6 +193,35 @@ def restart_environment(root: Path):
 
 
 class ServerRestartStateTests(unittest.TestCase):
+    def test_update_schedule_binding_requires_exact_forced_restart(self):
+        schedule_id = "a" * 32
+        common = {
+            "request_id": uuid.uuid4(),
+            "expected_server_identity": SERVER_IDENTITY,
+            "expected_server_instance_id": SERVER_INSTANCE_ID,
+            "confirmed": True,
+        }
+        with self.assertRaises(ValueError):
+            agent_server.ServerRestartRequest(
+                **common,
+                expected_update_schedule_id=schedule_id,
+            )
+        with self.assertRaises(ValueError):
+            agent_server.ServerRestartRequest(
+                **common,
+                force=True,
+                force_confirmed=True,
+                expected_update_schedule_id="A" * 32,
+            )
+
+        parsed = agent_server.ServerRestartRequest(
+            **common,
+            force=True,
+            force_confirmed=True,
+            expected_update_schedule_id=schedule_id,
+        )
+        self.assertEqual(parsed.expected_update_schedule_id, schedule_id)
+
     def test_private_journal_is_mode_0600_and_public_status_is_bounded(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -1361,6 +1398,252 @@ class ServerRestartEndpointTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(status["forced"])
         self.assertTrue(status["forced_audit"]["update_in_progress_overridden"])
         self.assertEqual(status["forced_audit"]["update_phase"], "installing")
+
+    async def test_force_update_arms_exact_pending_schedule_before_restart(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            request_id = uuid.uuid4()
+            schedule_id = "c" * 32
+            with restart_environment(root) as forced_signal, patch.object(
+                agent_server,
+                "SERVER_VERSION",
+                "1.0.0",
+            ):
+                agent_server.write_fresh_server_update_status(
+                    phase="pending",
+                    schedule_id=schedule_id,
+                    target_version="1.1.0",
+                    latest_version="1.1.0",
+                    track="stable",
+                    update_available=True,
+                    when_idle=True,
+                    cancelable=True,
+                    blocker_counts={"active_runs": 1},
+                )
+                accepted = await agent_server.restart_server_endpoint(
+                    restart_body(
+                        request_id,
+                        force=True,
+                        update_schedule_id=schedule_id,
+                    ),
+                    http_request(method="POST"),
+                    BackgroundTasks(),
+                )
+                pending = agent_server.read_server_update_status()
+                public_pending = agent_server.public_server_update_status(pending)
+
+        self.assertEqual(accepted["phase"], "accepted")
+        self.assertTrue(accepted["forced"])
+        self.assertEqual(accepted["update_schedule_id"], schedule_id)
+        self.assertEqual(pending["phase"], "pending")
+        self.assertEqual(pending["schedule_id"], schedule_id)
+        self.assertFalse(pending["cancelable"])
+        self.assertEqual(
+            pending["_force_restart_request_id"],
+            str(request_id),
+        )
+        self.assertNotIn("_force_restart_request_id", public_pending)
+        self.assertNotIn("_force_restart_requested_at", public_pending)
+        forced_signal.assert_called_once_with(str(request_id))
+
+    async def test_force_update_replay_is_idempotent_and_schedule_is_fingerprinted(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            request_id = uuid.uuid4()
+            schedule_id = "2" * 32
+            with restart_environment(root) as forced_signal:
+                agent_server.write_fresh_server_update_status(
+                    phase="pending",
+                    schedule_id=schedule_id,
+                    target_version="1.1.0",
+                    latest_version="1.1.0",
+                    track="stable",
+                    update_available=True,
+                    when_idle=True,
+                    cancelable=True,
+                )
+                body = restart_body(
+                    request_id,
+                    force=True,
+                    update_schedule_id=schedule_id,
+                )
+                first = await agent_server.restart_server_endpoint(
+                    body,
+                    http_request(method="POST"),
+                    BackgroundTasks(),
+                )
+                replay = await agent_server.restart_server_endpoint(
+                    body,
+                    http_request(method="POST"),
+                    BackgroundTasks(),
+                )
+                with self.assertRaises(HTTPException) as changed:
+                    await agent_server.restart_server_endpoint(
+                        body.model_copy(
+                            update={
+                                "expected_update_schedule_id": "3" * 32,
+                            },
+                        ),
+                        http_request(method="POST"),
+                        BackgroundTasks(),
+                    )
+
+        self.assertEqual(replay["request_id"], first["request_id"])
+        self.assertEqual(replay["update_schedule_id"], schedule_id)
+        self.assertEqual(
+            changed.exception.detail["code"],
+            "server_restart_request_changed",
+        )
+        self.assertEqual(forced_signal.call_count, 2)
+
+    async def test_force_update_changed_never_falls_back_to_generic_restart(self):
+        scenarios = (
+            ("available", "c" * 32),
+            ("pending", "d" * 32),
+            ("installing", "c" * 32),
+        )
+        for phase, actual_schedule_id in scenarios:
+            with self.subTest(phase=phase), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                with restart_environment(root) as forced_signal, patch.object(
+                    agent_server,
+                    "SERVER_VERSION",
+                    "1.0.0",
+                ):
+                    agent_server.write_fresh_server_update_status(
+                        phase=phase,
+                        schedule_id=actual_schedule_id,
+                        update_id=("e" * 32 if phase == "installing" else None),
+                        target_version="1.1.0",
+                        latest_version="1.1.0",
+                        track="stable",
+                        update_available=True,
+                        when_idle=(phase == "pending"),
+                        cancelable=(phase == "pending"),
+                    )
+                    with self.assertRaises(HTTPException) as raised:
+                        await agent_server.restart_server_endpoint(
+                            restart_body(
+                                force=True,
+                                update_schedule_id="c" * 32,
+                            ),
+                            http_request(method="POST"),
+                            BackgroundTasks(),
+                        )
+                    restart_status = agent_server.read_server_restart_status()
+
+                self.assertEqual(raised.exception.status_code, 409)
+                self.assertEqual(
+                    raised.exception.detail["code"],
+                    "server_force_update_changed",
+                )
+                self.assertEqual(restart_status["phase"], "idle")
+                forced_signal.assert_not_called()
+
+    async def test_force_update_and_cancel_are_serialized_force_wins(self):
+        entered_hub_snapshot = asyncio.Event()
+        release_hub_snapshot = asyncio.Event()
+
+        async def slow_hub_snapshot() -> bool:
+            entered_hub_snapshot.set()
+            await release_hub_snapshot.wait()
+            return True
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            schedule_id = "f" * 32
+            with restart_environment(root), patch.object(
+                agent_server,
+                "SERVER_VERSION",
+                "1.0.0",
+            ), patch.object(
+                agent_server,
+                "forced_server_restart_team_hub_snapshot_attempt",
+                side_effect=slow_hub_snapshot,
+            ):
+                agent_server.write_fresh_server_update_status(
+                    phase="pending",
+                    schedule_id=schedule_id,
+                    target_version="1.1.0",
+                    latest_version="1.1.0",
+                    track="stable",
+                    update_available=True,
+                    when_idle=True,
+                    cancelable=True,
+                )
+                force_task = asyncio.create_task(
+                    agent_server.restart_server_endpoint(
+                        restart_body(
+                            force=True,
+                            update_schedule_id=schedule_id,
+                        ),
+                        http_request(method="POST"),
+                        BackgroundTasks(),
+                    )
+                )
+                await entered_hub_snapshot.wait()
+                cancel_task = asyncio.create_task(
+                    agent_server.cancel_server_update(
+                        agent_server.ServerUpdateCancelRequest(
+                            schedule_id=schedule_id,
+                        )
+                    )
+                )
+                await asyncio.sleep(0)
+                self.assertFalse(cancel_task.done())
+                release_hub_snapshot.set()
+                accepted = await force_task
+                with self.assertRaises(HTTPException) as cancelled:
+                    await cancel_task
+
+        self.assertEqual(accepted["update_schedule_id"], schedule_id)
+        self.assertEqual(cancelled.exception.status_code, 409)
+        self.assertEqual(
+            cancelled.exception.detail["code"],
+            "server_update_not_cancelable",
+        )
+
+    async def test_force_update_refuses_when_atomic_lock_is_unavailable(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            schedule_id = "9" * 32
+            with restart_environment(root) as forced_signal, patch.object(
+                agent_server,
+                "SERVER_RESTART_FORCE_LOCK_TIMEOUT_SECONDS",
+                0.001,
+            ):
+                agent_server.write_fresh_server_update_status(
+                    phase="pending",
+                    schedule_id=schedule_id,
+                    target_version="1.1.0",
+                    latest_version="1.1.0",
+                    track="stable",
+                    update_available=True,
+                    when_idle=True,
+                    cancelable=True,
+                )
+                await agent_server.SERVER_UPDATE_OPERATION_LOCK.acquire()
+                try:
+                    with self.assertRaises(HTTPException) as raised:
+                        await agent_server.restart_server_endpoint(
+                            restart_body(
+                                force=True,
+                                update_schedule_id=schedule_id,
+                            ),
+                            http_request(method="POST"),
+                            BackgroundTasks(),
+                        )
+                finally:
+                    agent_server.SERVER_UPDATE_OPERATION_LOCK.release()
+                pending = agent_server.read_server_update_status()
+
+        self.assertEqual(raised.exception.status_code, 503)
+        self.assertEqual(
+            raised.exception.detail["code"],
+            "server_force_update_busy",
+        )
+        self.assertTrue(pending["cancelable"])
+        forced_signal.assert_not_called()
 
     async def test_pending_update_allows_restart_and_rearms_after_startup(self):
         with tempfile.TemporaryDirectory() as temporary:
