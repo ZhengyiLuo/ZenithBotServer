@@ -6032,9 +6032,12 @@ class TeamReference(BaseModel):
                 raise ValueError("team-wide recipients use target_id 'all'")
             if (
                 self.recipient_kind == "all"
-                and self.display_name_snapshot != "all"
+                and self.display_name_snapshot not in {"all", "bulletin"}
             ):
-                raise ValueError("team-wide recipients use the visible token '@@all'")
+                raise ValueError(
+                    "team-wide recipients use the visible token '@@bulletin' "
+                    "(legacy '@@all' is also accepted)"
+                )
         elif self.recipient_kind is not None:
             raise ValueError("skill references cannot carry recipient_kind")
         if self.source_text_end <= self.source_text_start:
@@ -65263,6 +65266,15 @@ async def health() -> dict[str, Any]:
                 "max_sends_per_run": PROVIDER_TEAM_SEND_LIMIT,
                 "max_attachments_per_send": PROVIDER_TEAM_ATTACHMENT_LIMIT,
                 "max_body_bytes": PROVIDER_TEAM_BODY_MAX_BYTES,
+            },
+            "team_bulletin_alias_v1": {
+                "available": bool(
+                    AGENT_TOKEN and (SERVER_ROOT / "agentsdock_team.py").is_file()
+                ),
+                "required": False,
+                "version": 1,
+                "mention": "@@bulletin",
+                "legacy_mention": "@@all",
             },
             "local_session_import_v1": {
                 "available": True,
