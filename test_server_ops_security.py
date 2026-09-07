@@ -643,6 +643,257 @@ class ServerOpsSecurityTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertTrue(snapshot["stale"])
 
+    async def test_replayed_running_codex_child_with_terminal_native_turn_is_idle(self):
+        class CodexManager:
+            ready = True
+            generation = 17
+
+            def __init__(self):
+                self.list_turns_calls = []
+
+            @staticmethod
+            def active_turn(_thread_id):
+                return None
+
+            async def list_turns(self, thread_id, **kwargs):
+                self.list_turns_calls.append((thread_id, kwargs))
+                return [{"id": "turn-terminal", "status": "interrupted"}]
+
+        manager = CodexManager()
+        child_state = {
+            "session_id": "idle-chat",
+            "run_id": "parent-run",
+            "subagent_status": "running",
+        }
+        with patch.object(agent_server, "CODEX_APP_SERVER_MANAGER", manager), \
+             patch.object(agent_server, "CLAUDE_SDK_MANAGER", None), \
+             patch.object(agent_server.STORE, "sessions", {}), \
+             patch.object(agent_server, "BUSY_SESSIONS", set()), \
+             patch.object(agent_server, "SERVER_MAINTENANCE_SESSIONS", set()), \
+             patch.object(agent_server, "ACTIVE", {}), \
+             patch.object(agent_server, "CURRENT_TURNS", {}), \
+             patch.object(agent_server, "CODEX_NATIVE_ACTION_TASKS", {}), \
+             patch.object(agent_server, "CODEX_PENDING_INTERACTIONS", {}), \
+             patch.object(
+                 agent_server,
+                 "CODEX_SUBAGENT_STATE",
+                 {"child-thread": child_state},
+             ), \
+             patch.object(
+                 agent_server,
+                 "CODEX_SUBAGENT_SESSION_INDEX",
+                 {"child-thread": "idle-chat"},
+             ), \
+             patch.object(
+                 agent_server,
+                 "CODEX_SUBAGENT_LIVE_GENERATIONS",
+                 {"child-thread": manager.generation},
+             ):
+            snapshot = await agent_server.prepare_provider_background_work_snapshot()
+            labels = agent_server.provider_background_work_labels_from_snapshot(
+                snapshot
+            )
+
+        self.assertEqual(labels, [])
+        self.assertEqual(
+            manager.list_turns_calls,
+            [(
+                "child-thread",
+                {
+                    "limit": 1,
+                    "items_view": "summary",
+                    "sort_direction": "desc",
+                },
+            )],
+        )
+
+    async def test_terminal_native_turn_retires_stale_local_turn_handle(self):
+        class CodexManager:
+            ready = True
+            generation = 20
+
+            @staticmethod
+            def active_turn(_thread_id):
+                return SimpleNamespace(turn_id="turn-terminal")
+
+            @staticmethod
+            async def list_turns(_thread_id, **_kwargs):
+                return [{"id": "turn-terminal", "status": "completed"}]
+
+        manager = CodexManager()
+        with patch.object(agent_server, "CODEX_APP_SERVER_MANAGER", manager), \
+             patch.object(agent_server, "CLAUDE_SDK_MANAGER", None), \
+             patch.object(agent_server.STORE, "sessions", {}), \
+             patch.object(agent_server, "BUSY_SESSIONS", set()), \
+             patch.object(agent_server, "SERVER_MAINTENANCE_SESSIONS", set()), \
+             patch.object(agent_server, "ACTIVE", {}), \
+             patch.object(agent_server, "CURRENT_TURNS", {}), \
+             patch.object(agent_server, "CODEX_NATIVE_ACTION_TASKS", {}), \
+             patch.object(agent_server, "CODEX_PENDING_INTERACTIONS", {}), \
+             patch.object(agent_server, "CODEX_SUBAGENT_STATE", {
+                 "child-thread": {
+                     "session_id": "idle-chat",
+                     "subagent_status": "running",
+                 },
+             }), \
+             patch.object(agent_server, "CODEX_SUBAGENT_SESSION_INDEX", {
+                 "child-thread": "idle-chat",
+             }), \
+             patch.object(agent_server, "CODEX_SUBAGENT_LIVE_GENERATIONS", {}):
+            snapshot = await agent_server.prepare_provider_background_work_snapshot()
+            labels = agent_server.provider_background_work_labels_from_snapshot(
+                snapshot
+            )
+
+        self.assertEqual(labels, [])
+
+    async def test_codex_terminal_scan_batches_make_forward_progress(self):
+        class CodexManager:
+            ready = True
+            generation = 21
+
+            def __init__(self):
+                self.inspected = []
+
+            @staticmethod
+            def active_turn(_thread_id):
+                return None
+
+            async def list_turns(self, thread_id, **_kwargs):
+                self.inspected.append(thread_id)
+                return [{"id": f"turn-{thread_id}", "status": "completed"}]
+
+        manager = CodexManager()
+        states = {
+            f"child-{index}": {
+                "id": f"event-{index}",
+                "session_id": "idle-chat",
+                "subagent_status": "running",
+            }
+            for index in range(3)
+        }
+        generations = {
+            thread_id: manager.generation for thread_id in states
+        }
+        with patch.object(agent_server, "CODEX_APP_SERVER_MANAGER", manager), \
+             patch.object(agent_server, "CLAUDE_SDK_MANAGER", None), \
+             patch.object(agent_server.STORE, "sessions", {}), \
+             patch.object(agent_server, "BUSY_SESSIONS", set()), \
+             patch.object(agent_server, "SERVER_MAINTENANCE_SESSIONS", set()), \
+             patch.object(agent_server, "ACTIVE", {}), \
+             patch.object(agent_server, "CURRENT_TURNS", {}), \
+             patch.object(agent_server, "CODEX_NATIVE_ACTION_TASKS", {}), \
+             patch.object(agent_server, "CODEX_PENDING_INTERACTIONS", {}), \
+             patch.object(agent_server, "CODEX_SUBAGENT_STATE", states), \
+             patch.object(agent_server, "CODEX_SUBAGENT_SESSION_INDEX", {}), \
+             patch.object(
+                 agent_server,
+                 "CODEX_SUBAGENT_LIVE_GENERATIONS",
+                 generations,
+             ), \
+             patch.object(
+                 agent_server,
+                 "SERVER_UPDATE_CODEX_SUBAGENT_SCAN_LIMIT",
+                 2,
+             ):
+            first = await agent_server.prepare_provider_background_work_snapshot()
+            first_labels = agent_server.provider_background_work_labels_from_snapshot(
+                first
+            )
+            second = await agent_server.prepare_provider_background_work_snapshot()
+            second_labels = agent_server.provider_background_work_labels_from_snapshot(
+                second
+            )
+
+        self.assertEqual(first_labels, ["Codex subagent child-2"])
+        self.assertEqual(second_labels, [])
+        self.assertEqual(manager.inspected, ["child-0", "child-1", "child-2"])
+
+    async def test_codex_child_with_in_progress_native_turn_still_blocks(self):
+        class CodexManager:
+            ready = True
+            generation = 18
+
+            @staticmethod
+            def active_turn(_thread_id):
+                return None
+
+            @staticmethod
+            async def list_turns(_thread_id, **_kwargs):
+                return [{"id": "turn-live", "status": "inProgress"}]
+
+        manager = CodexManager()
+        with patch.object(agent_server, "CODEX_APP_SERVER_MANAGER", manager), \
+             patch.object(agent_server, "CLAUDE_SDK_MANAGER", None), \
+             patch.object(agent_server.STORE, "sessions", {}), \
+             patch.object(agent_server, "BUSY_SESSIONS", set()), \
+             patch.object(agent_server, "SERVER_MAINTENANCE_SESSIONS", set()), \
+             patch.object(agent_server, "ACTIVE", {}), \
+             patch.object(agent_server, "CURRENT_TURNS", {}), \
+             patch.object(agent_server, "CODEX_NATIVE_ACTION_TASKS", {}), \
+             patch.object(agent_server, "CODEX_PENDING_INTERACTIONS", {}), \
+             patch.object(agent_server, "CODEX_SUBAGENT_STATE", {
+                 "child-thread": {
+                     "session_id": "idle-chat",
+                     "subagent_status": "running",
+                 },
+             }), \
+             patch.object(agent_server, "CODEX_SUBAGENT_SESSION_INDEX", {
+                 "child-thread": "idle-chat",
+             }), \
+             patch.object(agent_server, "CODEX_SUBAGENT_LIVE_GENERATIONS", {
+                 "child-thread": manager.generation,
+             }):
+            snapshot = await agent_server.prepare_provider_background_work_snapshot()
+            labels = agent_server.provider_background_work_labels_from_snapshot(
+                snapshot
+            )
+
+        self.assertEqual(labels, ["Codex subagent child-thread"])
+
+    async def test_failed_codex_native_turn_inspection_keeps_child_blocking(self):
+        class CodexManager:
+            ready = True
+            generation = 19
+
+            @staticmethod
+            def active_turn(_thread_id):
+                return None
+
+            @staticmethod
+            async def list_turns(_thread_id, **_kwargs):
+                raise RuntimeError("app-server unavailable")
+
+        manager = CodexManager()
+        with patch.object(agent_server, "CODEX_APP_SERVER_MANAGER", manager), \
+             patch.object(agent_server, "CLAUDE_SDK_MANAGER", None), \
+             patch.object(agent_server.STORE, "sessions", {}), \
+             patch.object(agent_server, "BUSY_SESSIONS", set()), \
+             patch.object(agent_server, "SERVER_MAINTENANCE_SESSIONS", set()), \
+             patch.object(agent_server, "ACTIVE", {}), \
+             patch.object(agent_server, "CURRENT_TURNS", {}), \
+             patch.object(agent_server, "CODEX_NATIVE_ACTION_TASKS", {}), \
+             patch.object(agent_server, "CODEX_PENDING_INTERACTIONS", {}), \
+             patch.object(agent_server, "CODEX_SUBAGENT_STATE", {
+                 "child-thread": {
+                     "session_id": "idle-chat",
+                     "subagent_status": "running",
+                 },
+             }), \
+             patch.object(agent_server, "CODEX_SUBAGENT_SESSION_INDEX", {
+                 "child-thread": "idle-chat",
+             }), \
+             patch.object(agent_server, "CODEX_SUBAGENT_LIVE_GENERATIONS", {
+                 "child-thread": manager.generation,
+             }):
+            snapshot = await agent_server.prepare_provider_background_work_snapshot()
+            labels = agent_server.provider_background_work_labels_from_snapshot(
+                snapshot
+            )
+
+        self.assertEqual(snapshot["codex"]["error"], "scan_failed")
+        self.assertEqual(labels, ["Codex subagent child-thread"])
+
     def test_oversized_claude_events_fail_closed_without_folding(self):
         event_file = MagicMock()
         event_file.stat.return_value.st_size = (

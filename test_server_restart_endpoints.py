@@ -1429,6 +1429,37 @@ class ServerRestartEndpointTests(unittest.IsolatedAsyncioTestCase):
             pending["schedule_id"],
         )
 
+    async def test_forced_restart_preserves_pending_update_reservation(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            with restart_environment(root) as forced_signal:
+                pending = agent_server.write_fresh_server_update_status(
+                    phase="pending",
+                    schedule_id="e" * 32,
+                    target_version="1.1.0",
+                    latest_version="1.1.0",
+                    track="beta",
+                    update_available=True,
+                    when_idle=True,
+                    cancelable=True,
+                    blocker_counts={"provider_background_tasks": 1},
+                )
+                accepted = await agent_server.restart_server_endpoint(
+                    restart_body(force=True),
+                    http_request(method="POST"),
+                    BackgroundTasks(),
+                )
+                preserved = agent_server.read_server_update_status()
+
+        self.assertTrue(accepted["forced"])
+        forced_signal.assert_called_once_with(accepted["request_id"])
+        self.assertEqual(preserved["phase"], "pending")
+        self.assertEqual(preserved["schedule_id"], pending["schedule_id"])
+        self.assertEqual(preserved["updated_at"], pending["updated_at"])
+        self.assertFalse(
+            accepted["forced_audit"]["update_in_progress_overridden"]
+        )
+
     async def test_active_queue_and_provider_work_are_forceable_blockers(self):
         scenarios = (
             ({"BUSY_SESSIONS": {"chat"}}, "active_count"),

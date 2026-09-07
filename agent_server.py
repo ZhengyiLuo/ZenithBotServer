@@ -65631,12 +65631,328 @@ def active_codex_work_labels() -> list[str]:
 
 
 SERVER_UPDATE_PROVIDER_WORK_LABEL_LIMIT = 32
+SERVER_UPDATE_CODEX_SUBAGENT_SCAN_LIMIT = SUBAGENT_SNAPSHOT_STATE_LIMIT
+SERVER_UPDATE_CODEX_SUBAGENT_SCAN_TIMEOUT_SECONDS = 5.0
 MAX_CLAUDE_BACKGROUND_EVENT_SCAN_BYTES = 64 * 1024 * 1024
 CLAUDE_PROVIDER_INSPECTION_OVERFLOW_LABEL = (
     "Claude provider state exceeds safe inspection limit"
 )
 CLAUDE_BACKGROUND_WORK_CACHE_KEY: tuple[Any, ...] | None = None
 CLAUDE_BACKGROUND_WORK_CACHE_LABELS: tuple[str, ...] = ()
+CODEX_SUBAGENT_NATIVE_STATUS_CACHE_MANAGER: Any = None
+CODEX_SUBAGENT_NATIVE_STATUS_CACHE_GENERATION: int | None = None
+CODEX_SUBAGENT_NATIVE_STATUS_CACHE: dict[
+    tuple[Any, ...],
+    tuple[str | None, int],
+] = {}
+CODEX_SUBAGENT_NATIVE_STATUS_CACHE_CLOCK = 0
+
+
+def codex_subagent_native_turn_candidates() -> tuple[
+    Any,
+    int | None,
+    tuple[tuple[Any, ...], ...],
+]:
+    """Return generation-owned child states that need native turn proof.
+
+    ``CODEX_SUBAGENT_LIVE_GENERATIONS`` is deliberately conservative: a
+    collaboration item observed in the current app-server generation marks a
+    child as live even when that item was replayed after the child's turn had
+    already stopped.  Busy owning chats and turns started through this server
+    have direct runtime ownership; only the generation-only fallback needs an
+    authoritative ``thread/turns/list`` check before restart/update admission.
+    """
+
+    manager = CODEX_APP_SERVER_MANAGER
+    generation = (
+        getattr(manager, "generation", None) if manager is not None else None
+    )
+    if (
+        manager is None
+        or getattr(manager, "ready", False) is not True
+        or not isinstance(generation, int)
+        or not callable(getattr(manager, "list_turns", None))
+    ):
+        return manager, generation, ()
+
+    with CODEX_SUBAGENT_INDEX_LOCK:
+        states = [
+            (
+                thread_id,
+                dict(state),
+                CODEX_SUBAGENT_SESSION_INDEX.get(thread_id),
+                CODEX_SUBAGENT_LIVE_GENERATIONS.get(thread_id),
+            )
+            for thread_id, state in CODEX_SUBAGENT_STATE.items()
+        ]
+
+    candidates: list[tuple[Any, ...]] = []
+    for thread_id, state, indexed_session_id, live_generation in states:
+        status = normalize_subagent_status(
+            state.get("subagent_status") or state.get("status")
+        )
+        if status not in {"starting", "running"}:
+            continue
+        session_id = str(
+            state.get("session_id") or indexed_session_id or ""
+        ).strip()
+        state_run_id = str(state.get("run_id") or "").strip()
+        if session_id and session_id in BUSY_SESSIONS:
+            owner = ACTIVE.get(session_id) or CURRENT_TURNS.get(session_id) or {}
+            owner_run_id = str(owner.get("run_id") or "").strip()
+            if (
+                not state_run_id
+                or not owner_run_id
+                or state_run_id == owner_run_id
+            ):
+                continue
+        direct_turn = None
+        with suppress(Exception):
+            direct_turn = manager.active_turn(thread_id)
+        direct_turn_id = str(
+            getattr(direct_turn, "turn_id", None) or ""
+        ).strip()
+        if direct_turn is None and live_generation != generation:
+            continue
+        if direct_turn is not None and not direct_turn_id:
+            # A provisional locally-owned turn has not received an ID that can
+            # be matched to native history yet. Its local handle remains the
+            # stronger, conservative proof that work may have been accepted.
+            continue
+        candidates.append(
+            (
+                thread_id,
+                session_id,
+                state_run_id,
+                status,
+                live_generation,
+                direct_turn_id,
+                str(state.get("id") or ""),
+                int(durable_event_seq(state) or 0),
+                str(state.get("ts") or ""),
+            )
+        )
+    candidates.sort()
+    return manager, generation, tuple(candidates)
+
+
+def cached_codex_subagent_native_statuses(
+    manager: Any,
+    generation: int | None,
+    candidates: tuple[tuple[Any, ...], ...],
+) -> dict[tuple[Any, ...], tuple[str | None, int]]:
+    """Return only proofs bound to the current manager and state revisions."""
+
+    global CODEX_SUBAGENT_NATIVE_STATUS_CACHE_MANAGER
+    global CODEX_SUBAGENT_NATIVE_STATUS_CACHE_GENERATION
+
+    candidate_set = set(candidates)
+    with CODEX_SUBAGENT_INDEX_LOCK:
+        if (
+            CODEX_SUBAGENT_NATIVE_STATUS_CACHE_MANAGER is not manager
+            or CODEX_SUBAGENT_NATIVE_STATUS_CACHE_GENERATION != generation
+        ):
+            CODEX_SUBAGENT_NATIVE_STATUS_CACHE.clear()
+            CODEX_SUBAGENT_NATIVE_STATUS_CACHE_MANAGER = manager
+            CODEX_SUBAGENT_NATIVE_STATUS_CACHE_GENERATION = generation
+        for candidate in tuple(CODEX_SUBAGENT_NATIVE_STATUS_CACHE):
+            if candidate not in candidate_set:
+                CODEX_SUBAGENT_NATIVE_STATUS_CACHE.pop(candidate, None)
+        return dict(CODEX_SUBAGENT_NATIVE_STATUS_CACHE)
+
+
+def cache_codex_subagent_native_statuses(
+    manager: Any,
+    generation: int | None,
+    candidates: tuple[tuple[Any, ...], ...],
+    results: list[tuple[tuple[Any, ...], str | None]],
+) -> dict[tuple[Any, ...], tuple[str | None, int]]:
+    """Commit one bounded inspection batch if its manager scope is current."""
+
+    global CODEX_SUBAGENT_NATIVE_STATUS_CACHE_CLOCK
+
+    cached_codex_subagent_native_statuses(manager, generation, candidates)
+    candidate_set = set(candidates)
+    with CODEX_SUBAGENT_INDEX_LOCK:
+        if (
+            CODEX_SUBAGENT_NATIVE_STATUS_CACHE_MANAGER is manager
+            and CODEX_SUBAGENT_NATIVE_STATUS_CACHE_GENERATION == generation
+        ):
+            for candidate, status in results:
+                if candidate in candidate_set:
+                    CODEX_SUBAGENT_NATIVE_STATUS_CACHE_CLOCK += 1
+                    CODEX_SUBAGENT_NATIVE_STATUS_CACHE[candidate] = (
+                        status,
+                        CODEX_SUBAGENT_NATIVE_STATUS_CACHE_CLOCK,
+                    )
+        return dict(CODEX_SUBAGENT_NATIVE_STATUS_CACHE)
+
+
+async def prepare_codex_subagent_terminal_snapshot(
+    *,
+    timeout_seconds: float | None = None,
+) -> dict[str, Any]:
+    """Prove which otherwise-live Codex child blockers are terminal.
+
+    A child is removable from the provider blocker list only when its latest
+    native turn has an explicit terminal status. Inspections run in bounded
+    batches and cache proofs against the exact manager generation and durable
+    child-state revision. This lets any finite replay backlog make progress
+    across pending-update polls without trusting missing or unknown turns.
+    """
+
+    manager, generation, candidates = codex_subagent_native_turn_candidates()
+    cached = cached_codex_subagent_native_statuses(
+        manager,
+        generation,
+        candidates,
+    )
+    terminal_statuses = {"completed", "stopped", "failed"}
+
+    def cached_terminal_thread_ids() -> tuple[str, ...]:
+        return tuple(sorted(
+            candidate[0]
+            for candidate, (status, _inspected_at) in cached.items()
+            if status in terminal_statuses
+        ))
+
+    if not candidates:
+        return {
+            "manager": manager,
+            "generation": generation,
+            "candidates": candidates,
+            "terminal_thread_ids": (),
+            "consistent": True,
+            "error": None,
+        }
+
+    uninspected = [candidate for candidate in candidates if candidate not in cached]
+    if uninspected:
+        inspection_batch = uninspected[:SERVER_UPDATE_CODEX_SUBAGENT_SCAN_LIMIT]
+    else:
+        # Once every child has a result, rotate through live/unknown results by
+        # least-recently inspected first. A missed terminal notification can
+        # therefore recover without starving children beyond the first batch.
+        inspection_batch = [
+            candidate
+            for candidate, _value in sorted(
+                (
+                    (candidate, cached[candidate])
+                    for candidate in candidates
+                    if cached[candidate][0] not in terminal_statuses
+                ),
+                key=lambda pair: (pair[1][1], pair[0]),
+            )[:SERVER_UPDATE_CODEX_SUBAGENT_SCAN_LIMIT]
+        ]
+    if not inspection_batch:
+        return {
+            "manager": manager,
+            "generation": generation,
+            "candidates": candidates,
+            "terminal_thread_ids": cached_terminal_thread_ids(),
+            "consistent": True,
+            "error": None,
+        }
+
+    async def latest_turn_status(
+        candidate: tuple[Any, ...],
+    ) -> tuple[tuple[Any, ...], str | None, bool]:
+        thread_id = candidate[0]
+        direct_turn_id = candidate[5]
+        try:
+            turns = await manager.list_turns(
+                thread_id,
+                limit=1,
+                items_view="summary",
+                sort_direction="desc",
+            )
+            latest_turn = turns[0] if turns else None
+            latest_turn_id = str(
+                latest_turn.get("id") if isinstance(latest_turn, dict) else ""
+            ).strip()
+            status = codex_child_status_from_turn(latest_turn)
+            if direct_turn_id and latest_turn_id != direct_turn_id:
+                # Native history has not caught up to the local turn handle,
+                # so an older terminal turn cannot retire the newer owner.
+                status = None
+            return candidate, status, True
+        except Exception:
+            # Keep this one child's existing generation blocker while still
+            # allowing independently proven terminal siblings to be ignored.
+            return candidate, None, False
+
+    try:
+        scan = asyncio.gather(
+            *(latest_turn_status(candidate) for candidate in inspection_batch)
+        )
+        effective_timeout = (
+            SERVER_UPDATE_CODEX_SUBAGENT_SCAN_TIMEOUT_SECONDS
+            if timeout_seconds is None
+            else max(0.0, float(timeout_seconds))
+        )
+        results = await asyncio.wait_for(scan, timeout=effective_timeout)
+    except (TimeoutError, asyncio.TimeoutError):
+        manager_after, generation_after, candidates_after = (
+            codex_subagent_native_turn_candidates()
+        )
+        consistent = (
+            manager_after is manager
+            and generation_after == generation
+            and candidates_after == candidates
+        )
+        return {
+            "manager": manager,
+            "generation": generation,
+            "candidates": candidates,
+            "terminal_thread_ids": (
+                cached_terminal_thread_ids() if consistent else ()
+            ),
+            "consistent": consistent,
+            "error": "timeout",
+        }
+    except Exception:
+        return {
+            "manager": manager,
+            "generation": generation,
+            "candidates": candidates,
+            "terminal_thread_ids": (),
+            "consistent": False,
+            "error": "scan_failed",
+        }
+
+    manager_after, generation_after, candidates_after = (
+        codex_subagent_native_turn_candidates()
+    )
+    consistent = (
+        manager_after is manager
+        and generation_after == generation
+        and candidates_after == candidates
+    )
+    scan_failed = any(not inspected for _, _, inspected in results)
+    if consistent:
+        cached = cache_codex_subagent_native_statuses(
+            manager,
+            generation,
+            candidates,
+            [
+                (candidate, status)
+                for candidate, status, _inspected in results
+            ],
+        )
+    return {
+        "manager": manager,
+        "generation": generation,
+        "candidates": candidates,
+        "terminal_thread_ids": (
+            cached_terminal_thread_ids() if consistent else ()
+        ),
+        "consistent": consistent,
+        "error": (
+            "state_changed"
+            if not consistent
+            else "scan_failed" if scan_failed else None
+        ),
+    }
 
 
 def loaded_claude_background_session_state(
@@ -65796,11 +66112,14 @@ async def prepare_provider_background_work_snapshot(
     *,
     timeout_seconds: float | None = None,
 ) -> dict[str, Any]:
-    """Fold Claude events before admission locks and bind them to metadata."""
+    """Inspect provider work before admission locks and bind it to metadata."""
 
     global CLAUDE_BACKGROUND_WORK_CACHE_KEY
     global CLAUDE_BACKGROUND_WORK_CACHE_LABELS
 
+    codex_snapshot = await prepare_codex_subagent_terminal_snapshot(
+        timeout_seconds=timeout_seconds,
+    )
     manager = CLAUDE_SDK_MANAGER
     session_ids, unknown_labels = loaded_claude_background_session_state(manager)
     fingerprints_before = await asyncio.to_thread(
@@ -65832,6 +66151,7 @@ async def prepare_provider_background_work_snapshot(
                 )
             )
             return {
+                "codex": codex_snapshot,
                 "manager": manager,
                 "session_ids": session_ids,
                 "unknown_labels": unknown_labels,
@@ -65842,6 +66162,7 @@ async def prepare_provider_background_work_snapshot(
             }
         except Exception:
             return {
+                "codex": codex_snapshot,
                 "manager": manager,
                 "session_ids": session_ids,
                 "unknown_labels": unknown_labels,
@@ -65860,6 +66181,7 @@ async def prepare_provider_background_work_snapshot(
         CLAUDE_BACKGROUND_WORK_CACHE_KEY = cache_key
         CLAUDE_BACKGROUND_WORK_CACHE_LABELS = tuple(claude_labels)
     return {
+        "codex": codex_snapshot,
         "manager": manager,
         "session_ids": session_ids,
         "unknown_labels": unknown_labels,
@@ -65875,7 +66197,23 @@ def provider_background_work_labels_from_snapshot(
 ) -> list[str]:
     """Validate a pre-lock fold using bounded process state and stat calls."""
 
-    labels = active_codex_work_labels()[:SERVER_UPDATE_PROVIDER_WORK_LABEL_LIMIT]
+    labels = active_codex_work_labels()
+    codex_snapshot = snapshot.get("codex")
+    if isinstance(codex_snapshot, dict):
+        manager, generation, candidates = codex_subagent_native_turn_candidates()
+        codex_snapshot_is_current = (
+            codex_snapshot.get("consistent") is True
+            and manager is codex_snapshot.get("manager")
+            and generation == codex_snapshot.get("generation")
+            and candidates == tuple(codex_snapshot.get("candidates") or ())
+        )
+        if codex_snapshot_is_current:
+            terminal_labels = {
+                f"Codex subagent {thread_id}"
+                for thread_id in codex_snapshot.get("terminal_thread_ids") or ()
+            }
+            labels = [label for label in labels if label not in terminal_labels]
+    labels = sorted(set(labels))[:SERVER_UPDATE_PROVIDER_WORK_LABEL_LIMIT]
     remaining = SERVER_UPDATE_PROVIDER_WORK_LABEL_LIMIT - len(labels)
     if remaining <= 0:
         return labels
